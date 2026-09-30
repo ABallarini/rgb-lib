@@ -1158,6 +1158,7 @@ pub trait WalletOnline: WalletOffline {
             txid,
             vout,
             mode,
+            false,
             &mut updated_batch_transfer,
         )
     }
@@ -1175,6 +1176,7 @@ pub trait WalletOnline: WalletOffline {
         txid: String,
         vout: Option<u32>,
         mode: ReceiveMode,
+        trust_self_sweep: bool,
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         let mut runtime = self.rgb_runtime()?;
@@ -1228,12 +1230,25 @@ pub trait WalletOnline: WalletOffline {
             build_opouts_dag: true,
             safe_height,
         };
-        let resolver = OffchainResolver {
-            witness_id,
-            consignment: &consignment,
-            fallback: self.blockchain_resolver(),
+        let validation_result = if trust_self_sweep {
+            // Self-authored sweep: trust the bundled witnesses; its anchors reference
+            // never-broadcast commitments the chain indexer cannot resolve.
+            let resolver = SelfSweepResolver {
+                consignment: &consignment,
+                fallback: self.blockchain_resolver(),
+            };
+            consignment.clone().validate(&resolver, &validation_config)
+        } else {
+            // External consignment: trust only the terminal bundle, resolving every other
+            // bundle from the chain to prevent forged-history attacks.
+            let resolver = OffchainResolver {
+                witness_id,
+                consignment: &consignment,
+                fallback: self.blockchain_resolver(),
+            };
+            consignment.clone().validate(&resolver, &validation_config)
         };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+        let valid_consignment = match validation_result {
             Ok(consignment) => consignment,
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger(), "Consignment is invalid: {}", e);
@@ -1441,8 +1456,10 @@ pub trait WalletOnline: WalletOffline {
             txn.set_coloring(db_coloring)?;
         }
 
-        // if the consignment contains unsafe history set status to WaitingSafeHeight and stop here
-        if validation_status.validity() == Validity::Warnings {
+        // Unsafe history normally parks the receive at `WaitingSafeHeight` until the
+        // chain proves the anchors safe.  Self-authored sweeps are exempt: their history
+        // references never-broadcast commitments, so `wait_safe_height` would never resolve them.
+        if !trust_self_sweep && validation_status.validity() == Validity::Warnings {
             let unsafe_txids =
                 Self::collect_unsafe_history_txids(&validation_status.warnings, &txid);
             if !unsafe_txids.is_empty() {
@@ -1472,6 +1489,7 @@ pub trait WalletOnline: WalletOffline {
         txn: &DbTxn,
         consignment_path_in: &str,
         media_file_paths: Vec<String>,
+        trust_self_sweep: bool,
     ) -> Result<RefreshResult, Error> {
         let consignment =
             RgbTransfer::load_file(consignment_path_in).map_err(|_| Error::InvalidFilePath {
@@ -1590,6 +1608,7 @@ pub trait WalletOnline: WalletOffline {
                 txid,
                 vout,
                 mode,
+                trust_self_sweep,
                 &mut updated_batch_transfer,
             )?;
 

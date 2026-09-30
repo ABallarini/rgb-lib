@@ -301,8 +301,8 @@ use crate::{
     },
     error::IndexerError,
     utils::{
-        INDEXER_STOP_GAP, OffchainResolver, check_proxy, get_indexer_and_resolver, hash_file,
-        script_buf_from_recipient_id,
+        INDEXER_STOP_GAP, OffchainResolver, SelfSweepResolver, check_proxy,
+        get_indexer_and_resolver, hash_file, script_buf_from_recipient_id,
     },
     wallet::{AssignmentsCollection, Indexer, multisig::RespondToOperation},
 };

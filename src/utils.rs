@@ -1006,6 +1006,31 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolver<'_, '_, TRANSFER>
     }
 }
 
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) struct SelfSweepResolver<'a, 'cons, const TRANSFER: bool> {
+    pub(crate) consignment: &'cons Consignment<TRANSFER>,
+    pub(crate) fallback: &'a AnyResolver,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl<const TRANSFER: bool> ResolveWitness for SelfSweepResolver<'_, '_, TRANSFER> {
+fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
+            // Trust the bundled witnesses: this node authored the sweep, and its anchors reference
+            // never-broadcast LDK commitments a chain indexer cannot resolve.
+            self.consignment
+            .bundled_witnesses()
+            .find(|bw| bw.witness_id() == witness_id)
+            .and_then(|p| p.pub_witness.tx().cloned())
+            .map_or_else(
+                || self.fallback.resolve_witness(witness_id),
+                |tx| Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
+            )
+    }
+    fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
+        self.fallback.check_chain_net(chain_net)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

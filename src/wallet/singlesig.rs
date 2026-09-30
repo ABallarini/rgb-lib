@@ -991,11 +991,43 @@ impl Wallet {
         info!(self.logger(), "Providing out-of-band consignment...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let res =
-            self.provide_out_of_band_consignment_impl(&txn, &consignment_path, media_file_paths)?;
+        let res = self.provide_out_of_band_consignment_impl(
+            &txn,
+            &consignment_path,
+            media_file_paths,
+            false,
+        )?;
         self.update_backup_info(&txn, false)?;
         txn.commit()?;
         info!(self.logger(), "Provide out-of-band consignment completed");
+        Ok(res)
+    }
+
+    /// Receive a justice (penalty) sweep consignment *this node authored itself*.
+    ///
+    /// Unlike [`provide_out_of_band_consignment`](Wallet::provide_out_of_band_consignment), the
+    /// consignment is validated trusting the witnesses it bundles, because it was generated from
+    /// this node's own wallet state: its anchors reference never-broadcast channel commitment
+    /// transactions the chain indexer cannot resolve.  Third-party consignments keep the strict
+    /// chain-backed `OffchainResolver` validation.
+    pub fn provide_own_sweep_consignment(
+        &mut self,
+        online: Online,
+        consignment_path: String,
+        media_file_paths: Vec<String>,
+    ) -> Result<RefreshResult, Error> {
+        info!(self.logger(), "Providing own sweep consignment...");
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let res = self.provide_out_of_band_consignment_impl(
+            &txn,
+            &consignment_path,
+            media_file_paths,
+            true,
+        )?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()?;
+        info!(self.logger(), "Provide own sweep consignment completed");
         Ok(res)
     }
 
