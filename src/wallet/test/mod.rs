@@ -519,6 +519,9 @@ mod delete_transfers;
 mod drain_to;
 #[cfg(feature = "electrum")]
 mod fail_transfers;
+// native only: these drive a real wallet directory
+#[cfg(not(target_arch = "wasm32"))]
+mod files;
 #[cfg(feature = "electrum")]
 mod finalize_psbt;
 mod get_address;

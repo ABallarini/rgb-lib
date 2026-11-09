@@ -8,8 +8,10 @@
 //! wallet id is the object store key: saving the same id replaces the previous snapshot.
 //!
 //! Only the wallet id and the snapshot are written: the snapshot excludes the mnemonic and the
-//! signing keys (see `Wallet::snapshot`), so the stored value carries no secret material.
-//! Errors surface as [`Error::Internal`] with the JS failure message and never with a value.
+//! signing keys (see `Wallet::snapshot`), so the stored value carries no secret material. It does
+//! carry the wallet's browser blobs, so one write makes the database, BDK and file state durable
+//! together. Errors surface as [`Error::Internal`] with the JS failure message and never with a
+//! value.
 //!
 //! # Host lifecycle
 //!
@@ -45,8 +47,18 @@
 //!
 //! The last flushed snapshot wins: changes made after the last flush are lost if the wallet goes
 //! away without another flush. A flush error leaves the in-memory wallet usable, so the host can
-//! retry. Two overlapping flushes for the same wallet id have no ordering guarantee: keep one
-//! writer per wallet id.
+//! retry.
+//!
+//! A write is a single IndexedDB read-write transaction, so it either commits whole or not at all.
+//! When it fails or aborts, the transaction rolls back and the previously committed snapshot stays
+//! intact: a crash mid-write can lose the newest unflushed changes, never the whole wallet. Two
+//! overlapping flushes for the same wallet id are serialized by IndexedDB and the last committed
+//! write wins; there is no ordering guarantee between them, so keep one writer per wallet id.
+//!
+//! A snapshot that cannot be decoded is an error, never a fresh wallet. [`load_snapshot`] returns
+//! the bytes it finds and `Wallet::from_snapshot` validates the envelope and the manifest, so the
+//! host must surface the error instead of falling back to `Wallet::new`. The stored value stays
+//! untouched, so the host can diagnose or overwrite it.
 //!
 //! The wallet id is the key, so the caller passes the same id to every call.
 //! `save_snapshot` waits for the IndexedDB transaction to commit before it returns.
@@ -60,6 +72,36 @@ use crate::Error;
 const DB_NAME: &str = "rgb-lib";
 const DB_VERSION: u32 = 1;
 const STORE_NAME: &str = "snapshots";
+
+/// Test-only failure injection for the browser scenarios; never compiled outside `cfg(test)`.
+///
+/// `Unavailable` fails before any transaction starts, `WriteFailed` writes the value and then
+/// fails without committing, and `AbortBeforeCommit` aborts the transaction after the write so the
+/// explicit abort path is exercised. All three must leave the previous committed snapshot intact.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InjectedFailure {
+    Unavailable,
+    WriteFailed,
+    AbortBeforeCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_FAILURE: std::cell::Cell<Option<InjectedFailure>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set or clear the test-only failure injection for this thread; not compiled in production builds.
+#[cfg(test)]
+pub(crate) fn set_injected_failure(failure: Option<InjectedFailure>) {
+    INJECTED_FAILURE.with(|injected| injected.set(failure));
+}
+
+#[cfg(test)]
+fn injected_failure() -> Option<InjectedFailure> {
+    INJECTED_FAILURE.with(|injected| injected.get())
+}
 
 fn internal(details: impl Into<String>) -> Error {
     Error::Internal {
@@ -188,9 +230,13 @@ fn transaction_future(transaction: &IdbTransaction) -> JsFuture {
 /// and carry no secret material. Errors are returned as [`Error::Internal`] with the JS failure
 /// message.
 ///
-/// Call this only on an explicit flush boundary, never concurrently for the same wallet id: two
-/// overlapping writes for one id have no ordering guarantee.
+/// Call this only on an explicit flush boundary. Two overlapping writes for one wallet id are
+/// serialized by IndexedDB and the last committed write wins.
 pub async fn save_snapshot(wallet_id: &str, bytes: &[u8]) -> Result<(), Error> {
+    #[cfg(test)]
+    if injected_failure() == Some(InjectedFailure::Unavailable) {
+        return Err(internal("injected failure: IndexedDB is unavailable"));
+    }
     let db = open().await?;
     let result = write(&db, wallet_id, bytes).await;
     db.close();
@@ -205,6 +251,10 @@ pub async fn save_snapshot(wallet_id: &str, bytes: &[u8]) -> Result<(), Error> {
 /// [`Wallet::from_snapshot`](crate::wallet::Wallet::from_snapshot). Errors are returned as
 /// [`Error::Internal`] with the JS failure message.
 pub async fn load_snapshot(wallet_id: &str) -> Result<Option<Vec<u8>>, Error> {
+    #[cfg(test)]
+    if injected_failure() == Some(InjectedFailure::Unavailable) {
+        return Err(internal("injected failure: IndexedDB is unavailable"));
+    }
     let db = open().await?;
     let result = read(&db, wallet_id).await;
     db.close();
@@ -217,6 +267,10 @@ pub async fn load_snapshot(wallet_id: &str) -> Result<Option<Vec<u8>>, Error> {
 /// and deleting an id that has no snapshot succeeds. Errors are returned as [`Error::Internal`]
 /// with the JS failure message.
 pub async fn delete_snapshot(wallet_id: &str) -> Result<(), Error> {
+    #[cfg(test)]
+    if injected_failure() == Some(InjectedFailure::Unavailable) {
+        return Err(internal("injected failure: IndexedDB is unavailable"));
+    }
     let db = open().await?;
     let result = remove(&db, wallet_id).await;
     db.close();
@@ -240,6 +294,21 @@ async fn write(db: &IdbDatabase, wallet_id: &str, bytes: &[u8]) -> Result<(), Er
         request_future(&request)
             .await
             .map_err(|e| js_error("cannot write the snapshot", e))?;
+        // test-only: fail after the put so the transaction rolls back. `WriteFailed` leaves the
+        // abort to the caller's error path, `AbortBeforeCommit` aborts here to exercise it directly.
+        #[cfg(test)]
+        match injected_failure() {
+            Some(InjectedFailure::WriteFailed) => {
+                return Err(internal("injected failure: the snapshot write failed"));
+            }
+            Some(InjectedFailure::AbortBeforeCommit) => {
+                let _ = transaction.abort();
+                return Err(internal(
+                    "injected failure: the snapshot write aborted before commit",
+                ));
+            }
+            _ => {}
+        }
         Ok::<(), Error>(())
     }
     .await;

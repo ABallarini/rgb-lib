@@ -473,8 +473,8 @@ use crate::utils::INDEXER_BATCH_SIZE;
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::utils::INDEXER_STOP_GAP;
-#[cfg(feature = "_online")]
-use crate::utils::write_fascia;
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use crate::utils::{atomic_write, atomic_write_with};
 #[cfg(feature = "bitcoind")]
 use crate::wallet::BitcoindClient;
 #[cfg(feature = "_online")]
@@ -514,7 +514,8 @@ use crate::{
     error::IndexerError,
     utils::{
         ChainResolver, OffchainResolver, check_proxy, detect_indexer, get_indexer_and_resolver,
-        hash_file, proxy_max_media, proxy_retention_grace, script_buf_from_recipient_id,
+        hash_file, hash_file_bytes, proxy_max_media, proxy_retention_grace,
+        script_buf_from_recipient_id,
     },
     wallet::{
         AssignmentsCollection, BitcoindAuth, Indexer, IndexerConfig, multisig::RespondToOperation,
@@ -533,10 +534,10 @@ use crate::{
     keys::{Keys, WitnessVersion},
     utils::{
         ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
-        RGB_RUNTIME_DELETING_DIR, RgbStock, atomic_write, atomic_write_with,
-        beneficiary_from_script_buf, from_str_or_number_mandatory, from_str_or_number_optional,
-        get_account_xpubs, get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes,
-        hash_bytes_hex, now, parse_address_str, read_fascia, setup_logger, str_to_xpub,
+        RGB_RUNTIME_DELETING_DIR, RgbStock, beneficiary_from_script_buf,
+        from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
+        get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex,
+        now, parse_address_str, read_fascia, setup_logger, str_to_xpub,
     },
     wallet::{
         AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
@@ -567,7 +568,7 @@ use crate::database::entities::{
 };
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::utils::adjust_canonicalization;
-#[cfg(all(feature = "wallet", any(test, not(target_arch = "wasm32"))))]
+#[cfg(all(test, feature = "wallet"))]
 use crate::utils::atomic_tmp_path;
 #[cfg(all(test, feature = "wallet"))]
 use crate::{

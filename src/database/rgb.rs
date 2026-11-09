@@ -2023,6 +2023,7 @@ pub(crate) use legacy::migrate_rgb_fs_to_db;
 /// No-op unless the legacy filesystem migration is enabled on a non-wasm target.
 #[cfg(any(not(feature = "rgb_fs_store_migration"), target_arch = "wasm32"))]
 pub(crate) fn migrate_rgb_fs_to_db(
+    _files: &dyn crate::wallet::WalletFiles,
     _wallet_dir: &Path,
     _database: &RgbLibDatabase,
 ) -> Result<(), Error> {
@@ -2039,7 +2040,9 @@ mod legacy {
     use strict_encoding::{DeserializeError, StreamReader, StrictReader};
 
     use crate::utils::{RGB_RUNTIME_DIR, atomic_write_with, sync_dir, write_fascia};
-    use crate::wallet::{ASSETS_DIR, FASCIA_FILE, TRANSFERS_DIR, UNSIGNED_PSBT_FILE};
+    use crate::wallet::{
+        ASSETS_DIR, FASCIA_FILE, TRANSFERS_DIR, UNSIGNED_PSBT_FILE, WalletFiles, WalletPath,
+    };
 
     /// Prefix of every RGB container file, followed by a 3-byte magic
     const RGB_FILE_PREFIX: &[u8; 4] = b"RGB\0";
@@ -2052,16 +2055,23 @@ mod legacy {
 
     /// One-time migration of the legacy filesystem RGB store and of the legacy
     /// consignment files.
+    ///
+    /// The wallet adapter retires the legacy store (rename, then delete) once it has been migrated,
+    /// but the store itself is read through `LegacyFsStore`, a path-based store from the RGB
+    /// libraries: it is native-only and cannot be expressed as wallet keys.
     pub(crate) fn migrate_rgb_fs_to_db(
+        files: &dyn WalletFiles,
         wallet_dir: &Path,
         database: &RgbLibDatabase,
     ) -> Result<(), Error> {
         let rgb_dir = wallet_dir.join(RGB_RUNTIME_DIR);
-        if !rgb_dir.exists() {
+        let rgb_key = WalletPath::from_segments(&[RGB_RUNTIME_DIR])?;
+        let deleting_key = WalletPath::from_segments(&[RGB_RUNTIME_DELETING_DIR])?;
+        if !files.exists(&rgb_key)? {
             // finish the job of a run that crashed after retiring the legacy store (the rename
             // below, which is what makes the migration complete) but before deleting it. Failing
             // to delete is not fatal here either, for the same reason as below
-            let _ = fs::remove_dir_all(wallet_dir.join(RGB_RUNTIME_DELETING_DIR));
+            let _ = files.remove_dir_all(&deleting_key);
             return Ok(());
         }
 
@@ -2217,8 +2227,7 @@ mod legacy {
         // goes through a rename so that retiring the store is atomic: a crash mid-delete cannot
         // leave a partially-deleted `rgb` dir for the next open to migrate again (which would fail
         // to load it), only a leftover retired dir that the next open sweeps up
-        let deleting_dir = wallet_dir.join(RGB_RUNTIME_DELETING_DIR);
-        fs::rename(&rgb_dir, &deleting_dir)?;
+        files.rename(&rgb_key, &deleting_key)?;
         // fsync the wallet dir so the rename (our "already migrated" marker) is durable: the DB
         // writes above are upserts, so a re-run after a power loss that kept later DB commits but
         // lost the rename would overwrite newer RGB state with the legacy snapshot
@@ -2226,7 +2235,7 @@ mod legacy {
         // the migration is complete and durable by now, so a delete that fails must not fail the
         // wallet open: the leftover is never read and stays out of backups, and the next open
         // tries again
-        let _ = fs::remove_dir_all(&deleting_dir);
+        let _ = files.remove_dir_all(&deleting_key);
 
         Ok(())
     }

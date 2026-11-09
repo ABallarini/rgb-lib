@@ -73,6 +73,7 @@ use crate::database::enums::{
 };
 use crate::database::{LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
+use crate::utils::now;
 use crate::wallet::{Balance, Outpoint};
 
 fn av<T: Into<sea_orm::Value>>(v: ActiveValue<T>) -> T {
@@ -97,6 +98,21 @@ fn av_or<T: Into<sea_orm::Value>>(v: ActiveValue<T>, default: T) -> T {
         ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v,
         ActiveValue::NotSet => default,
     }
+}
+
+/// The SQLite error detail for a `UNIQUE` violation, as SeaORM renders it.
+fn unique_violation(columns: &str) -> InternalError {
+    InternalError::Database(format!(
+        "Query Error: error returned from database: (code: 2067) UNIQUE constraint failed: {columns}"
+    ))
+}
+
+/// The SQLite error detail for a `FOREIGN KEY` violation on a delete, as SeaORM renders it.
+fn foreign_key_violation() -> InternalError {
+    InternalError::Database(
+        "Execution Error: error returned from database: (code: 1811) FOREIGN KEY constraint failed"
+            .to_string(),
+    )
 }
 
 impl Default for AssetSchema {
@@ -229,12 +245,16 @@ impl InMemoryDb {
     pub(crate) fn set_asset(&self, a: DbAssetActMod) -> Result<i32, InternalError> {
         #[cfg(test)]
         self.counters.asset_writes.fetch_add(1, Ordering::Relaxed);
+        let id = av(a.id);
+        if self.assets.borrow().iter().any(|row| row.id == id) {
+            return Err(unique_violation("asset.id"));
+        }
         let idx = *self.next_asset_idx.borrow();
         *self.next_asset_idx.borrow_mut() += 1;
         let row = DbAsset {
             idx,
             media_idx: av_opt(a.media_idx),
-            id: av(a.id),
+            id,
             schema: av_or(a.schema, AssetSchema::Nia),
             added_at: av(a.added_at),
             details: av_opt(a.details),
@@ -292,7 +312,7 @@ impl InMemoryDb {
             txid: av_opt(b.txid),
             status: av_or(b.status, TransferStatus::Settled),
             created_at: created,
-            updated_at: av_or(b.updated_at, created),
+            updated_at: created,
             expiration: av_opt(b.expiration),
             min_confirmations: av(b.min_confirmations),
             incoming: av_or(b.incoming, false),
@@ -319,11 +339,15 @@ impl InMemoryDb {
     }
 
     pub(crate) fn set_media(&self, m: DbMediaActMod) -> Result<i32, InternalError> {
+        let digest = av(m.digest);
+        if self.media.borrow().iter().any(|row| row.digest == digest) {
+            return Err(unique_violation("media.digest"));
+        }
         let idx = *self.next_media_idx.borrow();
         *self.next_media_idx.borrow_mut() += 1;
         let row = DbMedia {
             idx,
-            digest: av(m.digest),
+            digest,
             mime: av(m.mime),
         };
         self.media.borrow_mut().push(row);
@@ -620,6 +644,9 @@ impl InMemoryDb {
             if let ActiveValue::Set(v) = &b.last_operation_timestamp {
                 row.last_operation_timestamp = v.clone();
             }
+            if let ActiveValue::Set(v) = &b.last_processed_operation_idx {
+                row.last_processed_operation_idx = *v;
+            }
             Ok(row.clone())
         } else {
             Err(InternalError::Unexpected)
@@ -643,9 +670,7 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = b.status {
             row.status = v;
         }
-        if let ActiveValue::Set(v) = b.updated_at {
-            row.updated_at = v;
-        }
+        row.updated_at = now().unix_timestamp();
         if let ActiveValue::Set(v) = &b.expiration {
             row.expiration = *v;
         }
@@ -713,7 +738,9 @@ impl InMemoryDb {
         &self,
         batch_transfer: &DbBatchTransfer,
     ) -> Result<(), InternalError> {
-        // Cascade: BatchTransfer → AssetTransfer → Transfer → TransferTransportEndpoint
+        // Cascade: BatchTransfer → AssetTransfer → Transfer → TransferTransportEndpoint,
+        // BatchTransfer → ReservedTxo. Colorings restrict the AssetTransfer delete like the
+        // SQLite foreign keys do.
         let asset_transfer_idxs: Vec<i32> = self
             .asset_transfers
             .borrow()
@@ -721,6 +748,14 @@ impl InMemoryDb {
             .filter(|at| at.batch_transfer_idx == batch_transfer.idx)
             .map(|at| at.idx)
             .collect();
+        if self
+            .colorings
+            .borrow()
+            .iter()
+            .any(|c| asset_transfer_idxs.contains(&c.asset_transfer_idx))
+        {
+            return Err(foreign_key_violation());
+        }
         let transfer_idxs: Vec<i32> = self
             .transfers
             .borrow()
@@ -747,6 +782,11 @@ impl InMemoryDb {
             let mut bts = self.batch_transfers.borrow_mut();
             bts.retain(|bt| bt.idx != batch_transfer.idx);
             bts.shrink_to_fit();
+        }
+        {
+            let mut reserved = self.reserved_txos.borrow_mut();
+            reserved.retain(|r| r.reserved_for_colored != Some(batch_transfer.idx));
+            reserved.shrink_to_fit();
         }
         Ok(())
     }
@@ -837,16 +877,13 @@ impl InMemoryDb {
     }
 
     pub(crate) fn del_txo(&self, idx: i32) -> Result<(), InternalError> {
-        {
-            let mut colorings = self.colorings.borrow_mut();
-            colorings.retain(|c| c.txo_idx != idx);
-            colorings.shrink_to_fit();
+        // the SQLite coloring foreign key is `RESTRICT`: referenced TXOs can't be deleted
+        if self.colorings.borrow().iter().any(|c| c.txo_idx == idx) {
+            return Err(foreign_key_violation());
         }
-        {
-            let mut txos = self.txos.borrow_mut();
-            txos.retain(|t| t.idx != idx);
-            txos.shrink_to_fit();
-        }
+        let mut txos = self.txos.borrow_mut();
+        txos.retain(|t| t.idx != idx);
+        txos.shrink_to_fit();
         Ok(())
     }
 
@@ -1133,6 +1170,10 @@ impl InMemoryDb {
         self.wallet_transactions
             .borrow_mut()
             .retain(|w| w.idx != idx);
+        // the SQLite reserved TXO foreign key is `ON DELETE CASCADE`
+        self.reserved_txos
+            .borrow_mut()
+            .retain(|r| r.reserved_for_vanilla != Some(idx));
         Ok(())
     }
 
@@ -2174,7 +2215,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txo_del_cascades() {
+    fn test_txo_del_after_removing_colorings() {
         let db = make_db();
         // Create two TXOs so PKs are 1 and 2
         let txo1_idx = db.set_txo(make_txo_mod("tx1", 0, "50000")).unwrap();
@@ -2189,7 +2230,12 @@ mod tests {
         db.set_coloring(make_coloring_mod(txo2_idx, 12, ColoringType::Receive, 200))
             .unwrap();
 
-        // Delete txo1 — should remove txo1 row and its 2 colorings
+        // the SQLite foreign key restricts the delete while the colorings exist
+        assert!(db.del_txo(txo1_idx).is_err());
+        db.del_coloring(10).unwrap();
+        db.del_coloring(11).unwrap();
+
+        // Delete txo1 — now its colorings are gone
         db.del_txo(txo1_idx).unwrap();
 
         // txo1 gone, txo2 remains
@@ -2934,5 +2980,182 @@ mod tests {
             db.get_bdk_changeset().unwrap().network,
             Some(Network::Regtest)
         );
+    }
+
+    // ── SQLite constraint parity ───────────────────────────────────
+
+    const UNIQUE_ASSET_ID: &str = "Query Error: error returned from database: (code: 2067) \
+                                   UNIQUE constraint failed: asset.id";
+    const UNIQUE_MEDIA_DIGEST: &str = "Query Error: error returned from database: (code: 2067) \
+                                       UNIQUE constraint failed: media.digest";
+    const FOREIGN_KEY: &str = "Execution Error: error returned from database: (code: 1811) \
+                               FOREIGN KEY constraint failed";
+
+    #[test]
+    fn test_asset_duplicate_id_is_rejected() {
+        let db = make_db();
+        let first = db.set_asset(make_asset_mod("a1")).unwrap();
+        let err = db.set_asset(make_asset_mod("a1")).unwrap_err();
+        assert_eq!(
+            Error::from(err),
+            Error::Database {
+                details: UNIQUE_ASSET_ID.to_string()
+            }
+        );
+        assert_eq!(db.iter_assets().unwrap().len(), 1);
+        // the failed insert does not consume the next index
+        assert_eq!(db.set_asset(make_asset_mod("a2")).unwrap(), first + 1);
+    }
+
+    #[test]
+    fn test_media_duplicate_digest_is_rejected() {
+        let db = make_db();
+        let media = |mime: &str| DbMediaActMod {
+            digest: ActiveValue::Set("digest".to_string()),
+            mime: ActiveValue::Set(mime.to_string()),
+            ..Default::default()
+        };
+        let first = db.set_media(media("image/png")).unwrap();
+        let err = db.set_media(media("image/jpeg")).unwrap_err();
+        assert_eq!(
+            Error::from(err),
+            Error::Database {
+                details: UNIQUE_MEDIA_DIGEST.to_string()
+            }
+        );
+        assert_eq!(db.iter_media().unwrap().len(), 1);
+        assert_eq!(
+            db.set_media(DbMediaActMod {
+                digest: ActiveValue::Set("other".to_string()),
+                mime: ActiveValue::Set("image/png".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+            first + 1
+        );
+    }
+
+    #[test]
+    fn test_del_txo_is_restricted_by_colorings() {
+        let db = make_db();
+        let txo_idx = db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(txo_idx, 1, ColoringType::Receive, 10))
+            .unwrap();
+
+        let err = db.del_txo(txo_idx).unwrap_err();
+        assert_eq!(
+            Error::from(err),
+            Error::Database {
+                details: FOREIGN_KEY.to_string()
+            }
+        );
+        assert_eq!(db.iter_txos().unwrap().len(), 1);
+        assert_eq!(db.iter_colorings().unwrap().len(), 1);
+
+        // once the coloring is gone, the TXO can be deleted
+        db.del_coloring(1).unwrap();
+        db.del_txo(txo_idx).unwrap();
+        assert!(db.iter_txos().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_del_batch_transfer_is_restricted_by_colorings() {
+        let db = make_db();
+        let batch_idx = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+            .unwrap();
+        let asset_transfer_idx = db
+            .set_asset_transfer(make_asset_transfer_mod(batch_idx, Some("asset")))
+            .unwrap();
+        let txo_idx = db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(
+            txo_idx,
+            asset_transfer_idx,
+            ColoringType::Receive,
+            10,
+        ))
+        .unwrap();
+        let batch = db.iter_batch_transfers().unwrap().remove(0);
+
+        let err = db.del_batch_transfer(&batch).unwrap_err();
+        assert_eq!(
+            Error::from(err),
+            Error::Database {
+                details: FOREIGN_KEY.to_string()
+            }
+        );
+        assert_eq!(db.iter_batch_transfers().unwrap().len(), 1);
+        assert_eq!(db.iter_asset_transfers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_del_batch_transfer_cascades_reserved_txos() {
+        let db = make_db();
+        let batch_idx = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+            .unwrap();
+        db.set_reserved_txos(vec![DbReservedTxoActMod {
+            txid: ActiveValue::Set("tx1".to_string()),
+            vout: ActiveValue::Set(0),
+            reserved_for_colored: ActiveValue::Set(Some(batch_idx)),
+            ..Default::default()
+        }])
+        .unwrap();
+        let batch = db.iter_batch_transfers().unwrap().remove(0);
+        db.del_batch_transfer(&batch).unwrap();
+        assert!(db.iter_reserved_txos().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_del_wallet_transaction_cascades_reserved_txos() {
+        let db = make_db();
+        let wallet_idx = db
+            .set_wallet_transaction(DbWalletTransactionActMod {
+                txid: ActiveValue::Set("wtx".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.set_reserved_txos(vec![DbReservedTxoActMod {
+            txid: ActiveValue::Set("tx1".to_string()),
+            vout: ActiveValue::Set(0),
+            reserved_for_vanilla: ActiveValue::Set(Some(wallet_idx)),
+            ..Default::default()
+        }])
+        .unwrap();
+        db.del_wallet_transaction(wallet_idx).unwrap();
+        assert!(db.iter_reserved_txos().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_update_backup_info_persists_last_processed_operation_idx() {
+        let db = make_db();
+        db.set_backup_info(DbBackupInfoActMod {
+            last_backup_timestamp: ActiveValue::Set("1".to_string()),
+            last_operation_timestamp: ActiveValue::Set("2".to_string()),
+            last_processed_operation_idx: ActiveValue::Set(Some(3)),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut update = DbBackupInfoActMod {
+            last_processed_operation_idx: ActiveValue::Set(Some(9)),
+            ..Default::default()
+        };
+        let updated = db.update_backup_info(&mut update).unwrap();
+        assert_eq!(updated.last_processed_operation_idx, Some(9));
+    }
+
+    #[test]
+    fn test_update_batch_transfer_refreshes_updated_at() {
+        let db = make_db();
+        let idx = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingCounterparty))
+            .unwrap();
+        let mut update = DbBatchTransferActMod {
+            idx: ActiveValue::Set(idx),
+            status: ActiveValue::Set(TransferStatus::Settled),
+            ..Default::default()
+        };
+        let updated = db.update_batch_transfer(&mut update).unwrap();
+        assert!(updated.updated_at > updated.created_at);
     }
 }

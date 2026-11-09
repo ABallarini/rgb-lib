@@ -850,6 +850,11 @@ pub(crate) enum InternalError {
     #[error("Consensus encode error: {0}")]
     ConsensusEncode(#[from] bitcoin::io::Error),
 
+    /// A database constraint violation, shaped like the SQLite backend's [`Error::Database`].
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
+    #[error("Database error: {0}")]
+    Database(String),
+
     #[error("From slice error: {0}")]
     FromSlice(#[from] amplify::FromSliceError),
 
@@ -1036,8 +1041,12 @@ impl From<std::io::Error> for Error {
 #[cfg(feature = "wallet")]
 impl From<InternalError> for Error {
     fn from(e: InternalError) -> Self {
-        Error::Internal {
-            details: e.to_string(),
+        match e {
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
+            InternalError::Database(details) => Error::Database { details },
+            e => Error::Internal {
+                details: e.to_string(),
+            },
         }
     }
 }

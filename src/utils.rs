@@ -763,6 +763,9 @@ pub(crate) fn hash_bytes_hex(data: &[u8]) -> String {
 /// single filesystem, a reader (or a crash) never observes a partially-written
 /// file. The fsync (plus a best-effort directory fsync) makes the result
 /// durable across a power loss.
+///
+/// Native-only: a wasm wallet writes through its file adapter, never a path.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn atomic_write_with<F>(path: &Path, write: F) -> Result<(), Error>
 where
     F: FnOnce(&Path) -> Result<(), Error>,
@@ -793,6 +796,7 @@ where
 ///
 /// Exposed so a loader can recover a temp file left behind by a crash between the write and the
 /// rename.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn atomic_tmp_path(path: &Path) -> Result<PathBuf, Error> {
     let parent = path.parent().ok_or_else(|| Error::Internal {
         details: format!("cannot atomically write {path:?}: no parent directory"),
@@ -807,6 +811,7 @@ pub(crate) fn atomic_tmp_path(path: &Path) -> Result<PathBuf, Error> {
 }
 
 /// Atomically write `bytes` to `path`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     atomic_write_with(path, |tmp| Ok(fs::write(tmp, bytes)?))
 }
@@ -816,6 +821,30 @@ pub(crate) fn read_fascia(path: &Path) -> Result<Fascia, Error> {
     Fascia::strict_deserialize_from_file::<FASCIA_MAX_LEN>(path).map_err(|e| Error::Internal {
         details: format!("cannot read fascia {}: {e}", path.display()),
     })
+}
+
+/// Decode a fascia from its strict-encoded bytes, which is what [`read_fascia`] reads.
+///
+/// `source` names the file in the error, like [`read_fascia`] does with its path.
+pub(crate) fn fascia_from_bytes(bytes: Vec<u8>, source: &str) -> Result<Fascia, Error> {
+    let data =
+        Confined::<Vec<u8>, 0, FASCIA_MAX_LEN>::try_from(bytes).map_err(|e| Error::Internal {
+            details: format!("cannot read fascia {source}: {e}"),
+        })?;
+    Fascia::from_strict_serialized::<FASCIA_MAX_LEN>(data).map_err(|e| Error::Internal {
+        details: format!("cannot read fascia {source}: {e}"),
+    })
+}
+
+/// Encode a fascia to its strict-encoded bytes, as written by [`write_fascia`].
+#[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+pub(crate) fn fascia_to_bytes(fascia: &Fascia) -> Result<Vec<u8>, Error> {
+    Ok(fascia
+        .to_strict_serialized::<FASCIA_MAX_LEN>()
+        .map_err(|e| Error::Internal {
+            details: format!("cannot serialize fascia: {e}"),
+        })?
+        .release())
 }
 
 /// Write a fascia file atomically, so a crash mid-write cannot leave a torn one behind.
@@ -841,6 +870,17 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, Error> {
         engine.input(&buffer[..n]);
     }
     Ok(sha256::Hash::from_engine(engine).to_string())
+}
+
+/// The digest [`hash_file`] produces, over bytes already in memory.
+///
+/// Note this is the `bitcoin` hash display order, not the plain hex of [`hash_bytes_hex`]: the
+/// values are exchanged with counterparties, so the two must not be confused.
+#[cfg(feature = "_online")]
+pub(crate) fn hash_file_bytes(bytes: &[u8]) -> String {
+    let mut engine = sha256::HashEngine::default();
+    engine.input(bytes);
+    sha256::Hash::from_engine(engine).to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

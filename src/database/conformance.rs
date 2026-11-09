@@ -7,9 +7,8 @@
 //! back, the returned indices, and small owned snapshots. SQL statements, internal data
 //! structures and storage layout are never inspected.
 //!
-//! Scenarios where the two backends are known to differ are named `..._is_backend_specific`
-//! and assert the exact outcome of each backend, so a difference is documented and checked
-//! rather than silently skipped.
+//! Every scenario asserts that the two backends return the same observable result, including
+//! the same errors for constraint violations.
 //!
 //! The transaction and savepoint scenarios of the online features live in the [`online`]
 //! module: the default wallet gate (`wallet,sqlite`) cannot reach them.
@@ -382,8 +381,8 @@ fn assets_roundtrip_and_iteration_order() {
 }
 
 #[test]
-fn duplicate_unique_keys_are_backend_specific() {
-    let (sqlite, memory) = on_both_backends(|db| {
+fn duplicate_unique_keys_are_rejected_by_both_backends() {
+    assert_backends_match(|db| {
         let txn = db.begin_transaction().unwrap();
         let first_asset = txn.set_asset(asset("duplicate")).unwrap();
         let second_asset = txn.set_asset(asset("duplicate"));
@@ -393,21 +392,15 @@ fn duplicate_unique_keys_are_backend_specific() {
         let second_media = txn.set_media(media("duplicate-digest", "image/png"));
         let result = (
             first_asset,
-            second_asset.is_ok(),
-            second_asset.is_err(),
+            second_asset,
             first_media,
-            second_media.is_ok(),
+            second_media,
             txn.iter_assets().unwrap().len(),
             txn.iter_media().unwrap().len(),
         );
         txn.commit().unwrap();
         result
     });
-
-    // divergence: SQLite enforces the `UNIQUE` constraints on the asset ID and media digest,
-    // the memory backend does not validate them on insert.
-    assert_eq!(sqlite, (1, false, true, 1, false, 1, 1));
-    assert_eq!(memory, (1, true, false, 1, true, 2, 2));
 }
 
 // ────────────────────────────────────────────────────────────
@@ -630,8 +623,8 @@ fn backup_info_roundtrip_update_and_delete() {
 }
 
 #[test]
-fn backup_info_nullable_update_is_backend_specific() {
-    let (sqlite, memory) = on_both_backends(|db| {
+fn backup_info_update_persists_the_nullable_operation_idx() {
+    assert_backends_match(|db| {
         let txn = db.begin_transaction().unwrap();
         let idx = txn
             .set_backup_info(DbBackupInfoActMod {
@@ -654,10 +647,6 @@ fn backup_info_nullable_update_is_backend_specific() {
         txn.commit().unwrap();
         result
     });
-
-    // divergence: the memory backend ignores `last_processed_operation_idx` in updates.
-    assert_eq!(sqlite, Some(Some(9)));
-    assert_eq!(memory, Some(Some(3)));
 }
 
 // ────────────────────────────────────────────────────────────
@@ -806,8 +795,8 @@ mod online {
     }
 
     #[test]
-    fn deleting_a_colored_txo_is_backend_specific() {
-        let (sqlite, memory) = on_both_backends(|db| {
+    fn deleting_a_colored_txo_is_rejected_by_both_backends() {
+        assert_backends_match(|db| {
             let txn = db.begin_transaction().unwrap();
             txn.set_asset(asset("asset-1")).unwrap();
             let batch_idx = txn
@@ -826,7 +815,7 @@ mod online {
             .unwrap();
             let delete = txn.del_txo(txo_idx);
             let result = (
-                delete.is_ok(),
+                delete,
                 txn.get_txo(&Outpoint {
                     txid: "txo-a".to_string(),
                     vout: 0,
@@ -838,11 +827,6 @@ mod online {
             txn.commit().unwrap();
             result
         });
-
-        // divergence: the SQLite foreign key is `RESTRICT`, so the callers delete the colorings
-        // first; the memory backend cascades the delete to the colorings.
-        assert_eq!(sqlite, (false, true, 1));
-        assert_eq!(memory, (true, false, 0));
     }
 
     #[test]
@@ -886,7 +870,7 @@ mod online {
     }
 
     #[test]
-    fn batch_transfer_update_is_backend_specific_on_updated_at() {
+    fn batch_transfer_update_refreshes_updated_at_on_both_backends() {
         let (sqlite, memory) = on_both_backends(|db| {
             let txn = db.begin_transaction().unwrap();
             let idx = txn
@@ -910,19 +894,8 @@ mod online {
             row
         });
 
-        let project = |row: &DbBatchTransfer| {
-            (
-                row.txid.clone(),
-                row.status,
-                row.expiration,
-                row.incoming,
-                row.min_confirmations,
-            )
-        };
-        assert_eq!(project(&sqlite), project(&memory));
-        // divergence: SQLite refreshes `updated_at` on update, the memory backend leaves it.
+        assert_eq!(sqlite, memory);
         assert!(sqlite.updated_at > sqlite.created_at);
-        assert_eq!(memory.updated_at, memory.created_at);
     }
 
     #[test]

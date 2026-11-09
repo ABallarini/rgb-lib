@@ -23,80 +23,191 @@ pub(crate) const WALLET_MANIFEST_VERSION: u8 = 1;
 
 // wasm wallet snapshot envelope: the manifest travels in front of the memory-backend snapshot.
 const WASM_SNAPSHOT_MAGIC: &[u8; 5] = b"RGBWL";
-const WASM_SNAPSHOT_VERSION: u8 = 2;
+// v2 carries the manifest and the database only; v3 adds the browser files section.
+const WASM_SNAPSHOT_VERSION: u8 = 3;
+const WASM_SNAPSHOT_LEGACY_VERSION: u8 = 2;
 const WASM_SNAPSHOT_HEADER_LEN: usize = WASM_SNAPSHOT_MAGIC.len() + 1 + 4;
+const WASM_SNAPSHOT_V3_HEADER_LEN: usize = WASM_SNAPSHOT_HEADER_LEN + 4;
 
-/// Build a wasm wallet snapshot: the manifest JSON, then the raw memory-backend snapshot.
+fn snapshot_invalid(details: String) -> Error {
+    Error::Internal { details }
+}
+
+fn manifest_bytes(manifest: &WalletManifest) -> Result<Vec<u8>, Error> {
+    serde_json::to_vec(manifest).map_err(|e| Error::Internal {
+        details: format!("cannot serialize the wallet manifest into the snapshot: {e}"),
+    })
+}
+
+/// Build a wasm wallet snapshot: the manifest JSON, the browser files, then the raw memory-backend
+/// snapshot.
 ///
 /// The envelope keeps the settings the wallet was created with next to the database bytes, so a
 /// restore can validate the caller's [`WalletData`] and [`SinglesigKeys`] without a manifest file.
 /// The manifest is the non-secret settings record; the mnemonic never reaches it.
+///
+/// # Format and versions
+///
+/// - v2: `magic`, version `2`, `u32` manifest length, manifest JSON, database bytes.
+/// - v3: `magic`, version `3`, `u32` manifest length (`0` for a wallet without a manifest, i.e.
+///   multisig), manifest JSON, `u32` files length, encoded [`WasmFilesState`], database bytes.
+///
+/// `files` selects the version: `None` keeps the v2 layout byte-for-byte, so a native snapshot (the
+/// adapter holds nothing in memory) is unchanged. `Some` writes v3 even when the adapter is empty,
+/// because on wasm the files section is part of the wallet state.
+///
+/// Multisig passes `None` for `manifest`: it has no settings to validate.
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
 pub(crate) fn encode_wasm_snapshot(
-    manifest: &WalletManifest,
+    manifest: Option<&WalletManifest>,
+    files: Option<&WasmFilesState>,
     db_snapshot: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let json = serde_json::to_vec(manifest).map_err(|e| Error::Internal {
-        details: format!("cannot serialize the wallet manifest into the snapshot: {e}"),
-    })?;
-    let json_len = u32::try_from(json.len()).map_err(|_| Error::Internal {
+    let json = manifest
+        .map(manifest_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let files = match files {
+        Some(files) => files.encode()?,
+        None => {
+            // native: the v2 layout is kept byte-for-byte so existing native snapshots do not move
+            let version = WASM_SNAPSHOT_LEGACY_VERSION;
+            return encode_envelope(version, &json, None, db_snapshot);
+        }
+    };
+    encode_envelope(WASM_SNAPSHOT_VERSION, &json, Some(&files), db_snapshot)
+}
+
+fn encode_envelope(
+    version: u8,
+    manifest_json: &[u8],
+    files: Option<&[u8]>,
+    db_snapshot: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let manifest_len = u32::try_from(manifest_json.len()).map_err(|_| Error::Internal {
         details: "the wallet manifest is too large for the snapshot envelope".to_string(),
     })?;
-    let mut out = Vec::with_capacity(WASM_SNAPSHOT_HEADER_LEN + json.len() + db_snapshot.len());
+    let files_len = files
+        .map(|files| {
+            u32::try_from(files.len()).map_err(|_| Error::Internal {
+                details: "the wallet files are too large for the snapshot envelope".to_string(),
+            })
+        })
+        .transpose()?;
+    let header_len = if files.is_some() {
+        WASM_SNAPSHOT_V3_HEADER_LEN
+    } else {
+        WASM_SNAPSHOT_HEADER_LEN
+    };
+    let mut out = Vec::with_capacity(
+        header_len + manifest_json.len() + files.map_or(0, <[u8]>::len) + db_snapshot.len(),
+    );
     out.extend_from_slice(WASM_SNAPSHOT_MAGIC);
-    out.push(WASM_SNAPSHOT_VERSION);
-    out.extend_from_slice(&json_len.to_le_bytes());
-    out.extend_from_slice(&json);
+    out.push(version);
+    out.extend_from_slice(&manifest_len.to_le_bytes());
+    out.extend_from_slice(manifest_json);
+    if let (Some(files), Some(files_len)) = (files, files_len) {
+        out.extend_from_slice(&files_len.to_le_bytes());
+        out.extend_from_slice(files);
+    }
     out.extend_from_slice(db_snapshot);
     Ok(out)
 }
 
-/// Split a wasm wallet snapshot into its manifest and the raw memory-backend snapshot.
+/// Split a wasm wallet snapshot into its manifest, its browser files and the raw memory-backend
+/// snapshot.
 ///
-/// Only the envelope is validated here: the database snapshot is decoded by the memory backend.
-/// The old raw database format has no envelope magic and is rejected.
+/// Both envelope versions decode: a v2 snapshot has no files section and restores an empty adapter,
+/// which keeps snapshots written before the browser backend usable. The manifest is `None` only for
+/// a v3 snapshot with a zero manifest length (a multisig wallet, which has none). The old raw
+/// database format has no envelope magic and is rejected.
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
-pub(crate) fn decode_wasm_snapshot(bytes: &[u8]) -> Result<(WalletManifest, Vec<u8>), Error> {
-    let invalid = |details: String| Error::Internal { details };
+pub(crate) fn decode_wasm_snapshot(
+    bytes: &[u8],
+) -> Result<(Option<WalletManifest>, WasmFilesState, Vec<u8>), Error> {
     let header = bytes.get(..WASM_SNAPSHOT_HEADER_LEN).ok_or_else(|| {
-        invalid("the wallet snapshot is shorter than its envelope header".to_string())
+        snapshot_invalid("the wallet snapshot is shorter than its envelope header".to_string())
     })?;
     if &header[..WASM_SNAPSHOT_MAGIC.len()] != WASM_SNAPSHOT_MAGIC {
-        return Err(invalid(
+        return Err(snapshot_invalid(
             "the wallet snapshot does not start with the expected envelope magic".to_string(),
         ));
     }
     let version = header[WASM_SNAPSHOT_MAGIC.len()];
-    if version != WASM_SNAPSHOT_VERSION {
-        return Err(invalid(format!(
+    if version != WASM_SNAPSHOT_VERSION && version != WASM_SNAPSHOT_LEGACY_VERSION {
+        return Err(snapshot_invalid(format!(
             "unsupported wallet snapshot envelope version {version} (expected {WASM_SNAPSHOT_VERSION})"
         )));
     }
-    let json_len = u32::from_le_bytes([
+    let manifest_len = u32::from_le_bytes([
         header[WASM_SNAPSHOT_MAGIC.len() + 1],
         header[WASM_SNAPSHOT_MAGIC.len() + 2],
         header[WASM_SNAPSHOT_MAGIC.len() + 3],
         header[WASM_SNAPSHOT_MAGIC.len() + 4],
     ]) as usize;
-    let json_end = WASM_SNAPSHOT_HEADER_LEN
-        .checked_add(json_len)
+    let manifest_end = WASM_SNAPSHOT_HEADER_LEN
+        .checked_add(manifest_len)
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| {
-            invalid("the wallet snapshot manifest length is larger than the snapshot".to_string())
+            snapshot_invalid(
+                "the wallet snapshot manifest length is larger than the snapshot".to_string(),
+            )
         })?;
-    let manifest: WalletManifest =
-        serde_json::from_slice(&bytes[WASM_SNAPSHOT_HEADER_LEN..json_end]).map_err(|e| {
-            invalid(format!(
-                "cannot deserialize the wallet snapshot manifest: {e}"
-            ))
-        })?;
-    let db_snapshot = &bytes[json_end..];
-    if db_snapshot.is_empty() {
-        return Err(invalid(
+    let manifest = if manifest_len == 0 {
+        None
+    } else {
+        Some(
+            serde_json::from_slice::<WalletManifest>(
+                &bytes[WASM_SNAPSHOT_HEADER_LEN..manifest_end],
+            )
+            .map_err(|e| {
+                snapshot_invalid(format!(
+                    "cannot deserialize the wallet snapshot manifest: {e}"
+                ))
+            })?,
+        )
+    };
+
+    let (files, body) = if version == WASM_SNAPSHOT_LEGACY_VERSION {
+        if manifest.is_none() {
+            return Err(snapshot_invalid(
+                "the wallet snapshot carries no wallet manifest".to_string(),
+            ));
+        }
+        (WasmFilesState::default(), &bytes[manifest_end..])
+    } else {
+        let files_len = u32::from_le_bytes(
+            bytes
+                .get(manifest_end..manifest_end + 4)
+                .ok_or_else(|| {
+                    snapshot_invalid(
+                        "the wallet snapshot is missing its files section length".to_string(),
+                    )
+                })?
+                .try_into()
+                .expect("four length bytes"),
+        ) as usize;
+        let files_start = manifest_end + 4;
+        let files_end = files_start
+            .checked_add(files_len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                snapshot_invalid(
+                    "the wallet snapshot files length is larger than the snapshot".to_string(),
+                )
+            })?;
+        (
+            WasmFilesState::decode(&bytes[files_start..files_end])?,
+            &bytes[files_end..],
+        )
+    };
+
+    if body.is_empty() {
+        return Err(snapshot_invalid(
             "the wallet snapshot carries no database snapshot body".to_string(),
         ));
     }
-    Ok((manifest, db_snapshot.to_vec()))
+    Ok((manifest, files, body.to_vec()))
 }
 
 // Only the version field, so an unsupported manifest reports its version instead of failing to
@@ -145,28 +256,38 @@ impl WalletManifest {
         wallet_dir.join(WALLET_MANIFEST_FILE)
     }
 
+    /// The manifest's wallet-relative key.
+    fn key() -> Result<WalletPath, Error> {
+        WalletPath::from_segments(&[WALLET_MANIFEST_FILE])
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn write(&self, wallet_dir: &Path) -> Result<(), Error> {
+    pub(crate) fn write(&self, files: &dyn WalletFiles) -> Result<(), Error> {
         let json = serde_json::to_string_pretty(self).map_err(InternalError::from)?;
-        atomic_write(&Self::path(wallet_dir), json.as_bytes())?;
+        files.atomic_write(&Self::key()?, json.as_bytes())?;
         Ok(())
     }
 
     /// wasm: there is no wallet directory on disk; the manifest is stored in the in-memory
     /// backend so it can travel in the snapshot envelope.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn write(&self, _wallet_dir: &Path) -> Result<(), Error> {
+    pub(crate) fn write(&self, _files: &dyn WalletFiles) -> Result<(), Error> {
         Ok(())
     }
 
-    pub(crate) fn read(wallet_dir: &Path) -> Result<Self, Error> {
-        let manifest_path = Self::path(wallet_dir);
-        if !manifest_path.exists() {
+    /// Read the manifest through the wallet adapter.
+    ///
+    /// `wallet_dir` is only used to name the file in the "missing manifest" error, which reports
+    /// the same path it did when the manifest was read from disk.
+    pub(crate) fn read(files: &dyn WalletFiles, wallet_dir: &Path) -> Result<Self, Error> {
+        if !files.exists(&Self::key()?)? {
             return Err(Error::InexistentWalletManifest {
-                path: manifest_path.to_string_lossy().to_string(),
+                path: Self::path(wallet_dir).to_string_lossy().to_string(),
             });
         }
-        let json = fs::read_to_string(&manifest_path)?;
+        let json = String::from_utf8(files.read(&Self::key()?)?).map_err(|e| Error::Internal {
+            details: format!("cannot read the wallet manifest: {e}"),
+        })?;
         let manifest_version: WalletManifestVersion =
             serde_json::from_str(&json).map_err(InternalError::from)?;
         if manifest_version.version != WALLET_MANIFEST_VERSION {
@@ -181,15 +302,16 @@ impl WalletManifest {
     // are allowed to change are not checked on purpose.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn check_settings_unchanged(
+        files: &dyn WalletFiles,
         wallet_dir: &Path,
         wallet_data: &WalletData,
         keys: &SinglesigKeys,
     ) -> Result<(), Error> {
-        if !Self::path(wallet_dir).exists() {
+        if !files.exists(&Self::key()?)? {
             // skip when no manifest exists (legacy directory or first creation)
             return Ok(());
         }
-        Self::read(wallet_dir)?.check_unchanged_inner(wallet_data, keys, false)
+        Self::read(files, wallet_dir)?.check_unchanged_inner(wallet_data, keys, false)
     }
 
     /// Fail if `wallet_data` or `keys` disagree with this manifest.
@@ -254,6 +376,7 @@ impl WalletManifest {
     /// compare against.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn check_settings_unchanged(
+        _files: &dyn WalletFiles,
         _wallet_dir: &Path,
         _wallet_data: &WalletData,
         _keys: &SinglesigKeys,
@@ -341,6 +464,10 @@ pub struct WalletInternals {
     pub(crate) _logger_guard: LoggerGuard,
     pub(crate) database: Arc<RgbLibDatabase>,
     pub(crate) wallet_dir: PathBuf,
+    /// The wallet's file/blob adapter, rooted at `wallet_dir` on native and in memory on wasm.
+    /// The browser adapter's contents travel in the wallet snapshot; the native one's files live
+    /// in the wallet directory and are not serialized.
+    pub(crate) files: Arc<dyn WalletFiles>,
     pub(crate) bdk_wallet: BdkWallet,
     pub(crate) bdk_pending: Arc<Mutex<ChangeSet>>,
     #[cfg(feature = "_online")]
@@ -488,6 +615,7 @@ fn import_legacy_bdk_store(
 /// transaction has committed. Were one deleted first, a rollback would lose the data it held.
 pub(crate) fn setup_bdk<P: AsRef<Path>>(
     database: &RgbLibDatabase,
+    files: &dyn WalletFiles,
     wallet_dir: P,
     desc_colored: String,
     desc_vanilla: String,
@@ -505,15 +633,19 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
     let mut changeset = txn.get_bdk_changeset()?;
     // wasm: no filesystem, the in-memory backend is the only store, so there is nothing to fold in
     #[cfg(target_arch = "wasm32")]
-    let _ = wallet_dir.as_ref();
-    // files this transaction takes the contents of, to be dropped once it has committed
+    let _ = (files, wallet_dir.as_ref());
+    // files this transaction takes the contents of, to be dropped once it has committed.
+    // The legacy BDK file store is a path-based store from BDK itself, so it stays native; the
+    // pending-changeset copies go through the wallet adapter.
     #[cfg(not(target_arch = "wasm32"))]
-    let mut migrated = Vec::new();
+    let mut migrated_paths = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut migrated_keys = Vec::new();
     // an empty changeset means either a brand-new wallet or one whose data still lives in the
     // legacy file store
     #[cfg(not(target_arch = "wasm32"))]
-    let mut reload =
-        changeset.is_empty() && import_legacy_bdk_store(&txn, wallet_dir.as_ref(), &mut migrated)?;
+    let mut reload = changeset.is_empty()
+        && import_legacy_bdk_store(&txn, wallet_dir.as_ref(), &mut migrated_paths)?;
     #[cfg(target_arch = "wasm32")]
     let reload = false;
     // a crash between the temporary write and the rename leaves the newer changeset in the .tmp
@@ -521,19 +653,18 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
     // ends on the newest state
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let pending_path = wallet_dir.as_ref().join(BDK_PENDING_FILE);
-        let pending_tmp_path = atomic_tmp_path(&pending_path)?;
-        for pending_file in [pending_path, pending_tmp_path] {
-            if !pending_file.exists() {
+        let pending_key = WalletPath::from_segments(&[BDK_PENDING_FILE])?;
+        for pending_file in [pending_key.clone(), pending_key.tmp_sibling()?] {
+            if !files.exists(&pending_file)? {
                 continue;
             }
             // a file that fails to parse was still being written when the crash happened, so its
             // contents were never complete: drop it rather than refusing to open the wallet
-            if let Ok(pending) = serde_json::from_slice::<ChangeSet>(&fs::read(&pending_file)?) {
+            if let Ok(pending) = serde_json::from_slice::<ChangeSet>(&files.read(&pending_file)?) {
                 txn.update_bdk_changeset(&pending)?;
                 reload = true;
             }
-            migrated.push(pending_file);
+            migrated_keys.push(pending_file);
         }
     }
     if reload {
@@ -556,8 +687,12 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
     txn.commit()?;
     // only now that their contents are durably in the DB
     #[cfg(not(target_arch = "wasm32"))]
-    for path in migrated {
+    for path in migrated_paths {
         let _ = fs::remove_file(path);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    for key in migrated_keys {
+        let _ = files.remove(&key);
     }
     Ok(bdk_wallet)
 }
@@ -658,14 +793,15 @@ pub trait WalletCore {
             }
             txn.update_bdk_changeset(&guard)?;
         }
-        let pending_file = self.wallet_dir().join(BDK_PENDING_FILE);
+        let pending_file = WalletPath::from_segments(&[BDK_PENDING_FILE])?;
+        let files = Arc::clone(&self.internals().files);
         txn.on_commit(move || {
             pending
                 .lock()
                 .expect("bdk_pending is never poisoned")
                 .take();
             // the changes are in the DB now, so the crash-recovery copy is no longer needed
-            let _ = fs::remove_file(pending_file);
+            let _ = files.remove(&pending_file);
         });
         Ok(())
     }
@@ -689,7 +825,10 @@ pub trait WalletCore {
         };
         // a crash mid-write cannot leave a half-written file, which would fail to parse on reload
         // and leave the wallet unopenable
-        atomic_write(&self.wallet_dir().join(BDK_PENDING_FILE), &serialized)
+        self.internals().files.atomic_write(
+            &WalletPath::from_segments(&[BDK_PENDING_FILE])?,
+            &serialized,
+        )
     }
 
     /// Persist any pending BDK changes and commit the transaction.
@@ -716,6 +855,24 @@ pub trait WalletCore {
 
     fn wallet_dir(&self) -> &PathBuf {
         &self.internals().wallet_dir
+    }
+
+    /// The wallet's file/blob adapter.
+    fn files(&self) -> &dyn WalletFiles {
+        &*self.internals().files
+    }
+
+    /// The wallet-relative key of a path built under the wallet directory.
+    ///
+    /// Wallet paths stay `PathBuf`s where they are also exposed to the host (media paths, transfer
+    /// directories); only the file operations go through [`Self::files`].
+    fn wallet_key(&self, path: &Path) -> Result<WalletPath, Error> {
+        let relative = path
+            .strip_prefix(self.wallet_dir())
+            .map_err(|e| Error::Internal {
+                details: format!("{path:?} is not inside the wallet directory: {e}"),
+            })?;
+        WalletPath::from_relative(relative)
     }
 
     #[cfg(feature = "_online")]
@@ -1093,7 +1250,19 @@ mod wasm_snapshot_tests {
     }
 
     fn envelope(manifest: &WalletManifest) -> Vec<u8> {
-        encode_wasm_snapshot(manifest, b"the memory-backend snapshot").unwrap()
+        // native adapters keep their blobs on disk, so the files section is absent
+        encode_wasm_snapshot(Some(manifest), None, b"the memory-backend snapshot").unwrap()
+    }
+
+    fn files_state() -> WasmFilesState {
+        use std::collections::{BTreeMap, BTreeSet};
+        WasmFilesState {
+            files: BTreeMap::from([(
+                WalletPath::new("media_files/abc123").unwrap(),
+                b"media bytes".to_vec(),
+            )]),
+            dirs: BTreeSet::from([WalletPath::new("media_files").unwrap()]),
+        }
     }
 
     fn assert_internal(result: Result<impl std::fmt::Debug, Error>, needle: &str) {
@@ -1112,7 +1281,10 @@ mod wasm_snapshot_tests {
         let bytes = envelope(&manifest);
 
         assert_eq!(&bytes[..WASM_SNAPSHOT_MAGIC.len()], WASM_SNAPSHOT_MAGIC);
-        assert_eq!(bytes[WASM_SNAPSHOT_MAGIC.len()], WASM_SNAPSHOT_VERSION);
+        assert_eq!(
+            bytes[WASM_SNAPSHOT_MAGIC.len()],
+            WASM_SNAPSHOT_LEGACY_VERSION
+        );
         // the envelope carries no secret
         assert!(
             !bytes
@@ -1120,12 +1292,119 @@ mod wasm_snapshot_tests {
                 .any(|window| window == mnemonic.as_bytes())
         );
 
-        let (decoded, db_snapshot) = decode_wasm_snapshot(&bytes).unwrap();
+        let (decoded, files, db_snapshot) = decode_wasm_snapshot(&bytes).unwrap();
+        let decoded = decoded.expect("a singlesig envelope carries the manifest");
         assert_eq!(
             serde_json::to_vec(&decoded).unwrap(),
             serde_json::to_vec(&manifest).unwrap()
         );
+        assert!(files.is_empty());
         assert_eq!(db_snapshot, b"the memory-backend snapshot");
+    }
+
+    #[test]
+    fn native_envelope_keeps_the_v2_layout() {
+        // a native wallet has no in-memory files, so its snapshot is the pre-browser v2 envelope:
+        // same magic, same version byte, no files section
+        let (manifest, _) = test_manifest();
+        let bytes = envelope(&manifest);
+        assert_eq!(
+            bytes[WASM_SNAPSHOT_MAGIC.len()],
+            WASM_SNAPSHOT_LEGACY_VERSION
+        );
+        let manifest_len = serde_json::to_vec(&manifest).unwrap().len();
+        assert_eq!(
+            bytes.len(),
+            WASM_SNAPSHOT_HEADER_LEN + manifest_len + b"the memory-backend snapshot".len()
+        );
+    }
+
+    #[test]
+    fn v2_envelope_restores_an_empty_files_state() {
+        let (manifest, _) = test_manifest();
+        let bytes = envelope(&manifest);
+        assert_eq!(bytes[WASM_SNAPSHOT_MAGIC.len()], 2);
+        let (_, files, db_snapshot) = decode_wasm_snapshot(&bytes).unwrap();
+        assert!(files.is_empty(), "an old snapshot has no browser files");
+        assert_eq!(db_snapshot, b"the memory-backend snapshot");
+    }
+
+    #[test]
+    fn v3_envelope_carries_the_browser_files() {
+        let (manifest, mnemonic) = test_manifest();
+        let files = files_state();
+        let bytes = encode_wasm_snapshot(Some(&manifest), Some(&files), b"body").unwrap();
+        assert_eq!(bytes[WASM_SNAPSHOT_MAGIC.len()], WASM_SNAPSHOT_VERSION);
+        assert!(
+            !bytes
+                .windows(mnemonic.len())
+                .any(|window| window == mnemonic.as_bytes()),
+            "the files section must not leak the mnemonic"
+        );
+
+        let (decoded, restored, db_snapshot) = decode_wasm_snapshot(&bytes).unwrap();
+        assert!(decoded.is_some());
+        assert_eq!(restored, files);
+        assert_eq!(db_snapshot, b"body");
+    }
+
+    #[test]
+    fn v3_envelope_without_manifest_is_a_multisig_snapshot() {
+        let files = files_state();
+        let bytes = encode_wasm_snapshot(None, Some(&files), b"body").unwrap();
+        let (manifest, restored, db_snapshot) = decode_wasm_snapshot(&bytes).unwrap();
+        assert!(manifest.is_none());
+        assert_eq!(restored, files);
+        assert_eq!(db_snapshot, b"body");
+    }
+
+    /// Build a v3 envelope from an already encoded files section, to feed hostile keys in.
+    fn envelope_with_raw_files(files: &[u8], manifest: &WalletManifest) -> Vec<u8> {
+        let json = serde_json::to_vec(manifest).unwrap();
+        let mut bytes = WASM_SNAPSHOT_MAGIC.to_vec();
+        bytes.push(WASM_SNAPSHOT_VERSION);
+        bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        bytes.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(files);
+        bytes.extend_from_slice(b"body");
+        bytes
+    }
+
+    #[test]
+    fn v3_files_section_rejects_traversal_keys() {
+        let (manifest, _) = test_manifest();
+        // empty directory list, one file named "../escape"
+        let mut files = 0u32.to_le_bytes().to_vec();
+        files.extend_from_slice(&1u32.to_le_bytes());
+        files.extend_from_slice(&9u32.to_le_bytes());
+        files.extend_from_slice(b"../escape");
+        files.extend_from_slice(&1u32.to_le_bytes());
+        files.push(b'x');
+        let bytes = envelope_with_raw_files(&files, &manifest);
+
+        assert!(matches!(
+            decode_wasm_snapshot(&bytes),
+            Err(Error::InvalidFilePath { .. })
+        ));
+    }
+
+    #[test]
+    fn v3_files_section_rejects_truncated_bytes() {
+        let (manifest, _) = test_manifest();
+        // the section claims one file but ends inside its key length
+        let bytes = envelope_with_raw_files(&[0u8, 0, 0, 0, 1, 0, 0, 0, 9], &manifest);
+        assert_internal(decode_wasm_snapshot(&bytes), "runs past the end");
+
+        // a files length larger than the envelope is rejected before decoding the section
+        let mut files_section = files_state();
+        files_section.files.clear();
+        let mut bytes =
+            encode_wasm_snapshot(Some(&manifest), Some(&files_section), b"body").unwrap();
+        let manifest_len = serde_json::to_vec(&manifest).unwrap().len();
+        let len_start = WASM_SNAPSHOT_HEADER_LEN + manifest_len;
+        bytes[len_start..len_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_internal(decode_wasm_snapshot(&bytes), "files length");
     }
 
     #[test]
@@ -1152,6 +1431,9 @@ mod wasm_snapshot_tests {
         let (manifest, _) = test_manifest();
         let mut bytes = envelope(&manifest);
         bytes[WASM_SNAPSHOT_MAGIC.len()] = WASM_SNAPSHOT_VERSION + 1;
+        assert_internal(decode_wasm_snapshot(&bytes), "envelope version");
+        let mut bytes = envelope(&manifest);
+        bytes[WASM_SNAPSHOT_MAGIC.len()] = 1;
         assert_internal(decode_wasm_snapshot(&bytes), "envelope version");
     }
 
