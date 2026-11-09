@@ -402,6 +402,22 @@ pub(crate) fn setup_db<P: AsRef<Path>>(_wallet_dir: P) -> Result<RgbLibDatabase,
     Ok(RgbLibDatabase::new_memory())
 }
 
+/// Select the database the wallet will use for its whole lifecycle: the injected backend when one
+/// is supplied, otherwise the default backend for the target, opened by [`setup_db`].
+///
+/// The returned database is owned by the wallet and backs every part of the setup and later use:
+/// the BDK changeset, the RGB store and the one-time migrations. An injected backend is therefore
+/// used unchanged, which lets the host supply a pre-populated or in-memory database.
+pub(crate) fn setup_db_with_backend<P: AsRef<Path>>(
+    wallet_dir: P,
+    backend: Option<RgbLibDatabase>,
+) -> Result<RgbLibDatabase, Error> {
+    match backend {
+        Some(db) => Ok(db),
+        None => setup_db(wallet_dir),
+    }
+}
+
 /// Import the BDK data of a wallet created before the changeset moved into the rgb-lib DB.
 ///
 /// Such wallets keep their data in `bdk_file_store` files inside the wallet directory. Chain data

@@ -223,10 +223,7 @@ impl Wallet {
         WalletManifest::check_settings_unchanged(&wallet_dir, &wallet_data, &keys)?;
 
         // setup rgb-lib DB
-        let database = match database {
-            Some(db) => db,
-            None => setup_db(&wallet_dir)?,
-        };
+        let database = setup_db_with_backend(&wallet_dir, database)?;
 
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(

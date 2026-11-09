@@ -1080,10 +1080,7 @@ impl MultisigWallet {
         fs::create_dir_all(wallet_dir.join(HUB_OPS_DIR))?;
 
         // setup rgb-lib DB
-        let database = match database {
-            Some(db) => db,
-            None => setup_db(&wallet_dir)?,
-        };
+        let database = setup_db_with_backend(&wallet_dir, database)?;
 
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(
