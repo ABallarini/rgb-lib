@@ -11,11 +11,15 @@ pub(crate) mod objects;
 pub(crate) mod offline;
 #[cfg(feature = "_online")]
 pub(crate) mod online;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod persistence;
 pub mod rust_only;
 pub(crate) mod singlesig;
 
 #[cfg(test)]
 pub(crate) mod test;
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) mod test_wasm;
 
 pub use crate::database::enums::TypeOfTransition;
 pub use crate::no_wallet::{

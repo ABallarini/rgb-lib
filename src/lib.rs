@@ -123,6 +123,9 @@ compile_error!(
 
 #[cfg(feature = "_online")]
 pub(crate) mod api;
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
 #[cfg(feature = "wallet")]
 pub(crate) mod database;
 // without the wallet only the database enums are needed, as some are shared with inspection

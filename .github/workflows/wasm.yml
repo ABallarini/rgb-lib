@@ -23,3 +23,29 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Check wallet-less build for wasm32
         run: cargo check --lib --target wasm32-unknown-unknown --no-default-features
+
+  # Required browser proof: the wallet lifecycle test creates a wallet over the in-memory backend,
+  # snapshots it, persists the snapshot in IndexedDB, restores the wallet from the stored bytes and
+  # checks the state survived. It needs a real browser, so it cannot run in the local gate
+  # (`scripts/wasm_gate.sh`), which stops at the compile checks.
+  wasm_browser_lifecycle:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Setup rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install ChromeDriver
+        uses: nanasess/setup-chromedriver@v2
+      # the runner ships with wasm-bindgen-cli and must match the wasm-bindgen version in Cargo.lock
+      - name: Install wasm-bindgen-test-runner
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - name: Run the wallet lifecycle test in headless Chrome
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: cargo test --lib --target wasm32-unknown-unknown --no-default-features --features wallet

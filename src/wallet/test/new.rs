@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::fs::PermissionsExt;
 
 fn check_wallet(
@@ -306,6 +307,8 @@ fn mainnet_success_esplora() {
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }
 
+// uses unix file permissions and a writability check that only exists natively
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 #[parallel]
 fn fail() {
