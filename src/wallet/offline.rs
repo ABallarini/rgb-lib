@@ -19,6 +19,37 @@ pub(crate) const MAX_ATTACHMENTS: usize = 20;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
+/// Serialize an issued contract to the bytes rgb-ops `ValidContract::save_file` writes.
+///
+/// rgb-ops exposes only a path-based `save_file` for a validated consignment, which cannot run in
+/// the browser. The layout is the contract's own file encoding with the validated-consignment
+/// magic and the JSON validation status appended; the native issuance test pins this output to
+/// `save_file`, byte for byte.
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+pub(crate) fn contract_file_bytes(valid_contract: &ValidContract) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    valid_contract
+        .clone()
+        .into_consignment()
+        .save(&mut bytes)
+        .map_err(|e| Error::Internal {
+            details: format!("cannot serialize issued contract: {e}"),
+        })?;
+    // a contract file starts with `RGB\0CON`; the validated form writes `RGB\0VCO`
+    bytes
+        .get_mut(4..7)
+        .ok_or_else(|| Error::Internal {
+            details: s!("serialized issued contract is missing its magic"),
+        })?
+        .copy_from_slice(b"VCO");
+    serde_json::to_writer(&mut bytes, valid_contract.validation_status()).map_err(|e| {
+        Error::Internal {
+            details: format!("cannot serialize issued contract status: {e}"),
+        }
+    })?;
+    Ok(bytes)
+}
+
 pub(crate) const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
 
 /// The maximum length of a confined collection, given an accessor returning it from a bundle.
@@ -86,6 +117,39 @@ pub trait WalletOffline: WalletBackup {
     fn get_asset_transfer_dir<P: AsRef<Path>>(&self, transfer_dir: P, asset_id: &str) -> PathBuf {
         let asset_id_no_prefix = asset_id.replace(ASSET_ID_PREFIX, "");
         transfer_dir.as_ref().join(&asset_id_no_prefix)
+    }
+
+    /// Key of the `transfers` directory.
+    fn transfers_key(&self) -> Result<WalletPath, Error> {
+        WalletPath::from_segments(&[TRANSFERS_DIR])
+    }
+
+    /// Key of a transfer directory, named after its TXID (or after the receive IDs hash while the
+    /// transfer is still being prepared).
+    fn transfer_key(&self, transfer_id: &str) -> Result<WalletPath, Error> {
+        self.transfers_key()?.join(transfer_id)
+    }
+
+    /// Key of the `media_files` directory.
+    fn media_key(&self, digest: &str) -> Result<WalletPath, Error> {
+        WalletPath::from_segments(&[MEDIA_DIR])?.join(digest)
+    }
+
+    /// Read a fascia through the wallet adapter.
+    fn read_fascia_at(&self, key: &WalletPath) -> Result<Fascia, Error> {
+        crate::utils::fascia_from_bytes(self.files().read(key)?, key.as_str())
+    }
+
+    /// Write a fascia through the wallet adapter, atomically.
+    #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+    fn write_fascia_at(&self, key: &WalletPath, fascia: &Fascia) -> Result<(), Error> {
+        let bytes = crate::utils::fascia_to_bytes(fascia).map_err(|e| Error::Internal {
+            details: match e {
+                Error::Internal { details } => format!("{details}: {key}"),
+                e => e.to_string(),
+            },
+        })?;
+        self.files().atomic_write(key, &bytes)
     }
 
     fn max_allocations_per_utxo(&self) -> u32 {
@@ -489,10 +553,10 @@ pub trait WalletOffline: WalletBackup {
         let src = original_file_path.as_ref().to_string_lossy().to_string();
         let dst = media.clone().file_path;
         if src != dst {
-            atomic_write_with(Path::new(&dst), |tmp| {
-                fs::copy(&src, tmp)?;
-                Ok(())
-            })?;
+            // the source is a file supplied by the host, the destination is a wallet blob
+            let bytes = fs::read(&src)?;
+            self.files()
+                .atomic_write(&self.wallet_key(Path::new(&dst))?, &bytes)?;
         }
         Ok(())
     }
@@ -567,16 +631,17 @@ pub trait WalletOffline: WalletBackup {
     ) -> Result<(String, PathBuf, ValidContract), Error> {
         let valid_contract = builder.issue_contract().expect("issuance should succeed");
         let asset_id = valid_contract.contract_id().to_string();
-        // wasm: no filesystem, so the contract is only imported into the in-memory DB and the
-        // consignment file is not written; the path is unused by every caller
+        let contract_path = self.get_issue_consignment_path(&asset_id);
         #[cfg(target_arch = "wasm32")]
-        let contract_path = PathBuf::new();
+        {
+            // rgb-ops only writes a validated consignment to a path, so the browser rebuilds the
+            // exact bytes and stores them through its blob adapter under the native key
+            let bytes = contract_file_bytes(&valid_contract)?;
+            self.files()
+                .atomic_write(&self.wallet_key(&contract_path)?, &bytes)?;
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        let contract_path = {
-            let contract_path = self.get_issue_consignment_path(&asset_id);
-            atomic_write_with(&contract_path, |tmp| Ok(valid_contract.save_file(tmp)?))?;
-            contract_path
-        };
+        atomic_write_with(&contract_path, |tmp| Ok(valid_contract.save_file(tmp)?))?;
         Ok((asset_id, contract_path, valid_contract))
     }
 
@@ -2652,7 +2717,13 @@ pub trait WalletOffline: WalletBackup {
                 .txid
                 .as_ref()
                 .map(|txid| self.get_transfer_dir(txid).join(UNSIGNED_PSBT_FILE))
-                .filter(|p| p.exists())
+                .filter(|p| {
+                    // a wallet that cannot tell whether the file exists reports it as missing,
+                    // which is what `Path::exists` does
+                    self.wallet_key(p)
+                        .and_then(|k| self.files().exists(&k))
+                        .unwrap_or(false)
+                })
                 .map(|p| p.to_string_lossy().to_string()),
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness | TransferKind::Issuance => {
                 None
@@ -3104,16 +3175,20 @@ pub trait WalletOffline: WalletBackup {
 
     fn get_transfer_end_data_by_txid(&self, txid: String) -> Result<TransferEndData, Error> {
         let transfer_dir = self.get_transfer_dir(&txid);
-        if !transfer_dir.exists() {
+        let transfer_key = self.transfer_key(&txid)?;
+        if !self.files().exists(&transfer_key)? {
             return Err(Error::UnknownTransfer { txid });
         }
 
-        let info_file = transfer_dir.join(TRANSFER_DATA_FILE);
-        let serialized_info = fs::read_to_string(info_file)?;
+        let info_key = transfer_key.join(TRANSFER_DATA_FILE)?;
+        let serialized_info =
+            String::from_utf8(self.files().read(&info_key)?).map_err(|e| Error::Internal {
+                details: format!("cannot read transfer data {info_key}: {e}"),
+            })?;
         let info_contents: InfoBatchTransfer =
             serde_json::from_str(&serialized_info).map_err(InternalError::from)?;
 
-        let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
+        let fascia = self.read_fascia_at(&transfer_key.join(FASCIA_FILE)?)?;
 
         Ok((txid, transfer_dir, info_contents, fascia))
     }
@@ -3142,9 +3217,18 @@ pub trait WalletOffline: WalletBackup {
             )?;
             stock.store_spv_proofs(spv_proofs)?;
             let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
-            fs::create_dir_all(&asset_transfer_dir)?;
+            let asset_transfer_key = self.wallet_key(&asset_transfer_dir)?;
+            self.files().create_dir_all(&asset_transfer_key)?;
             let consignment_path = self.get_send_consignment_path_impl(asset_transfer_dir);
-            atomic_write_with(&consignment_path, |tmp| Ok(consignment.save_file(tmp)?))?;
+            let mut bytes = Vec::new();
+            consignment.save(&mut bytes).map_err(|e| Error::Internal {
+                details: format!(
+                    "cannot serialize consignment {}: {e}",
+                    consignment_path.display()
+                ),
+            })?;
+            self.files()
+                .atomic_write(&self.wallet_key(&consignment_path)?, &bytes)?;
         }
         Ok(())
     }

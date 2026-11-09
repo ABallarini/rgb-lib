@@ -622,8 +622,8 @@ use crate::{
     },
     no_wallet::{BitcoindAuth, IndexerConfig},
     utils::{
-        check_proxy, detect_indexer, get_indexer_and_resolver, hash_file, proxy_max_media,
-        proxy_retention_grace, script_buf_from_recipient_id,
+        check_proxy, detect_indexer, get_indexer_and_resolver, hash_file, hash_file_bytes,
+        proxy_max_media, proxy_retention_grace, script_buf_from_recipient_id,
     },
     wallet::{AssignmentsCollection, Indexer, multisig::RespondToOperation},
 };

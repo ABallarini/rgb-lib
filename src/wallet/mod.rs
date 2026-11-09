@@ -4,6 +4,9 @@
 
 pub(crate) mod backup;
 pub(crate) mod core;
+// Wallet-relative storage seam: every wallet owns one adapter and routes its file operations
+// through it.
+pub(crate) mod files;
 #[cfg(feature = "_online")]
 pub(crate) mod indexer;
 pub(crate) mod multisig;
@@ -68,6 +71,7 @@ pub(crate) use core::{
 };
 #[cfg(feature = "_online")]
 pub use core::{SyncKeychain, SyncOptions, SyncStrategy};
+pub(crate) use files::{WalletFiles, WalletPath, WasmFilesState, default_files};
 #[cfg(feature = "bitcoind")]
 pub(crate) use indexer::BitcoindClient;
 #[cfg(feature = "_online")]

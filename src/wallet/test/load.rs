@@ -424,6 +424,53 @@ fn unsupported_manifest_version_fail() {
 
 #[test]
 #[parallel]
+fn malformed_manifest_fail() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let manifest_path = wallet.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+    drop(wallet);
+
+    // a truncated manifest is not a valid JSON document at all
+    fs::write(&manifest_path, b"{ not json").unwrap();
+    let err = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None)
+        .err()
+        .unwrap();
+    assert_matches!(
+        err,
+        Error::Internal { details } if details.starts_with("Serde JSON error: ")
+    );
+
+    // a valid JSON object without a version is reported before any other field is considered
+    fs::write(&manifest_path, br#"{"bitcoin_network": "regtest"}"#).unwrap();
+    let err = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None)
+        .err()
+        .unwrap();
+    assert_matches!(
+        err,
+        Error::Internal { details } if details.starts_with("Serde JSON error: ")
+            && details.contains("missing field `version`")
+    );
+
+    // a version of the wrong type fails to deserialize rather than reading as 1
+    fs::write(&manifest_path, br#"{"version": "1"}"#).unwrap();
+    let err = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None)
+        .err()
+        .unwrap();
+    assert_matches!(
+        err,
+        Error::Internal { details } if details.starts_with("Serde JSON error: ")
+    );
+}
+
+#[test]
+#[parallel]
 fn wrong_mnemonic_fail() {
     let test_data_dir = PrivateDataDir::new();
     let test_data_dir_str = test_data_dir.string();

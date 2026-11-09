@@ -1028,6 +1028,7 @@ fn legacy_bdk_store_is_imported() {
     let database = setup_db(dir.path()).unwrap();
     let bdk_wallet = setup_bdk(
         &database,
+        &*default_files(dir.path()),
         dir.path(),
         descriptors.colored.clone(),
         descriptors.vanilla.clone(),

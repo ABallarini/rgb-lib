@@ -596,7 +596,7 @@ pub trait WalletOnline: WalletOffline {
         r#type: WalletTransactionType,
     ) -> Result<(), Error> {
         let txid = psbt.unsigned_tx.compute_txid().to_string();
-        if self.get_transfer_dir(&txid).exists() {
+        if self.files().exists(&self.transfer_key(&txid)?)? {
             return Err(Error::WrongOperation { txid });
         }
         if let Some((wallet_transaction, _)) =
@@ -1348,9 +1348,8 @@ pub trait WalletOnline: WalletOffline {
         self.wallet_specific_consistency_checks(txn)?;
 
         let medias = txn.iter_media()?;
-        let media_dir = self.media_dir();
         for media in medias {
-            if !media_dir.join(media.digest).exists() {
+            if !self.files().exists(&self.media_key(&media.digest)?)? {
                 return Err(Error::Inconsistency {
                     details: s!("DB media do not match with the ones stored in media directory"),
                 });
@@ -1562,6 +1561,15 @@ pub trait WalletOnline: WalletOffline {
             .map_err(InternalError::from)?)
     }
 
+    fn get_signed_psbt(&self, transfer_dir: &Path) -> Result<Psbt, Error> {
+        let psbt_file = transfer_dir.join(SIGNED_PSBT_FILE);
+        let psbt_str = String::from_utf8(self.files().read(&self.wallet_key(&psbt_file)?)?)
+            .map_err(|e| Error::Internal {
+                details: format!("cannot read {}: {e}", psbt_file.display()),
+            })?;
+        Ok(Psbt::from_str(&psbt_str)?)
+    }
+
     /// Verify a downloaded blob against its expected plaintext hash, first decrypting it with the
     /// key shared with the counterparty as dictated by `encryption`, the mode the payload is
     /// expected in: the recipient's invoice preference for consignments and media, always
@@ -1625,6 +1633,10 @@ pub trait WalletOnline: WalletOffline {
     /// decrypted on the fly, the plaintext is streamed into `dest` one chunk at a time and written
     /// atomically, then the file is verified against the expected plaintext hash before being
     /// made visible.
+    ///
+    /// This is the one wallet write that does not go through the wallet adapter: the payload is
+    /// streamed into a temporary file and verified by reading that file back, so it needs a real
+    /// filesystem path rather than a byte buffer.
     fn decrypt_blob_with_shared_key_to_file(
         &self,
         payload_b64: &str,
@@ -1726,7 +1738,10 @@ pub trait WalletOnline: WalletOffline {
             .map_err(|e| Error::Internal {
                 details: e.to_string(),
             })?;
-        atomic_write(&self.get_received_signed_tx_path(recipient_id), &tx_bytes)?;
+        self.files().atomic_write(
+            &self.wallet_key(&self.get_received_signed_tx_path(recipient_id))?,
+            &tx_bytes,
+        )?;
         self.broadcast_tx(tx)?;
         Ok(())
     }
@@ -1735,7 +1750,10 @@ pub trait WalletOnline: WalletOffline {
     /// from the mempool. Failures are only logged, as the TX may e.g. have been replaced.
     fn rebroadcast_received_tx(&self, recipient_id: &str) {
         let path = self.get_received_signed_tx_path(recipient_id);
-        let Ok(tx_bytes) = fs::read(&path) else {
+        let Ok(tx_bytes) = self
+            .wallet_key(&path)
+            .and_then(|key| self.files().read(&key))
+        else {
             return;
         };
         let tx: BdkTransaction =
@@ -1841,12 +1859,13 @@ pub trait WalletOnline: WalletOffline {
             None
         };
 
-        let mut saved_media_paths = vec![];
+        let mut saved_media = vec![];
         for attachment in attachments {
             let digest = hex::encode(attachment.digest);
             let media_path = self.media_dir().join(&digest);
+            let media_key = self.media_key(&digest)?;
             // resolve media only if the file is not already present
-            if media_path.exists() {
+            if self.files().exists(&media_key)? {
                 continue;
             }
             match mode {
@@ -1861,7 +1880,9 @@ pub trait WalletOnline: WalletOffline {
                     debug!(self.logger(), "Media GET response: {:?}", media_res);
                     match media_res.result {
                         Some(media_res) => {
-                            // also checks the plaintext against the digest in the contract
+                            // also checks the plaintext against the digest in the contract. The
+                            // payload is streamed through a temporary file and verified by
+                            // reading it back, so this one write stays on the native path.
                             self.decrypt_blob_with_shared_key_to_file(
                                 &media_res,
                                 data.recipient_encryption,
@@ -1876,35 +1897,36 @@ pub trait WalletOnline: WalletOffline {
                                 self.logger(),
                                 "Cannot find the media file but the contract defines one"
                             );
-                            Self::cleanup_media_files(&saved_media_paths)?;
+                            self.cleanup_media_files(&saved_media)?;
                             return Ok(false);
                         }
                     }
                 }
                 ReceiveMode::OutOfBand { .. } => match provided_map.get(&digest) {
-                    Some(path) => atomic_write_with(&media_path, |tmp| {
-                        fs::copy(path, tmp)?;
-                        Ok(())
-                    })?,
+                    Some(path) => {
+                        // the provided file is a host path, the wallet copy is a wallet blob
+                        let bytes = fs::read(path)?;
+                        self.files().atomic_write(&media_key, &bytes)?;
+                    }
                     None => {
                         error!(
                             self.logger(),
                             "Media for digest {digest} was not provided for the out-of-band receive"
                         );
-                        Self::cleanup_media_files(&saved_media_paths)?;
+                        self.cleanup_media_files(&saved_media)?;
                         return Ok(false);
                     }
                 },
             }
-            saved_media_paths.push(media_path);
+            saved_media.push(media_key);
         }
 
         Ok(true)
     }
 
-    fn cleanup_media_files(paths: &[PathBuf]) -> Result<(), Error> {
-        for path in paths {
-            fs::remove_file(path)?;
+    fn cleanup_media_files(&self, keys: &[WalletPath]) -> Result<(), Error> {
+        for key in keys {
+            self.files().remove(key)?;
         }
         Ok(())
     }
@@ -2218,7 +2240,11 @@ pub trait WalletOnline: WalletOffline {
     ) -> Result<ValidTransfer, Error> {
         let consignment_path = self.get_receive_consignment_path(recipient_id);
         let valid_consignment_path = self.get_receive_valid_consignment_path(&consignment_path);
-        if valid_consignment_path.exists() {
+        if self
+            .files()
+            .exists(&self.wallet_key(&valid_consignment_path)?)?
+        {
+            // rgb-ops only exposes a path-based loader for a validated consignment
             return ValidTransfer::load_file(&valid_consignment_path)
                 .map_err(|e| InternalError::from(e).into());
         }
@@ -2227,7 +2253,9 @@ pub trait WalletOnline: WalletOffline {
             self.logger(),
             "No validated consignment for {recipient_id}, validating consignment"
         );
-        let consignment = RgbTransfer::load_file(&consignment_path).map_err(InternalError::from)?;
+        let consignment_key = self.wallet_key(&consignment_path)?;
+        let consignment = RgbTransfer::load(&self.files().read(&consignment_key)?[..])
+            .map_err(InternalError::from)?;
         let txid = batch_transfer
             .txid
             .as_deref()
@@ -2263,11 +2291,8 @@ pub trait WalletOnline: WalletOffline {
     /// Delete the validated copy of a received consignment
     fn delete_valid_consignment(&self, recipient_id: &str) -> Result<(), Error> {
         let consignment_path = self.get_receive_consignment_path(recipient_id);
-        match fs::remove_file(self.get_receive_valid_consignment_path(&consignment_path)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        let key = self.wallet_key(&self.get_receive_valid_consignment_path(&consignment_path))?;
+        self.files().remove(&key)
     }
 
     fn collect_unsafe_history_txids(warnings: &[Warning], exclude_txid: &str) -> HashSet<String> {
@@ -2532,10 +2557,20 @@ pub trait WalletOnline: WalletOffline {
         // rolls back the `used` flag on the transfer transport endpoint
         let consignment_path = self.get_receive_consignment_path(&recipient_id);
         let consignment_meta_path = self.get_receive_consignment_meta_path(&recipient_id);
-        let data = if consignment_path.exists()
-            && consignment_meta_path.exists()
-            && let Ok(meta_str) = fs::read_to_string(&consignment_meta_path)
-            && let Ok(meta) = serde_json::from_str::<ReceivedConsignmentMeta>(&meta_str)
+        let consignment_key = self.wallet_key(&consignment_path)?;
+        let consignment_meta_key = self.wallet_key(&consignment_meta_path)?;
+        // a consignment or metadata file that cannot be read is treated as missing, as before
+        let cached_meta = if self.files().exists(&consignment_key)?
+            && self.files().exists(&consignment_meta_key)?
+        {
+            self.files()
+                .read(&consignment_meta_key)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ReceivedConsignmentMeta>(&bytes).ok())
+        } else {
+            None
+        };
+        let data = if let Some(meta) = cached_meta
             && let Some(cached_transfer_id) = meta.transfer_id.clone()
             && let Some((cached_tte, cached_te)) = tte_data.iter().find(|(tte, te)| {
                 tte.kind == TransportEndpointKind::RecipientProxy
@@ -2662,7 +2697,8 @@ pub trait WalletOnline: WalletOffline {
                 batch: data.batch,
             };
             let meta_str = serde_json::to_string(&meta).map_err(InternalError::from)?;
-            atomic_write(&consignment_meta_path, meta_str.as_bytes())?;
+            self.files()
+                .atomic_write(&consignment_meta_key, meta_str.as_bytes())?;
 
             // persist the transfer ID, the consignment hash and the sender proxy endpoint (for the
             // ACK)
@@ -3770,12 +3806,12 @@ pub trait WalletOnline: WalletOffline {
             );
 
             // copy the provided consignment to the canonical receive path, so later refresh stages
-            // (safe height, confirmations) find it where they expect it
+            // (safe height, confirmations) find it where they expect it. The source is a host
+            // path, the destination is a wallet file.
             let consignment_path = self.get_receive_consignment_path(&recipient_id);
-            atomic_write_with(&consignment_path, |tmp| {
-                fs::copy(consignment_path_in, tmp)?;
-                Ok(())
-            })?;
+            let bytes = fs::read(consignment_path_in)?;
+            self.files()
+                .atomic_write(&self.wallet_key(&consignment_path)?, &bytes)?;
 
             let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
             let mode = ReceiveMode::OutOfBand {
@@ -3886,9 +3922,12 @@ pub trait WalletOnline: WalletOffline {
             let proxy_url =
                 Self::used_recipient_proxy_endpoint(&tte_data).expect("there should be 1 used TTE");
             let consignment_meta_path = self.get_receive_consignment_meta_path(&recipient_id);
-            let meta: ReceivedConsignmentMeta =
-                serde_json::from_str(&fs::read_to_string(&consignment_meta_path)?)
-                    .map_err(InternalError::from)?;
+            let meta: ReceivedConsignmentMeta = serde_json::from_slice(
+                &self
+                    .files()
+                    .read(&self.wallet_key(&consignment_meta_path)?)?,
+            )
+            .map_err(InternalError::from)?;
             let transfer_id = transfer
                 .proxy_transfer_id
                 .clone()
@@ -4182,7 +4221,7 @@ pub trait WalletOnline: WalletOffline {
         let transfer_dir = self.get_transfers_dir().join(txid);
         let signed_tx = self.get_signed_tx(&transfer_dir)?;
         let mut stock = self.rgb_stock(txn)?;
-        let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
+        let fascia = self.read_fascia_at(&self.wallet_key(&transfer_dir.join(FASCIA_FILE))?)?;
         self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
@@ -4345,7 +4384,10 @@ pub trait WalletOnline: WalletOffline {
         // recover the entropy used at send time for the operation result
         let transfer_dir = self.get_transfers_dir().join(&txid);
         let info_file = transfer_dir.join(TRANSFER_DATA_FILE);
-        let serialized_info = fs::read_to_string(info_file)?;
+        let serialized_info = String::from_utf8(self.files().read(&self.wallet_key(&info_file)?)?)
+            .map_err(|e| Error::Internal {
+                details: format!("cannot read {}: {e}", info_file.display()),
+            })?;
         let info_contents: InfoBatchTransfer =
             serde_json::from_str(&serialized_info).map_err(InternalError::from)?;
 
@@ -5691,8 +5733,9 @@ pub trait WalletOnline: WalletOffline {
         let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
         strip_rgb_data(psbt);
         check_psbt_parsable(psbt)?;
-        fs::create_dir_all(&transfer_dir)?;
-        write_fascia(&transfer_dir.join(FASCIA_FILE), &fascia)?;
+        let transfer_key = self.wallet_key(&transfer_dir)?;
+        self.files().create_dir_all(&transfer_key)?;
+        self.write_fascia_at(&transfer_key.join(FASCIA_FILE)?, &fascia)?;
 
         let witness_txid = psbt.get_txid();
         for (asset_id, transfer_info) in transfer_info_map.iter_mut() {
@@ -5791,7 +5834,8 @@ pub trait WalletOnline: WalletOffline {
         let serialized_info =
             serde_json::to_string(&info_batch_transfer).map_err(InternalError::from)?;
         let info_file = transfer_dir.join(TRANSFER_DATA_FILE);
-        atomic_write(&info_file, serialized_info.as_bytes())?;
+        self.files()
+            .atomic_write(&self.wallet_key(&info_file)?, serialized_info.as_bytes())?;
 
         Ok(PrepareRgbPsbtResult::Success(Box::new(
             BeginOperationData {
@@ -6116,7 +6160,8 @@ pub trait WalletOnline: WalletOffline {
         for asset_id in info_contents.transfers.keys() {
             let atd = self.get_asset_transfer_dir(transfer_dir, asset_id);
             let cpath = self.get_send_consignment_path_impl(&atd);
-            consignment_hashes.insert(asset_id.clone(), hash_file(&cpath)?);
+            let bytes = self.files().read(&self.wallet_key(&cpath)?)?;
+            consignment_hashes.insert(asset_id.clone(), hash_file_bytes(&bytes));
         }
         Ok(consignment_hashes)
     }
@@ -6727,11 +6772,12 @@ pub trait WalletOnline: WalletOffline {
         }
         let mut hasher = DefaultHasher::new();
         receive_ids.hash(&mut hasher);
-        let transfer_dir = self.get_transfer_dir(&hasher.finish().to_string());
-        if transfer_dir.exists() {
-            fs::remove_dir_all(&transfer_dir)?;
+        let transfer_id = hasher.finish().to_string();
+        let transfer_key = self.transfer_key(&transfer_id)?;
+        if self.files().exists(&transfer_key)? {
+            self.files().remove_dir_all(&transfer_key)?;
         }
-        Ok(transfer_dir)
+        Ok(self.get_transfer_dir(&transfer_id))
     }
 
     /// Prepare the PSBT of an operation on a single asset (an inflation, a burn or a mint),
@@ -6876,11 +6922,14 @@ pub trait WalletOnline: WalletOffline {
             .compute_txid()
             .to_string();
         let new_transfer_dir = self.get_transfer_dir(&txid);
-        fs::rename(transfer_dir, &new_transfer_dir)?;
+        self.files().rename(
+            &self.wallet_key(&transfer_dir)?,
+            &self.wallet_key(&new_transfer_dir)?,
+        )?;
 
         // persist the unsigned PSBT
-        atomic_write(
-            &new_transfer_dir.join(UNSIGNED_PSBT_FILE),
+        self.files().atomic_write(
+            &self.wallet_key(&new_transfer_dir.join(UNSIGNED_PSBT_FILE))?,
             begin_operation_data.psbt.to_string().as_bytes(),
         )?;
 
@@ -7223,10 +7272,9 @@ pub trait WalletOnline: WalletOffline {
         self.gen_consignments(txn, &fascia, &info_contents.transfers, &transfer_dir)?;
 
         // only the TX is needed to broadcast it
-        atomic_write(
-            &transfer_dir.join(SIGNED_TX_FILE),
-            hex::encode(&tx_bytes).as_bytes(),
-        )?;
+        let signed_tx_key = self.wallet_key(&transfer_dir.join(SIGNED_TX_FILE))?;
+        self.files()
+            .atomic_write(&signed_tx_key, hex::encode(&tx_bytes).as_bytes())?;
 
         // sender operation key (one per operation, shared across all recipients)
         let seed: [u8; 32] = info_contents

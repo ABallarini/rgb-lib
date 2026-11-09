@@ -1089,9 +1089,11 @@ impl MultisigWallet {
             [..8]
             .to_string();
         let (wallet_dir, logger, _logger_guard) = setup_new_wallet(&wallet_data, &fingerprint)?;
+        // one adapter per wallet, rooted exactly at the wallet directory
+        let files = default_files(wallet_dir.clone());
         // wasm: the host owns durable storage, so there is no hub ops directory to create
         #[cfg(not(target_arch = "wasm32"))]
-        fs::create_dir_all(wallet_dir.join(HUB_OPS_DIR))?;
+        files.create_dir_all(&WalletPath::from_segments(&[HUB_OPS_DIR])?)?;
 
         // setup rgb-lib DB
         let database = setup_db_with_backend(&wallet_dir, database)?;
@@ -1099,6 +1101,7 @@ impl MultisigWallet {
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(
             &database,
+            &*files,
             &wallet_dir,
             descs.colored,
             descs.vanilla,
@@ -1106,7 +1109,7 @@ impl MultisigWallet {
         )?;
 
         // migrate any legacy filesystem RGB data into the DB (one-time, no-op otherwise)
-        migrate_rgb_fs_to_db(&wallet_dir, &database)?;
+        migrate_rgb_fs_to_db(&*files, &wallet_dir, &database)?;
 
         // setup RGB
         setup_rgb(
@@ -1125,6 +1128,7 @@ impl MultisigWallet {
                 _logger_guard,
                 database: Arc::new(database),
                 wallet_dir,
+                files,
                 bdk_wallet,
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
                 #[cfg(feature = "_online")]
@@ -1140,11 +1144,25 @@ impl MultisigWallet {
     /// SQLite wallets, which persist themselves. Writing the returned bytes somewhere durable
     /// (for example IndexedDB) is up to the host: on wasm32 use
     /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot) on an explicit
-    /// flush boundary, never concurrently for the same wallet id.
+    /// flush boundary. Two overlapping writes for one wallet id are serialized by IndexedDB and the
+    /// last committed write wins.
     ///
-    /// Multisig wallets have no manifest: the snapshot is the raw database snapshot and
+    /// Multisig wallets have no manifest: the snapshot is the raw database snapshot natively, and
+    /// on wasm32 an envelope with the browser files section and no manifest;
     /// [`MultisigWallet::from_snapshot`] does not validate the settings.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            match self.internals.database.snapshot()? {
+                Some(db_snapshot) => {
+                    let files = self.internals.files.snapshot_state();
+                    crate::wallet::core::encode_wasm_snapshot(None, files.as_ref(), &db_snapshot)
+                        .map(Some)
+                }
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         self.internals.database.snapshot()
     }
 
@@ -1156,9 +1174,10 @@ impl MultisigWallet {
     /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot). The future
     /// resolves once the IndexedDB transaction commits.
     ///
-    /// Call it after a logical unit of work, and never concurrently for the same wallet id: two
-    /// overlapping writes for one id have no ordering guarantee. An error leaves the in-memory
-    /// state unchanged, so the wallet stays usable and a later flush can retry.
+    /// Call it after a logical unit of work. Two overlapping flushes for one wallet id are
+    /// serialized by IndexedDB and the last committed write wins, with no ordering guarantee. An
+    /// error leaves the in-memory state unchanged, so the wallet stays usable and a later flush can
+    /// retry.
     ///
     /// Native builds expose no `flush`: their SQLite backend writes every change itself, so a
     /// native flush would be a no-op.
@@ -1173,8 +1192,10 @@ impl MultisigWallet {
     /// Rebuild a wallet from the bytes returned by [`MultisigWallet::snapshot`], over the
     /// in-memory backend.
     ///
-    /// The wallet directory must already exist, as it holds the files the first construction
-    /// wrote; this constructor then follows the same setup path as [`MultisigWallet::new`].
+    /// On native the wallet directory must already exist, as it holds the files the first
+    /// construction wrote; this constructor then follows the same setup path as
+    /// [`MultisigWallet::new`]. On wasm32 the browser files travel in the snapshot and are restored
+    /// into the wallet's adapter before it is returned.
     ///
     /// Constructors are synchronous, so the host restores the snapshot asynchronously with
     /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
@@ -1186,8 +1207,21 @@ impl MultisigWallet {
         wallet_data: WalletData,
         keys: MultisigKeys,
     ) -> Result<Self, Error> {
-        let database = RgbLibDatabase::new_memory_from_snapshot(snapshot)?;
-        Self::new_with_database(wallet_data, keys, Some(database))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (_, files, db_snapshot) = crate::wallet::core::decode_wasm_snapshot(snapshot)?;
+            let database = RgbLibDatabase::new_memory_from_snapshot(&db_snapshot)?;
+            let wallet = Self::new_with_database(wallet_data, keys, Some(database))?;
+            // the browser blobs travel in the envelope and are in the adapter before it is returned
+            wallet.internals.files.restore_snapshot_state(files);
+            Ok(wallet)
+        }
+        // native snapshots are the raw database bytes and have no files section
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let database = RgbLibDatabase::new_memory_from_snapshot(snapshot)?;
+            Self::new_with_database(wallet_data, keys, Some(database))
+        }
     }
 
     /// Return the bitcoin keys of the wallet.
@@ -1267,15 +1301,17 @@ impl MultisigWallet {
 
     fn get_or_download_file(&self, file_metadata: &FileMetadata) -> Result<PathBuf, Error> {
         let filepath = self.get_cached_file_path(&file_metadata.file_id);
-        if filepath.exists() {
+        if self.files().exists(&self.wallet_key(&filepath)?)? {
             return Ok(filepath);
         }
         if matches!(file_metadata.r#type, FileType::Media) {
             let media_path = self.get_media_dir().join(&file_metadata.file_id);
-            if media_path.exists() {
+            if self.files().exists(&self.wallet_key(&media_path)?)? {
                 return Ok(media_path);
             }
         }
+        // the hub client streams the download into a file, so it needs a real path: this is the
+        // one write of the hub cache that stays native
         self.hub_client()
             .get_file(&file_metadata.file_id, &filepath)?;
         Ok(filepath)
@@ -1302,15 +1338,16 @@ impl MultisigWallet {
         files: &[FileResponse],
     ) -> Result<(), Error> {
         let transfer_dir = self.get_transfer_dir(txid);
-        fs::create_dir_all(&transfer_dir)?;
+        let transfer_key = self.wallet_key(&transfer_dir)?;
+        self.files().create_dir_all(&transfer_key)?;
         let batch_transfer = InfoBatchTransfer::extract_from_files(files)?;
         let batch_data_str = serde_json::to_string(&batch_transfer).expect("serializable");
-        atomic_write(
-            &transfer_dir.join(TRANSFER_DATA_FILE),
+        self.files().atomic_write(
+            &transfer_key.join(TRANSFER_DATA_FILE)?,
             batch_data_str.as_bytes(),
         )?;
         let fascia = extract_fascia_from_files(files)?;
-        write_fascia(&transfer_dir.join(FASCIA_FILE), &fascia)?;
+        self.write_fascia_at(&transfer_key.join(FASCIA_FILE)?, &fascia)?;
         Ok(())
     }
 
@@ -1807,6 +1844,8 @@ impl MultisigWallet {
         let contract_id = valid_contract.contract_id();
         let asset_id = contract_id.to_string();
         let contract_path = self.get_issue_consignment_path(&asset_id);
+        // stays native: the asset ID carries its `rgb:` scheme prefix, so the file name holds a
+        // `:` that `WalletPath` rejects, which is how the file is already laid out
         fs::rename(&consignment_file.filepath, &contract_path)?;
 
         // handle media files, if any
@@ -1830,15 +1869,17 @@ impl MultisigWallet {
             .collect::<Vec<_>>();
         let media_dir = self.get_media_dir();
         for media_file in media_files {
-            let media_digest = hash_file(&media_file.filepath)?;
+            let media_key = self.wallet_key(&media_file.filepath)?;
+            let media_digest = hash_file_bytes(&self.files().read(&media_key)?);
             if !attachment_digests.contains(&media_digest) {
                 return Err(Error::MultisigUnexpectedData {
                     details: s!("media digest mismatch"),
                 });
             }
             let media_path = media_dir.join(&media_digest);
-            if !media_path.exists() {
-                fs::rename(&media_file.filepath, media_path)?;
+            if !self.files().exists(&self.wallet_key(&media_path)?)? {
+                self.files()
+                    .rename(&media_key, &self.wallet_key(&media_path)?)?;
             }
         }
 
@@ -1905,11 +1946,12 @@ impl MultisigWallet {
             .ok_or(Error::MultisigUnexpectedData {
                 details: s!("receive data not found"),
             })?;
-        let file = fs::File::open(&metadata_file.filepath)?;
-        let reader = io::BufReader::new(file);
+        let metadata_key = self.wallet_key(&metadata_file.filepath)?;
         let receive_metadata: ReceiveMetadata =
-            serde_json::from_reader(reader).map_err(|_| Error::MultisigUnexpectedData {
-                details: s!("invalid receive data"),
+            serde_json::from_slice(&self.files().read(&metadata_key)?).map_err(|_| {
+                Error::MultisigUnexpectedData {
+                    details: s!("invalid receive data"),
+                }
             })?;
         let min_confirmations = receive_metadata.min_confirmations;
         let invoice = Invoice::new(receive_metadata.invoice.clone())?;
@@ -2057,10 +2099,10 @@ impl MultisigWallet {
 
         // cleanup cache for approved or discarded operations
         if op.status == OperationStatus::Approved || op.status == OperationStatus::Discarded {
-            let ops_dir = self.get_hub_ops_dir();
-            if ops_dir.exists() {
-                for entry in fs::read_dir(&ops_dir)? {
-                    fs::remove_file(entry?.path())?;
+            let ops_key = WalletPath::from_segments(&[HUB_OPS_DIR])?;
+            if self.files().exists(&ops_key)? {
+                for cached in self.files().list(&ops_key)? {
+                    self.files().remove(&cached)?;
                 }
             }
         }
@@ -2194,7 +2236,11 @@ impl MultisigWallet {
     /// cannot be used with this version. The key is written to the operation data when the
     /// operation is created, so this is detected as soon as the operation is seen, whatever its
     /// status.
-    fn is_legacy_operation(op: &OperationResponse, files: &[FileResponse]) -> Result<bool, Error> {
+    fn is_legacy_operation(
+        &self,
+        op: &OperationResponse,
+        files: &[FileResponse],
+    ) -> Result<bool, Error> {
         let Some(key) = Self::operation_key_name(&op.operation_type) else {
             return Ok(false);
         };
@@ -2206,11 +2252,11 @@ impl MultisigWallet {
         else {
             return Ok(false);
         };
-        let reader = io::BufReader::new(fs::File::open(&data_file.filepath)?);
         let data: serde_json::Value =
-            serde_json::from_reader(reader).map_err(|_| Error::MultisigUnexpectedData {
-                details: s!("invalid operation data"),
-            })?;
+            serde_json::from_slice(&self.files().read(&self.wallet_key(&data_file.filepath)?)?)
+                .map_err(|_| Error::MultisigUnexpectedData {
+                    details: s!("invalid operation data"),
+                })?;
         Ok(Self::operation_data_lacks_key(key, &data))
     }
 
@@ -2219,7 +2265,7 @@ impl MultisigWallet {
         // an operation from the previous proxy protocol cannot be processed and is not marked as
         // processed either: the sync stops here on every call, as the group must be drained with
         // the previous version and abandoned
-        if Self::is_legacy_operation(op, &files)? {
+        if self.is_legacy_operation(op, &files)? {
             error!(
                 self.logger(),
                 "Operation {} was created with the previous proxy protocol, the group cannot be used",
