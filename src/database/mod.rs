@@ -1,14 +1,14 @@
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 mod bdk;
 pub(crate) mod entities;
 pub(crate) mod rgb;
 // native adapter boundary: SQLite connection creation and migrations
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) mod sqlite;
 
 use super::*;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::database::entities::{
     asset, asset_transfer, batch_transfer, coloring, media, prelude::*, transfer,
     transfer_transport_endpoint, transport_endpoint, txo, wallet_transaction,
@@ -19,11 +19,11 @@ use crate::database::entities::{pending_witness_script, reserved_txo};
 use sea_orm::RelationTrait;
 
 /// Max number of values bound in a single `IN (...)` clause, well below SQLite's variable limit.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const SQL_IN_CHUNK_SIZE: usize = 500;
 
 /// Run `query` on chunks of `idxs` (to be used in an `IN (...)` clause) and collect the results.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn select_in_chunks<T>(
     idxs: &[i32],
     query: impl Fn(&[i32]) -> Result<Vec<T>, DbErr>,
@@ -285,12 +285,12 @@ impl From<LocalOutput> for DbTxoActMod {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub struct SqliteDatabase {
     connection: DatabaseConnection,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 impl SqliteDatabase {
     pub(crate) fn new(connection: DatabaseConnection) -> Self {
         Self { connection }
@@ -304,7 +304,7 @@ impl SqliteDatabase {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub struct SqliteTxn {
     txn: Option<DatabaseTransaction>,
     /// Callbacks run only if the transaction commits, to discard the crash-recovery copies of
@@ -314,14 +314,14 @@ pub struct SqliteTxn {
 
 // required by the rgb-ops `RgbStore` trait (implemented on `&SqliteTxn`); the inner
 // transaction is not `Debug`
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 impl std::fmt::Debug for SqliteTxn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteTxn").finish_non_exhaustive()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 impl Drop for SqliteTxn {
     fn drop(&mut self) {
         if let Some(txn) = self.txn.take() {
@@ -332,7 +332,7 @@ impl Drop for SqliteTxn {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 impl SqliteTxn {
     fn inner(&self) -> &DatabaseTransaction {
         self.txn.as_ref().expect("txn already consumed")
@@ -1239,48 +1239,46 @@ impl SqliteTxn {
 impl DbTxn {
     pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_bdk_changeset(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_bdk_changeset(),
         }
     }
 
     pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_bdk_changeset(changeset),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.update_bdk_changeset(changeset),
         }
     }
 }
 
 /// The storage backend behind [`RgbLibDatabase`]:
-/// * SQLite over the pooled [`DatabaseConnection`], as before;
-/// * the in-memory backend in tests and on `wasm32`, where no persistent
-///   storage exists (the host rebuilds it from a snapshot / seeds it fresh).
-///   Only `Sqlite` exists without the `wallet`-style build targets, hence the
-///   cfg on the [`RgbLibDatabase::Memory`] arm.
+/// * SQLite over the pooled [`DatabaseConnection`], as before, behind the `sqlite` feature;
+/// * the in-memory backend in tests, on `wasm32` and in native builds without `sqlite`, where no
+///   persistent storage exists (the host rebuilds it from a snapshot / seeds it fresh).
 // the memory backend types are crate-internal today; the enums are `pub` to match the visibility
 // of the transaction handles in the wallet method signatures
 #[allow(private_interfaces)]
 pub enum RgbLibDatabase {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
     Sqlite(SqliteDatabase),
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
     Memory(std::sync::Arc<crate::database::memory::MemoryBackend>),
 }
 
 impl RgbLibDatabase {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
     pub(crate) fn new(connection: DatabaseConnection) -> Self {
         Self::Sqlite(SqliteDatabase::new(connection))
     }
 
-    // the in-memory backend is single-threaded by design (wasm and tests)
+    // the in-memory backend is single-threaded by design (wasm, tests, driver-less native)
     #[allow(clippy::arc_with_non_send_sync)]
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
     pub(crate) fn new_memory() -> Self {
         Self::Memory(std::sync::Arc::new(
             crate::database::memory::MemoryBackend::new(),
@@ -1288,9 +1286,9 @@ impl RgbLibDatabase {
     }
 
     /// Rebuild an in-memory database from the bytes of [`MemoryBackend::to_snapshot`].
-    // the in-memory backend is single-threaded by design (wasm and tests)
+    // the in-memory backend is single-threaded by design (wasm, tests, driver-less native)
     #[allow(clippy::arc_with_non_send_sync)]
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
     pub(crate) fn new_memory_from_snapshot(snapshot: &[u8]) -> Result<Self, Error> {
         Ok(Self::Memory(std::sync::Arc::new(
             crate::database::memory::MemoryBackend::from_snapshot(snapshot)?,
@@ -1302,21 +1300,21 @@ impl RgbLibDatabase {
     /// Returns `None` for SQLite, which persists itself and has no snapshot format.
     pub(crate) fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             Self::Sqlite(_) => Ok(None),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             Self::Memory(backend) => backend.to_snapshot().map(Some),
         }
     }
 
     /// The in-memory backend, when this database runs in memory mode.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
     pub(crate) fn memory_backend(
         &self,
     ) -> Option<&std::sync::Arc<crate::database::memory::MemoryBackend>> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             Self::Sqlite(_) => None,
             Self::Memory(backend) => Some(backend),
         }
@@ -1325,9 +1323,9 @@ impl RgbLibDatabase {
     /// Open one transaction over the whole wallet data (tables + RGB stock).
     pub(crate) fn begin_transaction(&self) -> Result<DbTxn, Error> {
         Ok(match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             Self::Sqlite(db) => DbTxn::Sqlite(db.begin()?),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             Self::Memory(db) => DbTxn::Memory(db.begin_transaction()?),
         })
     }
@@ -1336,9 +1334,9 @@ impl RgbLibDatabase {
 /// Transaction handle of [`RgbLibDatabase`], over either backend.
 #[allow(private_interfaces)]
 pub enum DbTxn {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
     Sqlite(SqliteTxn),
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
     Memory(crate::database::memory::MemoryTxn),
 }
 
@@ -1347,9 +1345,9 @@ pub enum DbTxn {
 impl std::fmt::Debug for DbTxn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => std::fmt::Debug::fmt(t, f),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(_m) => f.debug_struct("DbTxn").finish_non_exhaustive(),
         }
     }
@@ -1361,9 +1359,9 @@ impl DbTxn {
     /// If the transaction is rolled back instead, the callback is dropped without running.
     pub(crate) fn on_commit(&self, f: impl FnOnce() + Send + 'static) {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.on_commit(f),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.on_commit(f),
         }
     }
@@ -1379,7 +1377,7 @@ impl DbTxn {
         f: impl FnOnce(&DbTxn) -> Result<T, Error>,
     ) -> Result<T, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 // the savepoint has to present itself to `f` as a regular `DbTxn` handle, so
                 // the savepoint logic of the sqlite transaction lives here, wrapped in the enum
@@ -1391,9 +1389,9 @@ impl DbTxn {
                 // on error the savepoint is dropped, which rolls it back
                 let res = f(&savepoint)?;
                 // the memory arm is compiled out on native non-test builds
-                #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+                #[cfg(all(feature = "sqlite", not(target_arch = "wasm32"), not(test)))]
                 let DbTxn::Sqlite(mut savepoint) = savepoint;
-                #[cfg(any(test, target_arch = "wasm32"))]
+                #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
                 let mut savepoint = match savepoint {
                     DbTxn::Sqlite(savepoint) => savepoint,
                     DbTxn::Memory(_) => unreachable!("took the same arm it matched"),
@@ -1412,7 +1410,7 @@ impl DbTxn {
                     .extend(callbacks);
                 Ok(res)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(t) => {
                 // no inner transaction: the memory backend rolls back by restoring both
                 // snapshots, and its RGB store refuses a nested `begin`
@@ -1432,18 +1430,18 @@ impl DbTxn {
 
     pub(crate) fn commit(self) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.commit(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.commit(),
         }
     }
 
     pub(crate) fn set_asset(&self, asset: DbAssetActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_asset(asset),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.set_asset(asset).map_err(Error::from),
         }
     }
@@ -1453,9 +1451,9 @@ impl DbTxn {
         asset_transfer: DbAssetTransferActMod,
     ) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_asset_transfer(asset_transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1466,9 +1464,9 @@ impl DbTxn {
 
     pub(crate) fn set_backup_info(&self, backup_info: DbBackupInfoActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_backup_info(backup_info),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1482,9 +1480,9 @@ impl DbTxn {
         batch_transfer: DbBatchTransferActMod,
     ) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_batch_transfer(batch_transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1495,9 +1493,9 @@ impl DbTxn {
 
     pub(crate) fn set_coloring(&self, coloring: DbColoringActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_coloring(coloring),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.set_coloring(coloring).map_err(Error::from),
         }
     }
@@ -1507,9 +1505,9 @@ impl DbTxn {
     #[allow(dead_code)]
     pub(crate) fn set_media(&self, media: DbMediaActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_media(media),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.set_media(media).map_err(Error::from),
         }
     }
@@ -1519,9 +1517,9 @@ impl DbTxn {
         pending_witness_script: DbPendingWitnessScriptActMod,
     ) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_pending_witness_script(pending_witness_script),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1536,9 +1534,9 @@ impl DbTxn {
         reserved_txos: Vec<DbReservedTxoActMod>,
     ) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_reserved_txos(reserved_txos),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1549,18 +1547,18 @@ impl DbTxn {
 
     pub(crate) fn set_token(&self, token: DbTokenActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_token(token),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.set_token(token).map_err(Error::from),
         }
     }
 
     pub(crate) fn set_token_media(&self, token_media: DbTokenMediaActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_token_media(token_media),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1574,9 +1572,9 @@ impl DbTxn {
         transport_endpoint: DbTransportEndpointActMod,
     ) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_transport_endpoint(transport_endpoint),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1587,9 +1585,9 @@ impl DbTxn {
 
     pub(crate) fn set_transfer(&self, transfer: DbTransferActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_transfer(transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.set_transfer(transfer).map_err(Error::from),
         }
     }
@@ -1599,9 +1597,9 @@ impl DbTxn {
         transfer_transport_endpoint: DbTransferTransportEndpointActMod,
     ) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_transfer_transport_endpoint(transfer_transport_endpoint),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1613,9 +1611,9 @@ impl DbTxn {
     #[cfg(feature = "_online")]
     pub(crate) fn set_txo(&self, txo: DbTxoActMod) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_txo(txo),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.set_txo(txo).map_err(Error::from),
         }
     }
@@ -1626,9 +1624,9 @@ impl DbTxn {
         wallet_transaction: DbWalletTransactionActMod,
     ) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.set_wallet_transaction(wallet_transaction),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1643,9 +1641,9 @@ impl DbTxn {
         transfer: &mut DbTransferActMod,
     ) -> Result<DbTransfer, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_transfer(transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.update_transfer(transfer).map_err(Error::from),
         }
     }
@@ -1653,9 +1651,9 @@ impl DbTxn {
     #[cfg(feature = "_online")]
     pub(crate) fn update_asset(&self, asset: &mut DbAssetActMod) -> Result<DbAsset, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_asset(asset),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.update_asset(asset).map_err(Error::from),
         }
     }
@@ -1666,9 +1664,9 @@ impl DbTxn {
         asset_transfer: &mut DbAssetTransferActMod,
     ) -> Result<DbAssetTransfer, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_asset_transfer(asset_transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1682,9 +1680,9 @@ impl DbTxn {
         backup_info: &mut DbBackupInfoActMod,
     ) -> Result<DbBackupInfo, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_backup_info(backup_info),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1699,9 +1697,9 @@ impl DbTxn {
         batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<DbBatchTransfer, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_batch_transfer(batch_transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1716,9 +1714,9 @@ impl DbTxn {
         transfer_transport_endpoint: &mut DbTransferTransportEndpointActMod,
     ) -> Result<DbTransferTransportEndpoint, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_transfer_transport_endpoint(transfer_transport_endpoint),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1730,27 +1728,27 @@ impl DbTxn {
     #[cfg(feature = "_online")]
     pub(crate) fn update_txo(&self, txo: DbTxoActMod) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.update_txo(txo),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.update_txo(txo).map_err(Error::from),
         }
     }
 
     pub(crate) fn del_backup_info(&self) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_backup_info(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.del_backup_info().map_err(Error::from),
         }
     }
 
     pub(crate) fn del_batch_transfer(&self, batch_transfer: &DbBatchTransfer) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_batch_transfer(batch_transfer),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1761,9 +1759,9 @@ impl DbTxn {
 
     pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_coloring(asset_transfer_idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1775,9 +1773,9 @@ impl DbTxn {
     #[cfg(feature = "_online")]
     pub(crate) fn del_pending_witness_script(&self, script: String) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_pending_witness_script(script),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1789,9 +1787,9 @@ impl DbTxn {
     #[cfg(feature = "_online")]
     pub(crate) fn del_reserved_txos(&self, reserved_txos: &[DbReservedTxo]) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_reserved_txos(reserved_txos),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1806,9 +1804,9 @@ impl DbTxn {
         outpoints: &[Outpoint],
     ) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_colored_reserved_txos_by_outpoints(outpoints),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1823,9 +1821,9 @@ impl DbTxn {
         batch_transfer_idx: i32,
     ) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_reserved_txos_for_batch_transfer(batch_transfer_idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1836,18 +1834,18 @@ impl DbTxn {
 
     pub(crate) fn del_txo(&self, idx: i32) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_txo(idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.del_txo(idx).map_err(Error::from),
         }
     }
 
     pub(crate) fn del_wallet_transaction(&self, idx: i32) -> Result<(), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.del_wallet_transaction(idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1858,27 +1856,27 @@ impl DbTxn {
 
     pub(crate) fn get_asset(&self, asset_id: String) -> Result<Option<DbAsset>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_asset(asset_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_asset(asset_id).map_err(Error::from),
         }
     }
 
     pub(crate) fn get_backup_info(&self) -> Result<Option<DbBackupInfo>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_backup_info(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_backup_info().map_err(Error::from),
         }
     }
 
     pub(crate) fn get_batch_transfer(&self, idx: i32) -> Result<Option<DbBatchTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_batch_transfer(idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_batch_transfer(idx),
         }
     }
@@ -1888,9 +1886,9 @@ impl DbTxn {
         txid: &str,
     ) -> Result<Vec<DbBatchTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_batch_transfers_by_txid(txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_batch_transfers_by_txid(txid),
         }
     }
@@ -1901,9 +1899,9 @@ impl DbTxn {
         batch_transfer_idx: i32,
     ) -> Result<Vec<DbTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_batch_transfer_transfers(batch_transfer_idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1919,9 +1917,9 @@ impl DbTxn {
         failed_since: i64,
     ) -> Result<Vec<(DbTransfer, DbBatchTransfer)>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_pending_or_recently_failed_incoming_transfers(failed_since),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1931,9 +1929,9 @@ impl DbTxn {
 
     pub(crate) fn get_media(&self, media_idx: i32) -> Result<Option<DbMedia>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_media(media_idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_media(media_idx).map_err(Error::from),
         }
     }
@@ -1941,9 +1939,9 @@ impl DbTxn {
     #[allow(dead_code)]
     pub(crate) fn get_media_by_digest(&self, digest: String) -> Result<Option<DbMedia>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_media_by_digest(digest),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1958,9 +1956,9 @@ impl DbTxn {
         txo_idxs: Vec<i32>,
     ) -> Result<Vec<DbColoring>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_receive_colorings_by_txo_idxs(txo_idxs),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_receive_colorings_by_txo_idxs(txo_idxs),
         }
     }
@@ -1970,9 +1968,9 @@ impl DbTxn {
         endpoint: String,
     ) -> Result<Option<DbTransportEndpoint>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_transport_endpoint(endpoint),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -1983,9 +1981,9 @@ impl DbTxn {
 
     pub(crate) fn get_txo(&self, outpoint: &Outpoint) -> Result<Option<DbTxo>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_txo(outpoint),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_txo(outpoint).map_err(Error::from),
         }
     }
@@ -1995,9 +1993,9 @@ impl DbTxn {
         idxs: &[i32],
     ) -> Result<Vec<DbWalletTransaction>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_wallet_transactions_by_idxs(idxs),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_wallet_transactions_by_idxs(idxs),
         }
     }
@@ -2007,9 +2005,9 @@ impl DbTxn {
         txid: &str,
     ) -> Result<Option<(DbWalletTransaction, Vec<DbReservedTxo>)>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_wallet_transaction_with_reserved_txos_by_txid(txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2019,45 +2017,45 @@ impl DbTxn {
 
     pub(crate) fn iter_assets(&self) -> Result<Vec<DbAsset>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_assets(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_assets().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_asset_transfers(&self) -> Result<Vec<DbAssetTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_asset_transfers(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_asset_transfers().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_batch_transfers(&self) -> Result<Vec<DbBatchTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_batch_transfers(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_batch_transfers().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_colorings(&self) -> Result<Vec<DbColoring>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_colorings(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_colorings().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_media(&self) -> Result<Vec<DbMedia>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_media(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_media().map_err(Error::from),
         }
     }
@@ -2067,9 +2065,9 @@ impl DbTxn {
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_pending_witness_scripts(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2081,9 +2079,9 @@ impl DbTxn {
     #[cfg(feature = "_online")]
     pub(crate) fn iter_pending_witness_txos(&self) -> Result<Vec<DbTxo>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_pending_witness_txos(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2094,54 +2092,54 @@ impl DbTxn {
 
     pub(crate) fn iter_reserved_txos(&self) -> Result<Vec<DbReservedTxo>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_reserved_txos(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_reserved_txos().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_token_medias(&self) -> Result<Vec<DbTokenMedia>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_token_medias(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_token_medias().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_tokens(&self) -> Result<Vec<DbToken>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_tokens(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_tokens().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_transfers(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_transfers().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_txos(&self) -> Result<Vec<DbTxo>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_txos(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_txos().map_err(Error::from),
         }
     }
 
     pub(crate) fn iter_wallet_transactions(&self) -> Result<Vec<DbWalletTransaction>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.iter_wallet_transactions(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.iter_wallet_transactions().map_err(Error::from),
         }
     }
@@ -2154,9 +2152,9 @@ impl DbTxn {
         asset_id: &str,
     ) -> Result<Vec<DbTransfer>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_transfers_for_asset(batch_transfer_idx, asset_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2170,9 +2168,9 @@ impl DbTxn {
         transfer_idx: i32,
     ) -> Result<Vec<(DbTransferTransportEndpoint, DbTransportEndpoint)>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_transfer_transport_endpoints_data(transfer_idx),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2189,9 +2187,9 @@ impl DbTxn {
         transfer_idxs: &[i32],
     ) -> Result<TransportEndpointsByTransfer, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_transport_endpoints_by_transfer(transfer_idxs),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2207,9 +2205,9 @@ impl DbTxn {
         asset_filter: &AssetFilter,
     ) -> Result<(DbData, TransportEndpointsByTransfer), Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_transfers_db_data(batch_transfer_idxs, asset_filter),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2219,9 +2217,9 @@ impl DbTxn {
 
     pub(crate) fn get_db_data(&self, empty_transfers: bool) -> Result<DbData, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_db_data(empty_transfers),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2232,9 +2230,9 @@ impl DbTxn {
 
     pub(crate) fn get_unspent_txos(&self, txos: Vec<DbTxo>) -> Result<Vec<DbTxo>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_unspent_txos(txos),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_unspent_txos(txos).map_err(Error::from),
         }
     }
@@ -2249,7 +2247,7 @@ impl DbTxn {
         txos: Option<Vec<DbTxo>>,
     ) -> Result<Balance, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_asset_balance(
                 asset_id,
                 transfers,
@@ -2258,7 +2256,7 @@ impl DbTxn {
                 colorings,
                 txos,
             ),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_asset_balance(
                 asset_id,
                 transfers,
@@ -2272,9 +2270,9 @@ impl DbTxn {
 
     pub(crate) fn check_asset_exists(&self, asset_id: String) -> Result<DbAsset, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.check_asset_exists(asset_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.check_asset_exists(asset_id),
         }
     }
@@ -2285,9 +2283,9 @@ impl DbTxn {
         batch_transfers: &[DbBatchTransfer],
     ) -> Result<DbBatchTransfer, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_batch_transfer_or_fail(idx, batch_transfers),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2297,9 +2295,9 @@ impl DbTxn {
 
     pub(crate) fn get_or_insert_media(&self, digest: String, mime: String) -> Result<i32, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_or_insert_media(digest, mime),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m
                 .backend
                 .db
@@ -2317,7 +2315,7 @@ impl DbTxn {
         transfers: Option<Vec<DbTransfer>>,
     ) -> Result<Vec<LocalUnspent>, Error> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => t.get_rgb_allocations(
                 utxos,
                 colorings,
@@ -2325,7 +2323,7 @@ impl DbTxn {
                 asset_transfers,
                 transfers,
             ),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => m.backend.db.get_rgb_allocations(
                 utxos,
                 colorings,
@@ -2340,5 +2338,5 @@ impl DbTxn {
 pub(crate) mod enums;
 
 // spike: in-memory storage behind the dispatched backend (S06 Option A)
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
 mod memory;

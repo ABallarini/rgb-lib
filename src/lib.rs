@@ -128,6 +128,10 @@ compile_error!(
      `esplora` instead"
 );
 
+// SQLite is native-only: the wasm32 build has no filesystem and runs over the in-memory backend.
+#[cfg(all(feature = "sqlite", target_arch = "wasm32"))]
+compile_error!("the `sqlite` feature is native-only and cannot be enabled on wasm32");
+
 #[cfg(feature = "_online")]
 pub(crate) mod api;
 #[cfg(test)]
@@ -169,7 +173,7 @@ pub use rgbstd::{
     vm::WitnessOrd,
 };
 
-#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use crate::utils::block_on;
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TypeOfTransition},
@@ -181,6 +185,8 @@ pub use crate::{
     utils::BitcoinNetwork,
 };
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use std::sync::LazyLock;
 #[cfg(feature = "_online")]
 use std::{
     cmp::{Ordering, max, min},
@@ -204,7 +210,7 @@ use std::{
     str::FromStr,
 };
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
-use std::{panic, sync::LazyLock, time::Duration};
+use std::{panic, time::Duration};
 
 use amplify::{ByteArray, Wrapper};
 #[cfg(feature = "wallet")]
@@ -300,7 +306,7 @@ use reqwest::{
     blocking::{Client as RestClient, multipart},
     header::CONTENT_TYPE,
 };
-#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use rgb_lib_migration::{Migrator, MigratorTrait};
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
@@ -381,7 +387,7 @@ use sea_orm::{
     ActiveValue, ColumnTrait, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult,
     TryGetError, TryGetable, TryIntoModel, sea_query::Condition,
 };
-#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use sea_orm::{
     ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, EntityTrait, Iterable,
     JoinType, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
@@ -528,7 +534,7 @@ use crate::{
     },
 };
 // The SQLite-only tables are not touched by the in-memory backend the wasm build uses.
-#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::database::entities::{
     rgb_aluvm_lib::ActiveModel as DbAluvmLibActMod,
     rgb_assignment::ActiveModel as DbAssignmentActMod,
@@ -549,7 +555,7 @@ use crate::database::entities::{
     rgb_witness::{ActiveModel as DbWitnessActMod, Model as DbWitness},
     rgb_witness_ord::ActiveModel as DbWitnessOrdActMod,
 };
-#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::utils::adjust_canonicalization;
 #[cfg(all(feature = "wallet", any(test, not(target_arch = "wasm32"))))]
 use crate::utils::atomic_tmp_path;

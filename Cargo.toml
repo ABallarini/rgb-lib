@@ -106,8 +106,6 @@ rgb-lib-migration = { path = "migration", version = "0.3.0-beta.5", optional = t
 rustls = { version = "0.23.46", optional = true, default-features = false }
 sea-orm = { version = "2.0.4", optional = true, default-features = false, features = [
     "macros",
-    "runtime-tokio-rustls",
-    "sqlx-sqlite",
     "with-json",
 ] }
 tokio = { version = "1", optional = true, default-features = false }
@@ -193,8 +191,16 @@ optional = true
 features = ["rustls"]
 
 [features]
-default = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
-all = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
+default = ["wallet", "sqlite", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
+all = ["wallet", "sqlite", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
+# native persistent storage: owns the SQLite driver, the Tokio runtime and the migration crate.
+# `wallet` alone compiles the entity layer without a driver, which is what the wasm32 build uses.
+sqlite = [
+    "dep:rgb-lib-migration",
+    "dep:tokio",
+    "sea-orm/sqlx-sqlite",
+    "sea-orm/runtime-tokio-rustls",
+]
 # the wallet functionality; without it only the APIs that don't need a wallet (e.g. consignment
 # inspection) are available, pulling in just the RGB crates and few other lightweight dependencies
 wallet = [
@@ -207,9 +213,7 @@ wallet = [
     "dep:hkdf",
     "dep:hmac",
     "dep:sha2",
-    "dep:tokio",
     "dep:rand",
-    "dep:rgb-lib-migration",
     "dep:rustls",
     "dep:scrypt",
     "dep:sea-orm",

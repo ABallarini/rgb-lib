@@ -11,15 +11,15 @@
 //! The module also holds the one-time migration of the legacy filesystem RGB store,
 //! into the database, and the legacy consignment files, on disk.
 
-// The SQLite `RgbStore` implementation and its row helpers are native-only; the wasm build keeps
-// only the backend dispatcher over `DbTxn`, so the rest looks dead there.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+// The SQLite `RgbStore` implementation and its row helpers are native-only; the wasm and
+// driver-less native builds keep only the backend dispatcher over `DbTxn`, so the rest looks dead.
+#![cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
 use super::memory::MemoryTxn;
 use super::*;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::database::entities::{
     rgb_aluvm_lib, rgb_assignment, rgb_bundle, rgb_bundle_contract, rgb_bundle_witness,
     rgb_genesis, rgb_global_state, rgb_invalid_op, rgb_op_bundle, rgb_op_input, rgb_outpoint_opout,
@@ -181,7 +181,7 @@ fn outpoint_condition(
 }
 
 // private helpers for the `RgbStore` implementation below
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 impl SqliteTxn {
     fn get_genesis(&self, contract_id: &[u8]) -> Result<Option<DbGenesis>, Error> {
         Ok(block_on(
@@ -378,7 +378,7 @@ impl SqliteTxn {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 impl RgbStore for &SqliteTxn {
     type Error = Error;
 
@@ -1344,21 +1344,21 @@ impl RgbStore for &DbTxn {
 
     fn schema(&self, schema_id: SchemaId) -> Result<Option<Schema>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::schema(&t, schema_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::schema(&m, schema_id),
         }
     }
 
     fn put_schema(&mut self, schema: &Schema) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_schema(&mut r, schema)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_schema(&mut r, schema)
@@ -1368,9 +1368,9 @@ impl RgbStore for &DbTxn {
 
     fn schemata(&self) -> impl Iterator<Item = Result<Schema, Error>> + '_ {
         let items: Vec<_> = match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::schemata(&t).collect(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::schemata(&m).collect(),
         };
         items.into_iter()
@@ -1378,21 +1378,21 @@ impl RgbStore for &DbTxn {
 
     fn type_libs(&self, schema_id: SchemaId) -> Result<BTreeMap<TypeLibId, TypeLib>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::type_libs(&t, schema_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::type_libs(&m, schema_id),
         }
     }
 
     fn put_type_lib(&mut self, schema_id: SchemaId, type_lib: &TypeLib) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_type_lib(&mut r, schema_id, type_lib)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_type_lib(&mut r, schema_id, type_lib)
@@ -1402,21 +1402,21 @@ impl RgbStore for &DbTxn {
 
     fn aluvm_lib(&self, aluvm_lib_id: LibId) -> Result<Option<Lib>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::aluvm_lib(&t, aluvm_lib_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::aluvm_lib(&m, aluvm_lib_id),
         }
     }
 
     fn put_aluvm_lib(&mut self, aluvm_lib: &Lib) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_aluvm_lib(&mut r, aluvm_lib)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_aluvm_lib(&mut r, aluvm_lib)
@@ -1426,21 +1426,21 @@ impl RgbStore for &DbTxn {
 
     fn genesis(&self, contract_id: ContractId) -> Result<Option<Genesis>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::genesis(&t, contract_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::genesis(&m, contract_id),
         }
     }
 
     fn put_genesis(&mut self, genesis: &Genesis) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_genesis(&mut r, genesis)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_genesis(&mut r, genesis)
@@ -1450,9 +1450,9 @@ impl RgbStore for &DbTxn {
 
     fn geneses(&self) -> impl Iterator<Item = Result<Genesis, Error>> + '_ {
         let items: Vec<_> = match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::geneses(&t).collect(),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::geneses(&m).collect(),
         };
         items.into_iter()
@@ -1460,30 +1460,30 @@ impl RgbStore for &DbTxn {
 
     fn contract_schema(&self, contract_id: ContractId) -> Result<Option<Schema>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::contract_schema(&t, contract_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::contract_schema(&m, contract_id),
         }
     }
 
     fn bundle(&self, bundle_id: BundleId) -> Result<Option<TransitionBundle>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::bundle(&t, bundle_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::bundle(&m, bundle_id),
         }
     }
 
     fn put_bundle(&mut self, bundle: &TransitionBundle) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_bundle(&mut r, bundle)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_bundle(&mut r, bundle)
@@ -1493,21 +1493,21 @@ impl RgbStore for &DbTxn {
 
     fn witness(&self, txid: RgbTxid) -> Result<Option<SealWitness>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witness(&t, txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witness(&m, txid),
         }
     }
 
     fn put_witness(&mut self, witness: &SealWitness) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_witness(&mut r, witness)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_witness(&mut r, witness)
@@ -1517,18 +1517,18 @@ impl RgbStore for &DbTxn {
 
     fn witness_tx(&self, txid: RgbTxid) -> Result<Option<bdk_wallet::bitcoin::Transaction>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witness_tx(&t, txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witness_tx(&m, txid),
         }
     }
 
     fn witness_spv_proof(&self, txid: RgbTxid) -> Result<Option<SpvProof>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witness_spv_proof(&t, txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witness_spv_proof(&m, txid),
         }
     }
@@ -1539,12 +1539,12 @@ impl RgbStore for &DbTxn {
         spv_proof: Option<&SpvProof>,
     ) -> Result<bool, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::set_witness_spv_proof(&mut r, txid, spv_proof)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::set_witness_spv_proof(&mut r, txid, spv_proof)
@@ -1554,9 +1554,9 @@ impl RgbStore for &DbTxn {
 
     fn seal_of_secret(&self, secret_seal: SecretSeal) -> Result<Option<GraphSeal>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::seal_of_secret(&t, secret_seal),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::seal_of_secret(&m, secret_seal),
         }
     }
@@ -1567,12 +1567,12 @@ impl RgbStore for &DbTxn {
         secret_seal: SecretSeal,
     ) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_secret_seal(&mut r, graph_seal, secret_seal)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_secret_seal(&mut r, graph_seal, secret_seal)
@@ -1587,11 +1587,11 @@ impl RgbStore for &DbTxn {
         visibility: Visibility,
     ) -> Result<Vec<GlobalStateRow>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 <&SqliteTxn as RgbStore>::globals(&t, contract_id, type_id, visibility)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 <&MemoryTxn as RgbStore>::globals(&m, contract_id, type_id, visibility)
             }
@@ -1600,12 +1600,12 @@ impl RgbStore for &DbTxn {
 
     fn put_global(&mut self, global_state: GlobalStateWrite<'_>) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_global(&mut r, global_state)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_global(&mut r, global_state)
@@ -1619,9 +1619,9 @@ impl RgbStore for &DbTxn {
         filter: AllocationFilter<'_>,
     ) -> Result<Vec<AllocationRow>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::allocations(&t, contract_id, filter),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::allocations(&m, contract_id, filter),
         }
     }
@@ -1632,11 +1632,11 @@ impl RgbStore for &DbTxn {
         visibility: Visibility,
     ) -> Result<Vec<(ContractId, AllocationRow)>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 <&SqliteTxn as RgbStore>::all_allocations_at_outpoints(&t, outpoints, visibility)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 <&MemoryTxn as RgbStore>::all_allocations_at_outpoints(&m, outpoints, visibility)
             }
@@ -1645,12 +1645,12 @@ impl RgbStore for &DbTxn {
 
     fn put_allocation(&mut self, allocation: AllocationWrite<'_>) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_allocation(&mut r, allocation)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_allocation(&mut r, allocation)
@@ -1660,9 +1660,9 @@ impl RgbStore for &DbTxn {
 
     fn witness_ord(&self, txid: RgbTxid) -> Result<Option<WitnessOrd>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witness_ord(&t, txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witness_ord(&m, txid),
         }
     }
@@ -1672,9 +1672,9 @@ impl RgbStore for &DbTxn {
         txids: &BTreeSet<RgbTxid>,
     ) -> Result<BTreeMap<RgbTxid, WitnessOrd>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witness_ords(&t, txids),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witness_ords(&m, txids),
         }
     }
@@ -1684,30 +1684,30 @@ impl RgbStore for &DbTxn {
         min_height: std::num::NonZeroU32,
     ) -> Result<BTreeSet<RgbTxid>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witness_ords_to_refresh(&t, min_height),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witness_ords_to_refresh(&m, min_height),
         }
     }
 
     fn all_witness_ords(&self) -> Result<BTreeMap<RgbTxid, WitnessOrd>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::all_witness_ords(&t),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::all_witness_ords(&m),
         }
     }
 
     fn put_witness_ord(&mut self, txid: RgbTxid, ord: WitnessOrd) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_witness_ord(&mut r, txid, ord)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_witness_ord(&mut r, txid, ord)
@@ -1717,30 +1717,30 @@ impl RgbStore for &DbTxn {
 
     fn all_invalid_ops(&self) -> Result<BTreeSet<OpId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::all_invalid_ops(&t),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::all_invalid_ops(&m),
         }
     }
 
     fn any_op_invalid(&self, opids: &BTreeSet<OpId>) -> Result<bool, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::any_op_invalid(&t, opids),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::any_op_invalid(&m, opids),
         }
     }
 
     fn set_op_validity(&mut self, opid: OpId, valid: bool) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::set_op_validity(&mut r, opid, valid)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::set_op_validity(&mut r, opid, valid)
@@ -1750,18 +1750,18 @@ impl RgbStore for &DbTxn {
 
     fn contract_registered(&self, contract_id: ContractId) -> Result<bool, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::contract_registered(&t, contract_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::contract_registered(&m, contract_id),
         }
     }
 
     fn bundle_contract(&self, bundle_id: BundleId) -> Result<Option<ContractId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::bundle_contract(&t, bundle_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::bundle_contract(&m, bundle_id),
         }
     }
@@ -1772,12 +1772,12 @@ impl RgbStore for &DbTxn {
         contract_id: ContractId,
     ) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_bundle_contract(&mut r, bundle_id, contract_id)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_bundle_contract(&mut r, bundle_id, contract_id)
@@ -1787,9 +1787,9 @@ impl RgbStore for &DbTxn {
 
     fn bundle_witnesses(&self, bundle_id: BundleId) -> Result<BTreeSet<RgbTxid>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::bundle_witnesses(&t, bundle_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::bundle_witnesses(&m, bundle_id),
         }
     }
@@ -1799,30 +1799,30 @@ impl RgbStore for &DbTxn {
         bundle_ids: &BTreeSet<BundleId>,
     ) -> Result<BTreeMap<BundleId, BTreeSet<RgbTxid>>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::witnesses_of_bundles(&t, bundle_ids),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::witnesses_of_bundles(&m, bundle_ids),
         }
     }
 
     fn bundles_of_witness(&self, txid: RgbTxid) -> Result<BTreeSet<BundleId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::bundles_of_witness(&t, txid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::bundles_of_witness(&m, txid),
         }
     }
 
     fn put_bundle_witness(&mut self, bundle_id: BundleId, txid: RgbTxid) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_bundle_witness(&mut r, bundle_id, txid)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_bundle_witness(&mut r, bundle_id, txid)
@@ -1832,30 +1832,30 @@ impl RgbStore for &DbTxn {
 
     fn bundle_of_op(&self, opid: OpId) -> Result<Option<BundleId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::bundle_of_op(&t, opid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::bundle_of_op(&m, opid),
         }
     }
 
     fn ops_in_bundle(&self, bundle_id: BundleId) -> Result<BTreeSet<OpId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::ops_in_bundle(&t, bundle_id),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::ops_in_bundle(&m, bundle_id),
         }
     }
 
     fn put_op_bundle(&mut self, opid: OpId, bundle_id: BundleId) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_op_bundle(&mut r, opid, bundle_id)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_op_bundle(&mut r, opid, bundle_id)
@@ -1865,27 +1865,27 @@ impl RgbStore for &DbTxn {
 
     fn child_bundles_of_op(&self, opid: OpId) -> Result<BTreeSet<BundleId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::child_bundles_of_op(&t, opid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::child_bundles_of_op(&m, opid),
         }
     }
 
     fn child_ops_of_op(&self, opid: OpId) -> Result<BTreeSet<(OpId, BundleId)>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::child_ops_of_op(&t, opid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::child_ops_of_op(&m, opid),
         }
     }
 
     fn input_opouts_for_op(&self, opid: OpId) -> Result<BTreeSet<Opout>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::input_opouts_for_op(&t, opid),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::input_opouts_for_op(&m, opid),
         }
     }
@@ -1897,7 +1897,7 @@ impl RgbStore for &DbTxn {
         child_bundle_id: BundleId,
     ) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_op_input(
@@ -1907,7 +1907,7 @@ impl RgbStore for &DbTxn {
                     child_bundle_id,
                 )
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_op_input(
@@ -1926,9 +1926,9 @@ impl RgbStore for &DbTxn {
         outpoints: &BTreeSet<OutPoint>,
     ) -> Result<BTreeMap<OutPoint, BTreeSet<Opout>>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::opouts_at(&t, contract_id, outpoints),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::opouts_at(&m, contract_id, outpoints),
         }
     }
@@ -1938,9 +1938,9 @@ impl RgbStore for &DbTxn {
         outpoints: &BTreeSet<OutPoint>,
     ) -> Result<BTreeSet<ContractId>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => <&SqliteTxn as RgbStore>::contracts_assigning(&t, outpoints),
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => <&MemoryTxn as RgbStore>::contracts_assigning(&m, outpoints),
         }
     }
@@ -1952,12 +1952,12 @@ impl RgbStore for &DbTxn {
         opout: Opout,
     ) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_outpoint_opout(&mut r, contract_id, outpoint, opout)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_outpoint_opout(&mut r, contract_id, outpoint, opout)
@@ -1971,11 +1971,11 @@ impl RgbStore for &DbTxn {
         secret_seals: &BTreeSet<SecretSeal>,
     ) -> Result<BTreeSet<Opout>, Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 <&SqliteTxn as RgbStore>::opouts_by_secrets(&t, contract_id, secret_seals)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 <&MemoryTxn as RgbStore>::opouts_by_secrets(&m, contract_id, secret_seals)
             }
@@ -1989,12 +1989,12 @@ impl RgbStore for &DbTxn {
         opout: Opout,
     ) -> Result<(), Error> {
         match *self {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             DbTxn::Sqlite(t) => {
                 let mut r: &SqliteTxn = t;
                 <&SqliteTxn as RgbStore>::put_secret_opout(&mut r, contract_id, secret_seal, opout)
             }
-            #[cfg(any(test, target_arch = "wasm32"))]
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
             DbTxn::Memory(m) => {
                 let mut r: &MemoryTxn = m;
                 <&MemoryTxn as RgbStore>::put_secret_opout(&mut r, contract_id, secret_seal, opout)
@@ -2551,7 +2551,7 @@ mod legacy {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

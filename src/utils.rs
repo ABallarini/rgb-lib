@@ -43,12 +43,12 @@ pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 const PROXY_PROTOCOL_VERSION: &str = "1.0";
 
 // sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
 
 /// Block on a future, spawning a new thread if already inside a Tokio runtime.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,
@@ -187,12 +187,16 @@ pub(crate) fn sync_dir<P: AsRef<Path>>(_dir: P) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    feature = "sqlite",
+    not(target_arch = "wasm32")
+))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().display().to_string()
 }
 
-#[cfg(all(target_os = "windows", not(target_arch = "wasm32")))]
+#[cfg(all(target_os = "windows", feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     const VERBATIM_PREFIX: &str = r#"\\?\"#;
     let p = p.as_ref().display().to_string();
@@ -1252,6 +1256,7 @@ mod tests {
         val: Option<u64>,
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_block_on_inside_tokio_runtime() {
         // calling block_on from within an active Tokio runtime takes the thread-spawn path

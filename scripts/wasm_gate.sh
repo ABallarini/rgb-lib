@@ -27,7 +27,10 @@ _run rustup target add wasm32-unknown-unknown
 _run cargo fmt --all -- --check
 _run cargo check --lib --all-features
 _run cargo clippy --lib --all-features -- -D warnings
-_run cargo test --lib --no-default-features --features wallet
+# driver-agnostic native build: proves the entity layer compiles without SQLite/Tokio
+_run cargo check --lib --no-default-features --features wallet
+_run cargo check --lib --no-default-features --features wallet,sqlite
+_run cargo test --lib --no-default-features --features wallet,sqlite
 _run cargo check --lib --target wasm32-unknown-unknown --no-default-features
 _run_deny_warnings cargo check --lib --target wasm32-unknown-unknown --no-default-features --features wallet
 _run cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wallet -- -D warnings

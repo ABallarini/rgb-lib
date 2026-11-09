@@ -12,7 +12,7 @@ pub(crate) const BDK_PENDING_FILE: &str = "bdk_pending.json";
 
 pub(crate) const NUM_KNOWN_SCHEMAS: usize = 4;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) const RGB_LIB_DB_NAME: &str = "rgb_lib_db";
 
 pub(crate) const ASSETS_DIR: &str = "assets";
@@ -390,14 +390,14 @@ pub(crate) fn setup_rgb(
 /// Open the SQLite database in `wallet_dir`, creating it and running the migrations if needed.
 ///
 /// The native connection and migration setup is owned by the `database::sqlite` adapter.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, Error> {
     crate::database::sqlite::open(wallet_dir)
 }
 
-/// On `wasm32` there is no filesystem to hold the SQLite database: the wallet data lives in the
-/// in-memory backend, which the host persists as a snapshot.
-#[cfg(target_arch = "wasm32")]
+/// Without SQLite (wasm32, or a native build without the `sqlite` feature) the wallet data lives
+/// in the in-memory backend, which the host persists as a snapshot.
+#[cfg(any(target_arch = "wasm32", not(feature = "sqlite")))]
 pub(crate) fn setup_db<P: AsRef<Path>>(_wallet_dir: P) -> Result<RgbLibDatabase, Error> {
     Ok(RgbLibDatabase::new_memory())
 }
