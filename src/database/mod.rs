@@ -1436,3 +1436,7 @@ impl DbTxn {
 }
 
 pub(crate) mod enums;
+
+// spike: in-memory storage, native tests only until the S06 decision
+#[cfg(test)]
+mod memory;
