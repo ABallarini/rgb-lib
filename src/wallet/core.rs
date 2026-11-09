@@ -66,9 +66,17 @@ impl WalletManifest {
         wallet_dir.join(WALLET_MANIFEST_FILE)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn write(&self, wallet_dir: &Path) -> Result<(), Error> {
         let json = serde_json::to_string_pretty(self).map_err(InternalError::from)?;
         atomic_write(&Self::path(wallet_dir), json.as_bytes())?;
+        Ok(())
+    }
+
+    /// wasm: settings persistence is carried in the host snapshot/IndexedDB layer pending the
+    /// next step, so there is no file to write.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn write(&self, _wallet_dir: &Path) -> Result<(), Error> {
         Ok(())
     }
 
@@ -92,6 +100,7 @@ impl WalletManifest {
 
     // Fail if wallet_data or keys disagree with settings fixed at wallet creation. Settings that
     // are allowed to change are not checked on purpose.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn check_settings_unchanged(
         wallet_dir: &Path,
         wallet_data: &WalletData,
@@ -129,6 +138,17 @@ impl WalletManifest {
             account_xpub_colored,
             account_xpub_vanilla,
         );
+        Ok(())
+    }
+
+    /// wasm: the manifest lives in the host snapshot/IndexedDB layer pending the next step, so
+    /// there is no on-disk copy to compare against.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn check_settings_unchanged(
+        _wallet_dir: &Path,
+        _wallet_data: &WalletData,
+        _keys: &SinglesigKeys,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
@@ -209,7 +229,7 @@ pub struct SyncOptions {
 pub struct WalletInternals {
     pub(crate) wallet_data: WalletData,
     pub(crate) logger: Logger,
-    pub(crate) _logger_guard: AsyncGuard,
+    pub(crate) _logger_guard: LoggerGuard,
     pub(crate) database: Arc<RgbLibDatabase>,
     pub(crate) wallet_dir: PathBuf,
     pub(crate) bdk_wallet: BdkWallet,
@@ -367,28 +387,38 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
             chain_net.chain_hash().to_bytes(),
         ));
     let mut changeset = txn.get_bdk_changeset()?;
+    // wasm: no filesystem, the in-memory backend is the only store, so there is nothing to fold in
+    #[cfg(target_arch = "wasm32")]
+    let _ = wallet_dir.as_ref();
     // files this transaction takes the contents of, to be dropped once it has committed
+    #[cfg(not(target_arch = "wasm32"))]
     let mut migrated = Vec::new();
     // an empty changeset means either a brand-new wallet or one whose data still lives in the
     // legacy file store
+    #[cfg(not(target_arch = "wasm32"))]
     let mut reload =
         changeset.is_empty() && import_legacy_bdk_store(&txn, wallet_dir.as_ref(), &mut migrated)?;
+    #[cfg(target_arch = "wasm32")]
+    let reload = false;
     // a crash between the temporary write and the rename leaves the newer changeset in the .tmp
     // file, so fold both in; the pending buffer only ever grows, so applying them in this order
     // ends on the newest state
-    let pending_path = wallet_dir.as_ref().join(BDK_PENDING_FILE);
-    let pending_tmp_path = atomic_tmp_path(&pending_path)?;
-    for pending_file in [pending_path, pending_tmp_path] {
-        if !pending_file.exists() {
-            continue;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let pending_path = wallet_dir.as_ref().join(BDK_PENDING_FILE);
+        let pending_tmp_path = atomic_tmp_path(&pending_path)?;
+        for pending_file in [pending_path, pending_tmp_path] {
+            if !pending_file.exists() {
+                continue;
+            }
+            // a file that fails to parse was still being written when the crash happened, so its
+            // contents were never complete: drop it rather than refusing to open the wallet
+            if let Ok(pending) = serde_json::from_slice::<ChangeSet>(&fs::read(&pending_file)?) {
+                txn.update_bdk_changeset(&pending)?;
+                reload = true;
+            }
+            migrated.push(pending_file);
         }
-        // a file that fails to parse was still being written when the crash happened, so its
-        // contents were never complete: drop it rather than refusing to open the wallet
-        if let Ok(pending) = serde_json::from_slice::<ChangeSet>(&fs::read(&pending_file)?) {
-            txn.update_bdk_changeset(&pending)?;
-            reload = true;
-        }
-        migrated.push(pending_file);
     }
     if reload {
         changeset = txn.get_bdk_changeset()?;
@@ -409,16 +439,18 @@ pub(crate) fn setup_bdk<P: AsRef<Path>>(
     };
     txn.commit()?;
     // only now that their contents are durably in the DB
+    #[cfg(not(target_arch = "wasm32"))]
     for path in migrated {
         let _ = fs::remove_file(path);
     }
     Ok(bdk_wallet)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_new_wallet(
     wallet_data: &WalletData,
     fingerprint: &str,
-) -> Result<(PathBuf, Logger, AsyncGuard), Error> {
+) -> Result<(PathBuf, Logger, LoggerGuard), Error> {
     if wallet_data.max_allocations_per_utxo == 0 {
         return Err(Error::NoMaxAllocationsPerUtxo);
     }
@@ -442,6 +474,23 @@ pub(crate) fn setup_new_wallet(
         prev_hook(info);
     }));
     Ok((wallet_dir, logger, logger_guard))
+}
+
+/// wasm: the host owns durable storage (snapshot/IndexedDB), so there is no data directory to
+/// check or create and no file log to install. The logger and guard are no-ops.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn setup_new_wallet(
+    wallet_data: &WalletData,
+    _fingerprint: &str,
+) -> Result<(PathBuf, Logger, LoggerGuard), Error> {
+    if wallet_data.max_allocations_per_utxo == 0 {
+        return Err(Error::NoMaxAllocationsPerUtxo);
+    }
+    Ok((
+        PathBuf::new(),
+        Logger::root(slog::Discard, o!()),
+        LoggerGuard,
+    ))
 }
 
 pub trait WalletCore {

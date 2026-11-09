@@ -848,10 +848,19 @@ fn log_timestamp(io: &mut dyn io::Write) -> io::Result<()> {
     )
 }
 
+/// Keeps the logger's drain alive. On wasm there is no file drain to flush, so the no-op guard
+/// keeps the same shape without spawning the async logger's thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type LoggerGuard = slog_async::AsyncGuard;
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Default)]
+pub(crate) struct LoggerGuard;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_logger<P: AsRef<Path>>(
     log_path: P,
     log_name: Option<&str>,
-) -> Result<(Logger, AsyncGuard), Error> {
+) -> Result<(Logger, LoggerGuard), Error> {
     let log_file = log_name.unwrap_or(LOG_FILE);
     let log_filepath = log_path.as_ref().join(log_file);
     let file = fs::OpenOptions::new()
@@ -867,6 +876,15 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     let logger = Logger::root(drain.fuse(), o!());
 
     Ok((logger, async_guard))
+}
+
+/// wasm: there is no filesystem to write a log file to, so callers get a discard logger.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn setup_logger<P: AsRef<Path>>(
+    _log_path: P,
+    _log_name: Option<&str>,
+) -> Result<(Logger, LoggerGuard), Error> {
+    Ok((Logger::root(slog::Discard, o!()), LoggerGuard))
 }
 
 pub(crate) fn now() -> OffsetDateTime {

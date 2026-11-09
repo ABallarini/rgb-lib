@@ -387,8 +387,6 @@ use slog::warn;
 #[cfg(feature = "wallet")]
 use slog::{Drain, Logger, debug, error, info, o};
 #[cfg(feature = "wallet")]
-use slog_async::AsyncGuard;
-#[cfg(feature = "wallet")]
 use slog_term::{FullFormat, PlainDecorator};
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
 use strict_encoding::StrictSerialize;
@@ -517,7 +515,7 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, PURPOSE,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
         RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, atomic_tmp_path, atomic_write,
         atomic_write_with, beneficiary_from_script_buf, from_str_or_number_mandatory,
         from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,

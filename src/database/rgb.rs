@@ -1998,10 +1998,11 @@ impl RgbStore for &DbTxn {
     }
 }
 
-#[cfg(feature = "rgb_fs_store_migration")]
+#[cfg(all(feature = "rgb_fs_store_migration", not(target_arch = "wasm32")))]
 pub(crate) use legacy::migrate_rgb_fs_to_db;
 
-#[cfg(not(feature = "rgb_fs_store_migration"))]
+/// No-op unless the legacy filesystem migration is enabled on a non-wasm target.
+#[cfg(any(not(feature = "rgb_fs_store_migration"), target_arch = "wasm32"))]
 pub(crate) fn migrate_rgb_fs_to_db(
     _wallet_dir: &Path,
     _database: &RgbLibDatabase,
@@ -2009,7 +2010,7 @@ pub(crate) fn migrate_rgb_fs_to_db(
     Ok(())
 }
 
-#[cfg(feature = "rgb_fs_store_migration")]
+#[cfg(all(feature = "rgb_fs_store_migration", not(target_arch = "wasm32")))]
 mod legacy {
     use super::*;
 

@@ -1072,6 +1072,8 @@ impl MultisigWallet {
             [..8]
             .to_string();
         let (wallet_dir, logger, _logger_guard) = setup_new_wallet(&wallet_data, &fingerprint)?;
+        // wasm: the host owns durable storage, so there is no hub ops directory to create
+        #[cfg(not(target_arch = "wasm32"))]
         fs::create_dir_all(wallet_dir.join(HUB_OPS_DIR))?;
 
         // setup rgb-lib DB
