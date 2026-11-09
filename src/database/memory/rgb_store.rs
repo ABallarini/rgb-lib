@@ -133,6 +133,10 @@ pub(crate) struct MemRgbStore {
     tx: RefCell<Option<Option<Tables>>>,
 }
 
+/// Opaque snapshot of the RGB tables, used by a savepoint of the shared transaction.
+#[derive(Clone, Debug)]
+pub(crate) struct RgbSavepoint(Tables);
+
 impl RgbStore for MemRgbStore {
     type Error = Infallible;
 
@@ -714,6 +718,16 @@ impl Reader<'_> {
 use amplify::s;
 
 impl MemRgbStore {
+    /// Snapshot the tables for a savepoint of the shared transaction.
+    pub(crate) fn savepoint(&self) -> RgbSavepoint {
+        RgbSavepoint(self.tables.borrow().clone())
+    }
+
+    /// Restore the tables to a savepoint taken with [`Self::savepoint`].
+    pub(crate) fn restore_savepoint(&self, savepoint: RgbSavepoint) {
+        *self.tables.borrow_mut() = savepoint.0;
+    }
+
     /// Encodes all tables. Call it outside of a transaction.
     pub(crate) fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let t = self.tables.borrow();

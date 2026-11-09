@@ -2205,7 +2205,7 @@ fn to_entity_db_data(
 /// Mirrors the SQLite backend: changes are visible immediately inside the transaction, commit
 /// makes them durable and runs the commit callbacks, drop (or an error in a savepoint) restores
 /// the snapshot taken at the start.
-pub(crate) struct MemoryTxn<'a> {
+pub(crate) struct InMemoryTxn<'a> {
     db: &'a InMemoryDb,
     snapshot: Option<InMemoryDb>,
     on_commit: RefCell<Vec<Box<dyn FnOnce()>>>,
@@ -2214,15 +2214,14 @@ pub(crate) struct MemoryTxn<'a> {
 macro_rules! table_fields {
     ($($f:ident),+ $(,)?) => {
         impl InMemoryDb {
-            fn snapshot(&self) -> InMemoryDb {
+            pub(crate) fn snapshot(&self) -> InMemoryDb {
                 let mut snap = self.clone();
                 snap.tx_open = RefCell::new(false);
                 snap
             }
 
-            fn restore(&self, snap: InMemoryDb) {
+            pub(crate) fn restore(&self, snap: InMemoryDb) {
                 $( *self.$f.borrow_mut() = snap.$f.into_inner(); )+
-                *self.tx_open.borrow_mut() = false;
             }
         }
     };
@@ -2263,14 +2262,24 @@ table_fields!(
 );
 
 impl InMemoryDb {
-    pub(crate) fn begin_transaction(&self) -> Result<MemoryTxn<'_>, Error> {
+    /// Reserve the single transaction slot of this store.
+    pub(crate) fn open_tx(&self) -> Result<(), Error> {
         if *self.tx_open.borrow() {
             return Err(Error::Internal {
                 details: "nested transaction".to_string(),
             });
         }
         *self.tx_open.borrow_mut() = true;
-        Ok(MemoryTxn {
+        Ok(())
+    }
+
+    pub(crate) fn close_tx(&self) {
+        *self.tx_open.borrow_mut() = false;
+    }
+
+    pub(crate) fn begin_transaction(&self) -> Result<InMemoryTxn<'_>, Error> {
+        self.open_tx()?;
+        Ok(InMemoryTxn {
             db: self,
             snapshot: Some(self.snapshot()),
             on_commit: RefCell::new(Vec::new()),
@@ -2278,7 +2287,7 @@ impl InMemoryDb {
     }
 }
 
-impl MemoryTxn<'_> {
+impl InMemoryTxn<'_> {
     pub(crate) fn on_commit(&self, f: impl FnOnce() + 'static) {
         self.on_commit.borrow_mut().push(Box::new(f));
     }
@@ -2323,9 +2332,9 @@ impl MemoryTxn<'_> {
 
     pub(crate) fn with_savepoint<T>(
         &self,
-        f: impl FnOnce(&MemoryTxn<'_>) -> Result<T, Error>,
+        f: impl FnOnce(&InMemoryTxn<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut savepoint = MemoryTxn {
+        let mut savepoint = InMemoryTxn {
             db: self.db,
             snapshot: Some(self.db.snapshot()),
             on_commit: RefCell::new(Vec::new()),
@@ -2340,7 +2349,7 @@ impl MemoryTxn<'_> {
 
     pub(crate) fn commit(mut self) -> Result<(), Error> {
         self.snapshot = None;
-        *self.db.tx_open.borrow_mut() = false;
+        self.db.close_tx();
         for callback in std::mem::take(&mut *self.on_commit.borrow_mut()) {
             callback();
         }
@@ -2348,10 +2357,11 @@ impl MemoryTxn<'_> {
     }
 }
 
-impl Drop for MemoryTxn<'_> {
+impl Drop for InMemoryTxn<'_> {
     fn drop(&mut self) {
         if let Some(snapshot) = self.snapshot.take() {
             self.db.restore(snapshot);
+            self.db.close_tx();
         }
     }
 }
