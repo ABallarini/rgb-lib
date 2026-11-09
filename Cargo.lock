@@ -3596,6 +3596,7 @@ dependencies = [
  "amplify",
  "base64 0.23.1",
  "bdk_bitcoind_rpc",
+ "bdk_chain",
  "bdk_electrum",
  "bdk_esplora",
  "bdk_wallet",
