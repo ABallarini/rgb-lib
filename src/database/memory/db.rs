@@ -5,6 +5,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+
+use bdk_chain::Merge;
+use bdk_wallet::ChangeSet;
 
 use crate::Error;
 #[cfg(feature = "_online")]
@@ -137,6 +141,7 @@ pub struct DbBatchTransfer {
     pub updated_at: i64,
     pub expiration: Option<i64>,
     pub min_confirmations: u8,
+    pub incoming: bool,
     pub operation_secret_key: Option<Vec<u8>>,
     pub broadcast_deadline: Option<i64>,
     pub retention_deadline: Option<i64>,
@@ -151,6 +156,7 @@ pub struct DbBatchTransferActMod {
     pub updated_at: ActiveValue<i64>,
     pub expiration: ActiveValue<Option<i64>>,
     pub min_confirmations: ActiveValue<u8>,
+    pub incoming: ActiveValue<bool>,
     pub operation_secret_key: ActiveValue<Option<Vec<u8>>>,
     pub broadcast_deadline: ActiveValue<Option<i64>>,
     pub retention_deadline: ActiveValue<Option<i64>>,
@@ -198,6 +204,64 @@ pub struct DbPendingWitnessScript {
 pub struct DbPendingWitnessScriptActMod {
     pub idx: ActiveValue<i32>,
     pub script: ActiveValue<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbReservedTxo {
+    pub idx: i32,
+    pub txid: String,
+    pub vout: u32,
+    pub reserved_for_vanilla: Option<i32>,
+    pub reserved_for_colored: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DbReservedTxoActMod {
+    pub idx: ActiveValue<i32>,
+    pub txid: ActiveValue<String>,
+    pub vout: ActiveValue<u32>,
+    pub reserved_for_vanilla: ActiveValue<Option<i32>>,
+    pub reserved_for_colored: ActiveValue<Option<i32>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbToken {
+    pub idx: i32,
+    pub asset_idx: i32,
+    pub index: u32,
+    pub ticker: Option<String>,
+    pub name: Option<String>,
+    pub details: Option<String>,
+    pub embedded_media: bool,
+    pub reserves: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DbTokenActMod {
+    pub idx: ActiveValue<i32>,
+    pub asset_idx: ActiveValue<i32>,
+    pub index: ActiveValue<u32>,
+    pub ticker: ActiveValue<Option<String>>,
+    pub name: ActiveValue<Option<String>>,
+    pub details: ActiveValue<Option<String>>,
+    pub embedded_media: ActiveValue<bool>,
+    pub reserves: ActiveValue<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbTokenMedia {
+    pub idx: i32,
+    pub token_idx: i32,
+    pub media_idx: i32,
+    pub attachment_id: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DbTokenMediaActMod {
+    pub idx: ActiveValue<i32>,
+    pub token_idx: ActiveValue<i32>,
+    pub media_idx: ActiveValue<i32>,
+    pub attachment_id: ActiveValue<Option<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +408,77 @@ impl DbTxo {
     }
 }
 
+impl DbBatchTransfer {
+    pub(crate) fn failed(&self) -> bool {
+        self.status.failed()
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.operation_secret_key.is_none()
+    }
+
+    pub(crate) fn is_expired(&self, now: i64) -> bool {
+        self.expiration.is_some_and(|expiration| expiration < now)
+    }
+
+    pub(crate) fn is_expired_with_margin(&self, now: i64, margin: u32) -> bool {
+        self.expiration
+            .is_some_and(|expiration| expiration + i64::from(margin) < now)
+    }
+
+    #[cfg(feature = "_online")]
+    pub(crate) fn waiting(&self) -> bool {
+        self.status.waiting()
+    }
+
+    pub(crate) fn waiting_confirmations(&self) -> bool {
+        self.status.waiting_confirmations()
+    }
+
+    #[cfg(feature = "_online")]
+    pub(crate) fn is_fallible(&self) -> bool {
+        self.status.is_fallible()
+    }
+
+    pub(crate) fn get_asset_transfers(
+        &self,
+        asset_transfers: &[DbAssetTransfer],
+    ) -> Vec<DbAssetTransfer> {
+        asset_transfers
+            .iter()
+            .filter(|&t| t.batch_transfer_idx == self.idx)
+            .cloned()
+            .collect()
+    }
+}
+
+impl DbTransfer {
+    pub(crate) fn uses_out_of_band_exchange(&self) -> bool {
+        self.invoice_string
+            .as_deref()
+            .and_then(|s| rgbinvoice::RgbInvoice::from_str(s).ok())
+            .map(|invoice| invoice.transports == vec![])
+            .unwrap_or(false)
+    }
+}
+
+/// Group colorings by the asset transfer they belong to, each group ordered by index.
+pub(crate) fn group_colorings_by_asset_transfer(
+    colorings: Vec<DbColoring>,
+) -> HashMap<i32, Vec<DbColoring>> {
+    let mut colorings_by_asset_transfer: HashMap<i32, Vec<DbColoring>> = HashMap::new();
+    for coloring in colorings {
+        colorings_by_asset_transfer
+            .entry(coloring.asset_transfer_idx)
+            .or_default()
+            .push(coloring);
+    }
+    colorings_by_asset_transfer
+        .values_mut()
+        .for_each(|c| c.sort_by_key(|c| c.idx));
+    colorings_by_asset_transfer
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbWalletTransaction {
     pub idx: i32,
@@ -439,6 +574,7 @@ impl From<DbBatchTransfer> for DbBatchTransferActMod {
             updated_at: ActiveValue::Unchanged(m.updated_at),
             expiration: ActiveValue::Unchanged(m.expiration),
             min_confirmations: ActiveValue::Unchanged(m.min_confirmations),
+            incoming: ActiveValue::Unchanged(m.incoming),
             operation_secret_key: ActiveValue::Unchanged(m.operation_secret_key),
             broadcast_deadline: ActiveValue::Unchanged(m.broadcast_deadline),
             retention_deadline: ActiveValue::Unchanged(m.retention_deadline),
@@ -560,6 +696,16 @@ pub struct InMemoryDb {
     next_pending_witness_script_idx: RefCell<i32>,
     backup_info: RefCell<Option<DbBackupInfo>>,
     next_backup_info_idx: RefCell<i32>,
+    reserved_txos: RefCell<Vec<DbReservedTxo>>,
+    next_reserved_txo_idx: RefCell<i32>,
+    tokens: RefCell<Vec<DbToken>>,
+    next_token_idx: RefCell<i32>,
+    token_medias: RefCell<Vec<DbTokenMedia>>,
+    next_token_media_idx: RefCell<i32>,
+    /// Set while a transaction is open, so a second `begin_transaction` is refused.
+    tx_open: RefCell<bool>,
+    /// Latest merged BDK changeset; the SQLite backend keeps it in the `bdk_*` tables.
+    bdk_changeset: RefCell<Option<ChangeSet>>,
 }
 
 impl InMemoryDb {
@@ -589,6 +735,14 @@ impl InMemoryDb {
             next_pending_witness_script_idx: RefCell::new(1),
             backup_info: RefCell::new(None),
             next_backup_info_idx: RefCell::new(1),
+            reserved_txos: RefCell::new(Vec::new()),
+            next_reserved_txo_idx: RefCell::new(1),
+            tokens: RefCell::new(Vec::new()),
+            next_token_idx: RefCell::new(1),
+            token_medias: RefCell::new(Vec::new()),
+            next_token_media_idx: RefCell::new(1),
+            tx_open: RefCell::new(false),
+            bdk_changeset: RefCell::new(None),
         }
     }
 
@@ -661,6 +815,7 @@ impl InMemoryDb {
             updated_at: av_or(b.updated_at, created),
             expiration: av(b.expiration),
             min_confirmations: av(b.min_confirmations),
+            incoming: av(b.incoming),
             operation_secret_key: av(b.operation_secret_key),
             broadcast_deadline: av(b.broadcast_deadline),
             retention_deadline: av(b.retention_deadline),
@@ -706,6 +861,56 @@ impl InMemoryDb {
             script: av(p.script),
         };
         self.pending_witness_scripts.borrow_mut().push(row);
+        Ok(idx)
+    }
+
+    pub(crate) fn set_reserved_txos(
+        &self,
+        reserved_txos: Vec<DbReservedTxoActMod>,
+    ) -> Result<(), InternalError> {
+        let mut rows = self.reserved_txos.borrow_mut();
+        let mut next = self.next_reserved_txo_idx.borrow_mut();
+        for r in reserved_txos {
+            let idx = *next;
+            *next += 1;
+            rows.push(DbReservedTxo {
+                idx,
+                txid: av(r.txid),
+                vout: av(r.vout),
+                reserved_for_vanilla: av(r.reserved_for_vanilla),
+                reserved_for_colored: av(r.reserved_for_colored),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_token(&self, t: DbTokenActMod) -> Result<i32, InternalError> {
+        let idx = *self.next_token_idx.borrow();
+        *self.next_token_idx.borrow_mut() += 1;
+        let row = DbToken {
+            idx,
+            asset_idx: av(t.asset_idx),
+            index: av(t.index),
+            ticker: av(t.ticker),
+            name: av(t.name),
+            details: av(t.details),
+            embedded_media: av(t.embedded_media),
+            reserves: av(t.reserves),
+        };
+        self.tokens.borrow_mut().push(row);
+        Ok(idx)
+    }
+
+    pub(crate) fn set_token_media(&self, t: DbTokenMediaActMod) -> Result<i32, InternalError> {
+        let idx = *self.next_token_media_idx.borrow();
+        *self.next_token_media_idx.borrow_mut() += 1;
+        let row = DbTokenMedia {
+            idx,
+            token_idx: av(t.token_idx),
+            media_idx: av(t.media_idx),
+            attachment_id: av(t.attachment_id),
+        };
+        self.token_medias.borrow_mut().push(row);
         Ok(idx)
     }
 
@@ -984,6 +1189,9 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = &b.expiration {
             row.expiration = *v;
         }
+        if let ActiveValue::Set(v) = b.incoming {
+            row.incoming = v;
+        }
         if let ActiveValue::Set(v) = &b.operation_secret_key {
             row.operation_secret_key = v.clone();
         }
@@ -1131,6 +1339,43 @@ impl InMemoryDb {
         Ok(())
     }
 
+    pub(crate) fn del_reserved_txos(
+        &self,
+        reserved_txos: &[DbReservedTxo],
+    ) -> Result<(), InternalError> {
+        let idxs = reserved_txos
+            .iter()
+            .map(|r| r.idx)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.reserved_txos
+            .borrow_mut()
+            .retain(|r| !idxs.contains(&r.idx));
+        Ok(())
+    }
+
+    pub(crate) fn del_colored_reserved_txos_by_outpoints(
+        &self,
+        outpoints: &[Outpoint],
+    ) -> Result<(), InternalError> {
+        self.reserved_txos.borrow_mut().retain(|r| {
+            r.reserved_for_colored.is_none()
+                || !outpoints
+                    .iter()
+                    .any(|o| o.txid == r.txid && o.vout == r.vout)
+        });
+        Ok(())
+    }
+
+    pub(crate) fn del_reserved_txos_for_batch_transfer(
+        &self,
+        batch_transfer_idx: i32,
+    ) -> Result<(), InternalError> {
+        self.reserved_txos
+            .borrow_mut()
+            .retain(|r| r.reserved_for_colored != Some(batch_transfer_idx));
+        Ok(())
+    }
+
     pub(crate) fn del_txo(&self, idx: i32) -> Result<(), InternalError> {
         {
             let mut colorings = self.colorings.borrow_mut();
@@ -1179,6 +1424,33 @@ impl InMemoryDb {
             .cloned())
     }
 
+    pub(crate) fn get_or_insert_media(
+        &self,
+        digest: String,
+        mime: String,
+    ) -> Result<i32, InternalError> {
+        match self.get_media_by_digest(digest.clone())? {
+            Some(media) => Ok(media.idx),
+            None => self.set_media(DbMediaActMod {
+                digest: ActiveValue::Set(digest),
+                mime: ActiveValue::Set(mime),
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
+        Ok(self.bdk_changeset.borrow().clone().unwrap_or_default())
+    }
+
+    pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
+        let mut current = self.bdk_changeset.borrow_mut();
+        let mut merged = current.take().unwrap_or_default();
+        merged.merge(changeset.clone());
+        *current = Some(merged);
+        Ok(())
+    }
+
     pub(crate) fn get_transport_endpoint(
         &self,
         endpoint: String,
@@ -1224,6 +1496,178 @@ impl InMemoryDb {
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, InternalError> {
         Ok(self.pending_witness_scripts.borrow().clone())
+    }
+
+    pub(crate) fn iter_reserved_txos(&self) -> Result<Vec<DbReservedTxo>, InternalError> {
+        Ok(self.reserved_txos.borrow().clone())
+    }
+
+    pub(crate) fn iter_tokens(&self) -> Result<Vec<DbToken>, InternalError> {
+        Ok(self.tokens.borrow().clone())
+    }
+
+    pub(crate) fn iter_token_medias(&self) -> Result<Vec<DbTokenMedia>, InternalError> {
+        Ok(self.token_medias.borrow().clone())
+    }
+
+    pub(crate) fn get_asset_transfers(&self) -> Result<Vec<DbAssetTransfer>, Error> {
+        Ok(self.asset_transfers.borrow().clone())
+    }
+
+    pub(crate) fn get_transfers(&self) -> Result<Vec<DbTransfer>, Error> {
+        Ok(self.transfers.borrow().clone())
+    }
+
+    pub(crate) fn get_batch_transfer(&self, idx: i32) -> Result<Option<DbBatchTransfer>, Error> {
+        Ok(self
+            .batch_transfers
+            .borrow()
+            .iter()
+            .find(|b| b.idx == idx)
+            .cloned())
+    }
+
+    pub(crate) fn get_batch_transfers_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Vec<DbBatchTransfer>, Error> {
+        Ok(self
+            .batch_transfers
+            .borrow()
+            .iter()
+            .filter(|b| b.txid.as_deref() == Some(txid))
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn get_batch_transfer_transfers(
+        &self,
+        batch_transfer_idx: i32,
+    ) -> Result<Vec<DbTransfer>, Error> {
+        let transfers = self.transfers.borrow();
+        let asset_transfers = self.asset_transfers.borrow();
+        Ok(transfers
+            .iter()
+            .filter(|t| {
+                asset_transfers.iter().any(|a| {
+                    a.idx == t.asset_transfer_idx && a.batch_transfer_idx == batch_transfer_idx
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn get_pending_or_recently_failed_incoming_transfers(
+        &self,
+        failed_since: i64,
+    ) -> Result<Vec<(DbTransfer, DbBatchTransfer)>, Error> {
+        let transfers = self.transfers.borrow();
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        Ok(transfers
+            .iter()
+            .filter_map(|t| {
+                let asset_transfer = asset_transfers
+                    .iter()
+                    .find(|a| a.idx == t.asset_transfer_idx)?;
+                let batch_transfer = batch_transfers
+                    .iter()
+                    .find(|b| b.idx == asset_transfer.batch_transfer_idx)?;
+                let pending = batch_transfer.status.pending();
+                let recently_failed =
+                    batch_transfer.status.failed() && batch_transfer.updated_at > failed_since;
+                (batch_transfer.incoming && (pending || recently_failed))
+                    .then(|| (t.clone(), batch_transfer.clone()))
+            })
+            .collect())
+    }
+
+    pub(crate) fn get_receive_colorings_by_txo_idxs(
+        &self,
+        txo_idxs: Vec<i32>,
+    ) -> Result<Vec<DbColoring>, Error> {
+        Ok(self
+            .colorings
+            .borrow()
+            .iter()
+            .filter(|c| c.r#type == ColoringType::Receive && txo_idxs.contains(&c.txo_idx))
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn get_transport_endpoints_by_transfer(
+        &self,
+        transfer_idxs: &[i32],
+    ) -> Result<crate::database::TransportEndpointsByTransfer, Error> {
+        let ttes = self.transfer_transport_endpoints.borrow();
+        let endpoints = self.transport_endpoints.borrow();
+        let mut grouped: crate::database::TransportEndpointsByTransfer = HashMap::new();
+        let mut rows: Vec<_> = ttes
+            .iter()
+            .filter(|t| transfer_idxs.contains(&t.transfer_idx))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|t| t.idx);
+        for tte in rows {
+            let endpoint = endpoints
+                .iter()
+                .find(|e| e.idx == tte.transport_endpoint_idx)
+                .expect("should be connected");
+            grouped.entry(tte.transfer_idx).or_default().push((
+                crate::database::entities::transfer_transport_endpoint::Model {
+                    idx: tte.idx,
+                    transfer_idx: tte.transfer_idx,
+                    transport_endpoint_idx: tte.transport_endpoint_idx,
+                    used: tte.used,
+                    kind: tte.kind,
+                },
+                crate::database::entities::transport_endpoint::Model {
+                    idx: endpoint.idx,
+                    transport_type: endpoint.transport_type,
+                    endpoint: endpoint.endpoint.clone(),
+                },
+            ));
+        }
+        Ok(grouped)
+    }
+
+    pub(crate) fn get_wallet_transactions_by_idxs(
+        &self,
+        idxs: &[i32],
+    ) -> Result<Vec<DbWalletTransaction>, Error> {
+        Ok(self
+            .wallet_transactions
+            .borrow()
+            .iter()
+            .filter(|w| idxs.contains(&w.idx))
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn get_wallet_transaction_with_reserved_txos_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Option<(DbWalletTransaction, Vec<DbReservedTxo>)>, Error> {
+        let wallet_transactions = self.wallet_transactions.borrow();
+        let Some(wallet_transaction) = wallet_transactions.iter().find(|w| w.txid == txid).cloned()
+        else {
+            return Ok(None);
+        };
+        let reserved = self
+            .reserved_txos
+            .borrow()
+            .iter()
+            .filter(|r| r.reserved_for_vanilla == Some(wallet_transaction.idx))
+            .cloned()
+            .collect();
+        Ok(Some((wallet_transaction, reserved)))
+    }
+
+    pub(crate) fn del_wallet_transaction(&self, idx: i32) -> Result<(), InternalError> {
+        self.wallet_transactions
+            .borrow_mut()
+            .retain(|w| w.idx != idx);
+        Ok(())
     }
 
     pub(crate) fn iter_pending_witness_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
@@ -1316,75 +1760,85 @@ impl InMemoryDb {
             self.iter_transfers()?
         };
         let txos = self.iter_txos()?;
-        Ok(crate::database::DbData {
-            batch_transfers: batch_transfers
-                .into_iter()
-                .map(|b| crate::database::entities::batch_transfer::Model {
-                    idx: b.idx,
-                    txid: b.txid,
-                    status: b.status,
-                    created_at: b.created_at,
-                    updated_at: b.updated_at,
-                    expiration: b.expiration,
-                    min_confirmations: b.min_confirmations,
-                    // shortcut: the reference memory DB keeps `incoming` on the transfer, not
-                    // the batch; wire it up when the DB layer is unified
-                    incoming: false,
-                    operation_secret_key: b.operation_secret_key,
-                    broadcast_deadline: b.broadcast_deadline,
-                    retention_deadline: b.retention_deadline,
-                })
-                .collect(),
-            asset_transfers: asset_transfers
-                .into_iter()
-                .map(|a| crate::database::entities::asset_transfer::Model {
-                    idx: a.idx,
-                    user_driven: a.user_driven,
-                    batch_transfer_idx: a.batch_transfer_idx,
-                    asset_id: a.asset_id,
-                })
-                .collect(),
-            transfers: transfers
-                .into_iter()
-                .map(|t| crate::database::entities::transfer::Model {
-                    idx: t.idx,
-                    asset_transfer_idx: t.asset_transfer_idx,
-                    requested_assignment: t.requested_assignment,
-                    recipient_type: t.recipient_type,
-                    recipient_id: t.recipient_id,
-                    ack: t.ack,
-                    invoice_string: t.invoice_string,
-                    recipient_pubkey: t.recipient_pubkey,
-                    consignment_hash: t.consignment_hash,
-                    recipient_encryption: t.recipient_encryption,
-                    ack_signature: t.ack_signature,
-                    proxy_transfer_id: t.proxy_transfer_id,
-                    invoice_expiration: t.invoice_expiration,
-                })
-                .collect(),
-            colorings: colorings
-                .into_iter()
-                .map(|c| crate::database::entities::coloring::Model {
-                    idx: c.idx,
-                    txo_idx: c.txo_idx,
-                    asset_transfer_idx: c.asset_transfer_idx,
-                    r#type: c.r#type,
-                    assignment: c.assignment,
-                })
-                .collect(),
-            txos: txos
-                .into_iter()
-                .map(|t| crate::database::entities::txo::Model {
-                    idx: t.idx,
-                    txid: t.txid,
-                    vout: t.vout,
-                    btc_amount: t.btc_amount,
-                    spent: t.spent,
-                    exists: t.exists,
-                    pending_witness: t.pending_witness,
-                })
-                .collect(),
-        })
+        Ok(to_entity_db_data(
+            batch_transfers,
+            asset_transfers,
+            transfers,
+            colorings,
+            txos,
+        ))
+    }
+
+    /// Get the DB rows (and transport endpoints) needed to build the user-driven transfers
+    /// matching `asset_filter`, restricted to the given batch transfers if provided.
+    pub(crate) fn get_transfers_db_data(
+        &self,
+        batch_transfer_idxs: Option<&[i32]>,
+        asset_filter: &crate::wallet::AssetFilter,
+    ) -> Result<
+        (
+            crate::database::DbData,
+            crate::database::TransportEndpointsByTransfer,
+        ),
+        Error,
+    > {
+        let asset_transfers: Vec<DbAssetTransfer> = self
+            .asset_transfers
+            .borrow()
+            .iter()
+            .filter(|a| a.user_driven)
+            .filter(|a| match asset_filter {
+                crate::wallet::AssetFilter::AnyOrNone => true,
+                crate::wallet::AssetFilter::None => a.asset_id.is_none(),
+                crate::wallet::AssetFilter::Id(asset_id) => {
+                    a.asset_id.as_deref() == Some(asset_id.as_str())
+                }
+            })
+            .filter(|a| batch_transfer_idxs.is_none_or(|idxs| idxs.contains(&a.batch_transfer_idx)))
+            .cloned()
+            .collect();
+        let asset_transfer_idxs: std::collections::BTreeSet<i32> =
+            asset_transfers.iter().map(|a| a.idx).collect();
+        let batch_transfer_idxs: std::collections::BTreeSet<i32> = asset_transfers
+            .iter()
+            .map(|a| a.batch_transfer_idx)
+            .collect();
+        let batch_transfers: Vec<DbBatchTransfer> = self
+            .batch_transfers
+            .borrow()
+            .iter()
+            .filter(|b| batch_transfer_idxs.contains(&b.idx))
+            .cloned()
+            .collect();
+        let transfers: Vec<DbTransfer> = self
+            .transfers
+            .borrow()
+            .iter()
+            .filter(|t| asset_transfer_idxs.contains(&t.asset_transfer_idx))
+            .cloned()
+            .collect();
+        let colorings: Vec<DbColoring> = self
+            .colorings
+            .borrow()
+            .iter()
+            .filter(|c| asset_transfer_idxs.contains(&c.asset_transfer_idx))
+            .cloned()
+            .collect();
+        let txo_idxs: std::collections::BTreeSet<i32> =
+            colorings.iter().map(|c| c.txo_idx).collect();
+        let txos: Vec<DbTxo> = self
+            .txos
+            .borrow()
+            .iter()
+            .filter(|t| txo_idxs.contains(&t.idx))
+            .cloned()
+            .collect();
+        let transfer_idxs: Vec<i32> = transfers.iter().map(|t| t.idx).collect();
+        let endpoints = self.get_transport_endpoints_by_transfer(&transfer_idxs)?;
+        Ok((
+            to_entity_db_data(batch_transfers, asset_transfers, transfers, colorings, txos),
+            endpoints,
+        ))
     }
 
     pub(crate) fn get_unspent_txos(&self, txos: Vec<DbTxo>) -> Result<Vec<DbTxo>, InternalError> {
@@ -1666,6 +2120,239 @@ impl InMemoryDb {
                 })
             })
             .collect()
+    }
+}
+
+/// Map the memory rows to the current entity models used by the wallet layer.
+fn to_entity_db_data(
+    batch_transfers: Vec<DbBatchTransfer>,
+    asset_transfers: Vec<DbAssetTransfer>,
+    transfers: Vec<DbTransfer>,
+    colorings: Vec<DbColoring>,
+    txos: Vec<DbTxo>,
+) -> crate::database::DbData {
+    crate::database::DbData {
+        batch_transfers: batch_transfers
+            .into_iter()
+            .map(|b| crate::database::entities::batch_transfer::Model {
+                idx: b.idx,
+                txid: b.txid,
+                status: b.status,
+                created_at: b.created_at,
+                updated_at: b.updated_at,
+                expiration: b.expiration,
+                min_confirmations: b.min_confirmations,
+                incoming: b.incoming,
+                operation_secret_key: b.operation_secret_key,
+                broadcast_deadline: b.broadcast_deadline,
+                retention_deadline: b.retention_deadline,
+            })
+            .collect(),
+        asset_transfers: asset_transfers
+            .into_iter()
+            .map(|a| crate::database::entities::asset_transfer::Model {
+                idx: a.idx,
+                user_driven: a.user_driven,
+                batch_transfer_idx: a.batch_transfer_idx,
+                asset_id: a.asset_id,
+            })
+            .collect(),
+        transfers: transfers
+            .into_iter()
+            .map(|t| crate::database::entities::transfer::Model {
+                idx: t.idx,
+                asset_transfer_idx: t.asset_transfer_idx,
+                requested_assignment: t.requested_assignment,
+                recipient_type: t.recipient_type,
+                recipient_id: t.recipient_id,
+                ack: t.ack,
+                invoice_string: t.invoice_string,
+                recipient_pubkey: t.recipient_pubkey,
+                consignment_hash: t.consignment_hash,
+                recipient_encryption: t.recipient_encryption,
+                ack_signature: t.ack_signature,
+                proxy_transfer_id: t.proxy_transfer_id,
+                invoice_expiration: t.invoice_expiration,
+            })
+            .collect(),
+        colorings: colorings
+            .into_iter()
+            .map(|c| crate::database::entities::coloring::Model {
+                idx: c.idx,
+                txo_idx: c.txo_idx,
+                asset_transfer_idx: c.asset_transfer_idx,
+                r#type: c.r#type,
+                assignment: c.assignment,
+            })
+            .collect(),
+        txos: txos
+            .into_iter()
+            .map(|t| crate::database::entities::txo::Model {
+                idx: t.idx,
+                txid: t.txid,
+                vout: t.vout,
+                btc_amount: t.btc_amount,
+                spent: t.spent,
+                exists: t.exists,
+                pending_witness: t.pending_witness,
+            })
+            .collect(),
+    }
+}
+
+/// Snapshot-based transaction over [`InMemoryDb`].
+///
+/// Mirrors the SQLite backend: changes are visible immediately inside the transaction, commit
+/// makes them durable and runs the commit callbacks, drop (or an error in a savepoint) restores
+/// the snapshot taken at the start.
+pub(crate) struct MemoryTxn<'a> {
+    db: &'a InMemoryDb,
+    snapshot: Option<InMemoryDb>,
+    on_commit: RefCell<Vec<Box<dyn FnOnce()>>>,
+}
+
+macro_rules! table_fields {
+    ($($f:ident),+ $(,)?) => {
+        impl InMemoryDb {
+            fn snapshot(&self) -> InMemoryDb {
+                let mut snap = self.clone();
+                snap.tx_open = RefCell::new(false);
+                snap
+            }
+
+            fn restore(&self, snap: InMemoryDb) {
+                $( *self.$f.borrow_mut() = snap.$f.into_inner(); )+
+                *self.tx_open.borrow_mut() = false;
+            }
+        }
+    };
+}
+
+table_fields!(
+    txos,
+    next_txo_idx,
+    media,
+    next_media_idx,
+    assets,
+    next_asset_idx,
+    batch_transfers,
+    next_batch_transfer_idx,
+    asset_transfers,
+    next_asset_transfer_idx,
+    colorings,
+    next_coloring_idx,
+    transfers,
+    next_transfer_idx,
+    transport_endpoints,
+    next_transport_endpoint_idx,
+    transfer_transport_endpoints,
+    next_transfer_transport_endpoint_idx,
+    wallet_transactions,
+    next_wallet_transaction_idx,
+    pending_witness_scripts,
+    next_pending_witness_script_idx,
+    backup_info,
+    next_backup_info_idx,
+    reserved_txos,
+    next_reserved_txo_idx,
+    tokens,
+    next_token_idx,
+    token_medias,
+    next_token_media_idx,
+    bdk_changeset,
+);
+
+impl InMemoryDb {
+    pub(crate) fn begin_transaction(&self) -> Result<MemoryTxn<'_>, Error> {
+        if *self.tx_open.borrow() {
+            return Err(Error::Internal {
+                details: "nested transaction".to_string(),
+            });
+        }
+        *self.tx_open.borrow_mut() = true;
+        Ok(MemoryTxn {
+            db: self,
+            snapshot: Some(self.snapshot()),
+            on_commit: RefCell::new(Vec::new()),
+        })
+    }
+}
+
+impl MemoryTxn<'_> {
+    pub(crate) fn on_commit(&self, f: impl FnOnce() + 'static) {
+        self.on_commit.borrow_mut().push(Box::new(f));
+    }
+
+    pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
+        self.db.get_bdk_changeset()
+    }
+
+    pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
+        self.db.update_bdk_changeset(changeset)
+    }
+
+    pub(crate) fn get_db_data(
+        &self,
+        empty_transfers: bool,
+    ) -> Result<crate::database::DbData, InternalError> {
+        self.db.get_db_data(empty_transfers)
+    }
+
+    pub(crate) fn iter_assets(&self) -> Result<Vec<DbAsset>, InternalError> {
+        self.db.iter_assets()
+    }
+
+    pub(crate) fn iter_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
+        self.db.iter_txos()
+    }
+
+    pub(crate) fn set_asset(&self, asset: DbAssetActMod) -> Result<i32, InternalError> {
+        self.db.set_asset(asset)
+    }
+
+    pub(crate) fn set_media(&self, media: DbMediaActMod) -> Result<i32, InternalError> {
+        self.db.set_media(media)
+    }
+
+    pub(crate) fn get_media_by_digest(
+        &self,
+        digest: String,
+    ) -> Result<Option<DbMedia>, InternalError> {
+        self.db.get_media_by_digest(digest)
+    }
+
+    pub(crate) fn with_savepoint<T>(
+        &self,
+        f: impl FnOnce(&MemoryTxn<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut savepoint = MemoryTxn {
+            db: self.db,
+            snapshot: Some(self.db.snapshot()),
+            on_commit: RefCell::new(Vec::new()),
+        };
+        // on error the savepoint is dropped, which restores its snapshot
+        let res = f(&savepoint)?;
+        savepoint.snapshot = None;
+        let callbacks = std::mem::take(&mut *savepoint.on_commit.borrow_mut());
+        self.on_commit.borrow_mut().extend(callbacks);
+        Ok(res)
+    }
+
+    pub(crate) fn commit(mut self) -> Result<(), Error> {
+        self.snapshot = None;
+        *self.db.tx_open.borrow_mut() = false;
+        for callback in std::mem::take(&mut *self.on_commit.borrow_mut()) {
+            callback();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MemoryTxn<'_> {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            self.db.restore(snapshot);
+        }
     }
 }
 
@@ -2714,5 +3401,110 @@ mod tests {
             .unwrap();
         assert_eq!(allocations.len(), 1);
         assert!(allocations[0].rgb_allocations.is_empty());
+    }
+
+    #[test]
+    fn commit_keeps_changes_and_runs_callbacks() {
+        let db = make_db();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let txn = db.begin_transaction().unwrap();
+            db.set_asset(make_asset_mod("asset-1")).unwrap();
+            let ran = ran.clone();
+            txn.on_commit(move || ran.set(true));
+            txn.commit().unwrap();
+        }
+        assert!(ran.get());
+        assert_eq!(db.iter_assets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn drop_rolls_back_and_drops_callbacks() {
+        let db = make_db();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let txn = db.begin_transaction().unwrap();
+            db.set_asset(make_asset_mod("asset-1")).unwrap();
+            let ran = ran.clone();
+            txn.on_commit(move || ran.set(true));
+        }
+        assert!(!ran.get());
+        assert!(db.iter_assets().unwrap().is_empty());
+        assert_eq!(*db.next_asset_idx.borrow(), 1);
+    }
+
+    #[test]
+    fn savepoint_keeps_success_and_rolls_back_error() {
+        let db = make_db();
+        let txn = db.begin_transaction().unwrap();
+        db.set_asset(make_asset_mod("outer")).unwrap();
+
+        let kept = txn
+            .with_savepoint(|_| {
+                db.set_asset(make_asset_mod("inner-kept"))?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(kept, ());
+
+        let err = txn
+            .with_savepoint(|_| -> Result<(), Error> {
+                db.set_asset(make_asset_mod("inner-dropped"))?;
+                Err(Error::Internal {
+                    details: "boom".to_string(),
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }));
+
+        txn.commit().unwrap();
+        let ids: Vec<_> = db
+            .iter_assets()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec!["outer", "inner-kept"]);
+    }
+
+    #[test]
+    fn nested_begin_is_refused_until_the_first_transaction_ends() {
+        let db = make_db();
+        let txn = db.begin_transaction().unwrap();
+        assert!(db.begin_transaction().is_err());
+        drop(txn);
+        assert!(db.begin_transaction().is_ok());
+    }
+
+    #[test]
+    fn bdk_changeset_merges_and_rolls_back() {
+        use bdk_wallet::bitcoin::Network;
+
+        let db = make_db();
+        let txn = db.begin_transaction().unwrap();
+        txn.update_bdk_changeset(&ChangeSet::default()).unwrap();
+        txn.update_bdk_changeset(&ChangeSet {
+            network: Some(Network::Regtest),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            txn.get_bdk_changeset().unwrap().network,
+            Some(Network::Regtest)
+        );
+        drop(txn);
+        assert_eq!(db.get_bdk_changeset().unwrap().network, None);
+
+        let txn = db.begin_transaction().unwrap();
+        txn.update_bdk_changeset(&ChangeSet {
+            network: Some(Network::Regtest),
+            ..Default::default()
+        })
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            db.get_bdk_changeset().unwrap().network,
+            Some(Network::Regtest)
+        );
     }
 }
