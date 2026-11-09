@@ -112,6 +112,23 @@ sea-orm = { version = "2.0.4", optional = true, default-features = false, featur
 ] }
 tokio = { version = "1", optional = true, default-features = false }
 
+# Browser entropy for the wasm32 wallet: getrandom has no backend of its own on
+# wasm32-unknown-unknown, so each version in the lock needs its JS feature. Today those come in
+# transitively (amplify enables 0.2 `js`, rgb-consensus/rgb-ops enable 0.3 `wasm_js`, zip enables
+# 0.4 `wasm_js`); declaring them here keeps the wallet RNG independent of those upstream features
+# staying enabled. Optional and enabled by `wallet`, so the wallet-less wasm build stays free of
+# wasm-bindgen. The target gate keeps the native dependency graph unchanged.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "=0.2.17", optional = true, default-features = false, features = [
+    "js",
+] }
+getrandom_03 = { package = "getrandom", version = "=0.3.4", optional = true, default-features = false, features = [
+    "wasm_js",
+] }
+getrandom_04 = { package = "getrandom", version = "=0.4.3", optional = true, default-features = false, features = [
+    "wasm_js",
+] }
+
 [dev-dependencies]
 biscuit-auth = { version = "6.0.0", default-features = false, features = [
     "datalog-macro",
@@ -167,6 +184,9 @@ wallet = [
     "dep:tempfile",
     "dep:time",
     "dep:file-format",
+    "dep:getrandom_02",
+    "dep:getrandom_03",
+    "dep:getrandom_04",
     "dep:url",
     "dep:walkdir",
     "dep:zip",
