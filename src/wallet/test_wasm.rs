@@ -13,6 +13,7 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use super::*;
 use crate::wallet::persistence::{delete_snapshot, load_snapshot};
 use crate::{
+    Error,
     database::entities::txo::ActiveModel as DbTxoActMod,
     keys::generate_keys,
     wallet::{core::WalletCore, offline::RgbWalletOpsOffline},
@@ -111,8 +112,8 @@ async fn wallet_lifecycle_over_indexed_db() {
         .await
         .unwrap()
         .expect("the snapshot saved above");
-    let mut restored =
-        Wallet::from_snapshot(&loaded, wallet_data.clone(), wallet_keys).expect("wallet restore");
+    let mut restored = Wallet::from_snapshot(&loaded, wallet_data.clone(), wallet_keys.clone())
+        .expect("wallet restore");
     assert_eq!(restored.get_keys().master_fingerprint, fingerprint);
     assert_eq!(
         restored.get_wallet_data().bitcoin_network,
@@ -132,6 +133,21 @@ async fn wallet_lifecycle_over_indexed_db() {
         next_address,
         "the second flush did not persist the newest state"
     );
+
+    // a restore with settings the snapshot was not created with is rejected: the manifest travels
+    // in the envelope and is validated before the database is rebuilt
+    let mut changed_data = wallet_data.clone();
+    changed_data.max_allocations_per_utxo += 1;
+    let err = Wallet::from_snapshot(&loaded, changed_data, wallet_keys.clone())
+        .err()
+        .expect("a changed setting must be rejected");
+    assert!(matches!(err, Error::WalletSettingMismatch { .. }));
+    let mut changed_data = wallet_data.clone();
+    changed_data.supported_schemas = vec![AssetSchema::Nia];
+    let err = Wallet::from_snapshot(&loaded, changed_data, wallet_keys)
+        .err()
+        .expect("a changed setting must be rejected");
+    assert!(matches!(err, Error::WalletSettingMismatch { .. }));
 
     delete_snapshot(WALLET_ID).await.unwrap();
     assert!(load_snapshot(WALLET_ID).await.unwrap().is_none());

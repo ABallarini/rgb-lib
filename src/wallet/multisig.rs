@@ -1124,6 +1124,9 @@ impl MultisigWallet {
     /// (for example IndexedDB) is up to the host: on wasm32 use
     /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot) on an explicit
     /// flush boundary, never concurrently for the same wallet id.
+    ///
+    /// Multisig wallets have no manifest: the snapshot is the raw database snapshot and
+    /// [`MultisigWallet::from_snapshot`] does not validate the settings.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
         self.internals.database.snapshot()
     }

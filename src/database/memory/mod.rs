@@ -21,6 +21,8 @@ use rgb_store::{MemRgbStore, RgbSavepoint};
 pub(crate) struct MemoryBackend {
     pub(crate) db: InMemoryDb,
     pub(crate) rgb: Mutex<MemRgbStore>,
+    // the wallet manifest rides in the wallet snapshot envelope, not in the inner snapshot
+    manifest_json: Mutex<Option<String>>,
 }
 
 impl MemoryBackend {
@@ -28,7 +30,24 @@ impl MemoryBackend {
         Self {
             db: InMemoryDb::new(),
             rgb: Mutex::new(MemRgbStore::default()),
+            manifest_json: Mutex::new(None),
         }
+    }
+
+    /// Store the wallet manifest JSON that travels in the wallet snapshot envelope.
+    pub(crate) fn set_wallet_manifest(&self, json: String) {
+        *self
+            .manifest_json
+            .lock()
+            .expect("manifest mutex is never poisoned") = Some(json);
+    }
+
+    /// The wallet manifest JSON stored by [`Self::set_wallet_manifest`].
+    pub(crate) fn wallet_manifest(&self) -> Option<String> {
+        self.manifest_json
+            .lock()
+            .expect("manifest mutex is never poisoned")
+            .clone()
     }
 
     /// Version byte of the snapshot format written by [`Self::to_snapshot`].
@@ -92,6 +111,7 @@ impl MemoryBackend {
         Ok(Self {
             db,
             rgb: Mutex::new(rgb),
+            manifest_json: Mutex::new(None),
         })
     }
 

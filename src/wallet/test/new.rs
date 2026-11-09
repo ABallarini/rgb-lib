@@ -167,6 +167,16 @@ fn snapshot_and_restore_memory_success() {
 
     let snapshot = wallet.snapshot().unwrap().unwrap();
     assert!(!snapshot.is_empty());
+    // the snapshot is the wallet envelope, and the backend keeps the manifest for later flushes
+    assert!(snapshot.starts_with(b"RGBWL"));
+    assert!(
+        wallet
+            .database()
+            .memory_backend()
+            .unwrap()
+            .wallet_manifest()
+            .is_some()
+    );
     // the DB snapshot carries the persisted wallet state, never the mnemonic
     let mnemonic = keys.mnemonic.clone();
     assert!(
@@ -175,6 +185,14 @@ fn snapshot_and_restore_memory_success() {
             .any(|window| window == mnemonic.as_bytes())
     );
     drop(wallet);
+
+    // a restore with settings the snapshot was not created with is rejected
+    let mut wallet_data_bad = wallet_data.clone();
+    wallet_data_bad.max_allocations_per_utxo += 1;
+    assert!(matches!(
+        Wallet::from_snapshot(&snapshot, wallet_data_bad, wallet_keys.clone()),
+        Err(Error::WalletSettingMismatch { .. })
+    ));
 
     // the manifest written by the first construction is in the same wallet dir
     let restored = Wallet::from_snapshot(&snapshot, wallet_data.clone(), wallet_keys).unwrap();
