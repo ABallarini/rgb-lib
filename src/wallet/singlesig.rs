@@ -200,6 +200,14 @@ impl Wallet {
     /// Create a new RGB singlesig wallet based on the provided [`WalletData`] and
     /// [`SinglesigKeys`].
     pub fn new(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
+        Self::new_with_database(wallet_data, keys, None)
+    }
+
+    pub(crate) fn new_with_database(
+        wallet_data: WalletData,
+        keys: SinglesigKeys,
+        database: Option<RgbLibDatabase>,
+    ) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
 
         // wallet keys
@@ -213,7 +221,10 @@ impl Wallet {
         WalletManifest::check_settings_unchanged(&wallet_dir, &wallet_data, &keys)?;
 
         // setup rgb-lib DB
-        let database = setup_db(&wallet_dir)?;
+        let database = match database {
+            Some(db) => db,
+            None => setup_db(&wallet_dir)?,
+        };
 
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(

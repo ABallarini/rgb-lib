@@ -89,6 +89,39 @@ fn success() {
     check_wallet(&party, bitcoin_network, vanilla_keychain);
 }
 
+#[test]
+#[parallel]
+fn memory_database_success() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_data = data_dir.wallet_data();
+
+    let wallet = Wallet::new_with_database(
+        wallet_data,
+        SinglesigKeys::from_keys(&keys, None),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+
+    // construction ran against the injected backend, not SQLite
+    assert!(wallet.database().memory_backend().is_some());
+    assert_eq!(
+        wallet.get_wallet_data().bitcoin_network,
+        BitcoinNetwork::Regtest
+    );
+    assert_eq!(
+        wallet.get_keys().master_fingerprint,
+        keys.master_fingerprint
+    );
+
+    // reads go through the wallet tables and the RGB store of the same backend
+    let assets = wallet.list_assets(vec![]).unwrap();
+    assert!(assets.nia.unwrap_or_default().is_empty());
+    assert!(assets.uda.unwrap_or_default().is_empty());
+    assert!(assets.cfa.unwrap_or_default().is_empty());
+    assert!(assets.ifa.unwrap_or_default().is_empty());
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
