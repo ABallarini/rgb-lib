@@ -1,9 +1,8 @@
 #!/bin/bash
 # Fail-fast gate for the WASM portability work.
 #
-# Runs the checks that must stay green for every step. The wallet build for
-# wasm32 is not included here until it is genuinely green; the baseline script
-# runs it as a separate, clearly labelled informational check.
+# Runs the checks that must stay green for every step, including the wallet
+# build for wasm32, which compiles over the in-memory backend (no SQLite/Tokio).
 set -e
 
 CWD=$(dirname "${0}")
@@ -19,3 +18,4 @@ _run cargo fmt --all -- --check
 _run cargo check --lib --all-features
 _run cargo test --lib --no-default-features --features wallet
 _run cargo check --lib --target wasm32-unknown-unknown --no-default-features
+_run cargo check --lib --target wasm32-unknown-unknown --no-default-features --features wallet

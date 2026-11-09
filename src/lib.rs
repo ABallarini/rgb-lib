@@ -159,6 +159,8 @@ pub use rgbstd::{
     vm::WitnessOrd,
 };
 
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+pub use crate::utils::block_on;
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TypeOfTransition},
     error::Error,
@@ -166,7 +168,7 @@ pub use crate::{
 #[cfg(feature = "wallet")]
 pub use crate::{
     database::enums::{Encryption, TransferStatus, TransportType, WalletTransactionType},
-    utils::{BitcoinNetwork, block_on},
+    utils::BitcoinNetwork,
 };
 
 #[cfg(feature = "_online")]
@@ -286,10 +288,8 @@ use reqwest::{
     blocking::{Client as RestClient, multipart},
     header::CONTENT_TYPE,
 };
-#[cfg(feature = "wallet")]
-use rgb_lib_migration::{
-    ArrayType, ColumnType, Migrator, MigratorTrait, Nullable, Value, ValueTypeErr,
-};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use rgb_lib_migration::{Migrator, MigratorTrait};
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
@@ -371,6 +371,8 @@ use sea_orm::{
     QueryOrder, QueryResult, QuerySelect, TransactionTrait, TryGetError, TryGetable, TryIntoModel,
     sea_query::{Alias, Condition, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
 };
+#[cfg(feature = "wallet")]
+use sea_query::{ArrayType, ColumnType, Nullable, Value, ValueTypeErr};
 #[cfg(feature = "wallet")]
 use serde::Deserializer;
 #[cfg(feature = "wallet")]

@@ -258,6 +258,7 @@ pub(crate) fn setup_rgb(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, Error> {
     let db_path = wallet_dir.as_ref().join(RGB_LIB_DB_NAME);
     let display_db_path = adjust_canonicalization(db_path);
@@ -272,6 +273,13 @@ pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, 
     let connection = db_cnn?;
     block_on(Migrator::up(&connection, None))?;
     Ok(RgbLibDatabase::new(connection))
+}
+
+/// On `wasm32` there is no filesystem to hold the SQLite database: the wallet data lives in the
+/// in-memory backend, which the host persists as a snapshot.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn setup_db<P: AsRef<Path>>(_wallet_dir: P) -> Result<RgbLibDatabase, Error> {
+    Ok(RgbLibDatabase::new_memory())
 }
 
 /// Import the BDK data of a wallet created before the changeset moved into the rgb-lib DB.

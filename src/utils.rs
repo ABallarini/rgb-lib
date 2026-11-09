@@ -42,10 +42,12 @@ pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 const PROXY_PROTOCOL_VERSION: &str = "1.0";
 
 // sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
+#[cfg(not(target_arch = "wasm32"))]
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
 
 /// Block on a future, spawning a new thread if already inside a Tokio runtime.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,

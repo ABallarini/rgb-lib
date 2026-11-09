@@ -44,7 +44,6 @@ x25519-dalek = { version = "3", optional = true, default-features = false, featu
 hkdf = { version = "0.13", optional = true, default-features = false }
 hmac = { version = "0.13", optional = true, default-features = false }
 sha2 = { version = "0.11", optional = true, default-features = false }
-tokio = { version = "1", optional = true, default-features = false }
 hex = { version = "0.4.3", default-features = false, features = [
     "alloc",
 ] }
@@ -56,15 +55,11 @@ reqwest = { version = "0.13", optional = true, default-features = false, feature
     "json",
     "multipart",
 ] }
-rgb-lib-migration = { path = "migration", version = "0.3.0-beta.5", optional = true }
-rustls = { version = "0.23.46", optional = true, default-features = false }
 scrypt = { version = "0.12.0", optional = true, default-features = false, features = [
     "phc",
 ] }
 sea-orm = { version = "2.0.4", optional = true, default-features = false, features = [
     "macros",
-    "runtime-tokio-rustls",
-    "sqlx-sqlite",
     "with-json",
 ] }
 sea-query = { version = "1.0.2", optional = true }
@@ -102,6 +97,20 @@ rgb-strict-encoding = { version = "1.0.5", default-features = false, features = 
     "bitcoin",
 ] }
 rgb-strict-types = { version = "1.0.5", default-features = false }
+
+# SQLite, Tokio and the TLS stack behind them are native only: on wasm32 the wallet runs over the
+# in-memory backend, so these cannot appear in its dependency graph (mio, libsqlite3-sys and ring
+# do not build there). The optional flags and the `wallet` feature entries stay the same.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rgb-lib-migration = { path = "migration", version = "0.3.0-beta.5", optional = true }
+rustls = { version = "0.23.46", optional = true, default-features = false }
+sea-orm = { version = "2.0.4", optional = true, default-features = false, features = [
+    "macros",
+    "runtime-tokio-rustls",
+    "sqlx-sqlite",
+    "with-json",
+] }
+tokio = { version = "1", optional = true, default-features = false }
 
 [dev-dependencies]
 biscuit-auth = { version = "6.0.0", default-features = false, features = [

@@ -73,24 +73,6 @@ impl SqliteTxn {
     }
 }
 
-impl DbTxn {
-    pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
-        match self {
-            DbTxn::Sqlite(t) => t.get_bdk_changeset(),
-            #[cfg(any(test, target_arch = "wasm32"))]
-            DbTxn::Memory(m) => m.backend.db.get_bdk_changeset(),
-        }
-    }
-
-    pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
-        match self {
-            DbTxn::Sqlite(t) => t.update_bdk_changeset(changeset),
-            #[cfg(any(test, target_arch = "wasm32"))]
-            DbTxn::Memory(m) => m.backend.db.update_bdk_changeset(changeset),
-        }
-    }
-}
-
 async fn load_changeset(connection: &DatabaseTransaction) -> Result<ChangeSet, Error> {
     let mut changeset = ChangeSet::default();
 
