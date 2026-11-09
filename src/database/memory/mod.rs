@@ -69,7 +69,40 @@ impl MemoryTxn {
         self.on_commit.borrow_mut().push(Box::new(f));
     }
 
-    // unused until `DbTxn::with_savepoint` wires savepoints over the memory backend
+    /// Snapshot both halves of the backend for a savepoint of this transaction.
+    pub(crate) fn savepoint_state(&self) -> (InMemoryDb, RgbSavepoint) {
+        let db = self.backend.db.snapshot();
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned")
+            .savepoint();
+        (db, rgb)
+    }
+
+    /// Restore both halves of the backend to a state taken with [`Self::savepoint_state`].
+    pub(crate) fn restore_savepoint(&self, db: InMemoryDb, rgb: RgbSavepoint) {
+        self.backend.db.restore(db);
+        self.backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned")
+            .restore_savepoint(rgb);
+    }
+
+    /// Number of `on_commit` callbacks registered so far, a savepoint boundary.
+    pub(crate) fn callbacks_len(&self) -> usize {
+        self.on_commit.borrow().len()
+    }
+
+    /// Drop the callbacks registered after the boundary taken with [`Self::callbacks_len`].
+    pub(crate) fn truncate_callbacks(&self, len: usize) {
+        self.on_commit.borrow_mut().truncate(len);
+    }
+
+    // kept for callers that hold a `MemoryTxn` directly; `DbTxn::with_savepoint` uses the
+    // snapshot helpers above so it can pass its own handle to the closure
     #[allow(dead_code)]
     pub(crate) fn with_savepoint<T>(
         &self,
@@ -358,5 +391,115 @@ mod test {
             backend.rgb.lock().unwrap().witness_ord(txid_kept).unwrap(),
             Some(WitnessOrd::Tentative)
         );
+    }
+
+    /// Savepoints over the memory backend: a successful one keeps its writes and its
+    /// callbacks, a failing one restores the tables and drops its callbacks, all inside the
+    /// same transaction.
+    #[cfg(feature = "_online")]
+    mod savepoint {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use sea_orm::ActiveValue;
+
+        use super::*;
+        use crate::database::DbTxn;
+        use crate::{DbAssetActMod, Error, RgbLibDatabase};
+
+        fn asset(id: &str) -> DbAssetActMod {
+            DbAssetActMod {
+                id: ActiveValue::Set(id.to_string()),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                added_at: ActiveValue::Set(1),
+                name: ActiveValue::Set("name".to_string()),
+                precision: ActiveValue::Set(8),
+                initial_supply: ActiveValue::Set("1000".to_string()),
+                timestamp: ActiveValue::Set(1),
+                ..Default::default()
+            }
+        }
+
+        fn asset_ids(txn: &DbTxn) -> Vec<String> {
+            txn.iter_assets()
+                .unwrap()
+                .into_iter()
+                .map(|a| a.id)
+                .collect()
+        }
+
+        fn setup() -> RgbLibDatabase {
+            let db = RgbLibDatabase::new_memory();
+            setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+            db
+        }
+
+        #[test]
+        fn savepoint_keeps_changes_on_success() {
+            let db = setup();
+            let txn = db.begin_transaction().unwrap();
+            txn.with_savepoint(|t| {
+                t.set_asset(asset("committed"))?;
+                Ok(())
+            })
+            .unwrap();
+            txn.commit().unwrap();
+
+            let txn = db.begin_transaction().unwrap();
+            assert_eq!(asset_ids(&txn), vec!["committed".to_string()]);
+            txn.commit().unwrap();
+        }
+
+        #[test]
+        fn failed_savepoint_restores_the_previous_state() {
+            let db = setup();
+            let txn = db.begin_transaction().unwrap();
+            txn.set_asset(asset("kept")).unwrap();
+
+            let res: Result<(), Error> = txn.with_savepoint(|t| {
+                t.set_asset(asset("dropped"))?;
+                Err(Error::Internal {
+                    details: "savepoint failure".to_string(),
+                })
+            });
+            assert!(res.is_err());
+            assert_eq!(asset_ids(&txn), vec!["kept".to_string()]);
+
+            txn.commit().unwrap();
+            let txn = db.begin_transaction().unwrap();
+            assert_eq!(asset_ids(&txn), vec!["kept".to_string()]);
+            txn.commit().unwrap();
+        }
+
+        #[test]
+        fn failed_savepoint_drops_its_callbacks() {
+            let db = setup();
+            let ran = Arc::new(AtomicUsize::new(0));
+            let txn = db.begin_transaction().unwrap();
+
+            let failing = ran.clone();
+            let res: Result<(), Error> = txn.with_savepoint(|t| {
+                t.on_commit(move || {
+                    failing.fetch_add(1, Ordering::SeqCst);
+                });
+                Err(Error::Internal {
+                    details: "savepoint failure".to_string(),
+                })
+            });
+            assert!(res.is_err());
+
+            let succeeding = ran.clone();
+            txn.with_savepoint(|t| {
+                t.on_commit(move || {
+                    succeeding.fetch_add(1, Ordering::SeqCst);
+                });
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+            txn.commit().unwrap();
+            assert_eq!(ran.load(Ordering::SeqCst), 1);
+        }
     }
 }

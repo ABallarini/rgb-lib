@@ -1331,11 +1331,20 @@ impl DbTxn {
                 Ok(res)
             }
             #[cfg(any(test, target_arch = "wasm32"))]
-            // shortcut: savepoint over the memory backend is not wired yet, wire it when the
-            // wallet wasm wiring runs with_savepoint over memory
-            DbTxn::Memory(_) => Err(Error::Internal {
-                details: "savepoint over the memory backend is not wired yet".to_string(),
-            }),
+            DbTxn::Memory(t) => {
+                // no inner transaction: the memory backend rolls back by restoring both
+                // snapshots, and its RGB store refuses a nested `begin`
+                let (db, rgb) = t.savepoint_state();
+                let callbacks_len = t.callbacks_len();
+                match f(self) {
+                    Ok(value) => Ok(value),
+                    Err(err) => {
+                        t.restore_savepoint(db, rgb);
+                        t.truncate_callbacks(callbacks_len);
+                        Err(err)
+                    }
+                }
+            }
         }
     }
 
@@ -2025,7 +2034,8 @@ impl DbTxn {
             DbTxn::Memory(m) => m
                 .backend
                 .db
-                .get_transfer_transport_endpoints_data(transfer_idx),
+                .get_transfer_transport_endpoints_data(transfer_idx)
+                .map_err(Error::from),
         }
     }
 
