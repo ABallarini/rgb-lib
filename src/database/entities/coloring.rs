@@ -13,7 +13,16 @@ impl EntityName for Entity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, DeriveModel, DeriveActiveModel, Eq)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    DeriveModel,
+    DeriveActiveModel,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Model {
     pub idx: i32,
     pub txo_idx: i32,

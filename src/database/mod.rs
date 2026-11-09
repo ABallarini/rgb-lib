@@ -1248,6 +1248,17 @@ impl RgbLibDatabase {
         ))
     }
 
+    /// The in-memory backend, when this database runs in memory mode.
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn memory_backend(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::database::memory::MemoryBackend>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Memory(backend) => Some(backend),
+        }
+    }
+
     /// Open one transaction over the whole wallet data (tables + RGB stock).
     pub(crate) fn begin_transaction(&self) -> Result<DbTxn, Error> {
         Ok(match self {

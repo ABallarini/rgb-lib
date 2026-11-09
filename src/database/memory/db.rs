@@ -97,7 +97,7 @@ impl Default for Assignment {
 
 /// In-memory store: one Vec per entity, next_id per table for insert idx.
 /// RefCell for interior mutability so methods can take &self (Arc<Backend>).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 /// In-memory database replacing SeaORM/SQLite for WASM targets.
 ///
 /// **Design constraint:** All fields use `RefCell` for interior mutability. Methods must NOT
@@ -1667,6 +1667,11 @@ impl InMemoryDb {
 
     pub(crate) fn close_tx(&self) {
         *self.tx_open.borrow_mut() = false;
+    }
+
+    /// Whether a transaction is currently open on this store.
+    pub(crate) fn has_open_tx(&self) -> bool {
+        *self.tx_open.borrow()
     }
 
     pub(crate) fn begin_transaction(&self) -> Result<InMemoryTxn<'_>, Error> {
