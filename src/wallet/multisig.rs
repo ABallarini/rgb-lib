@@ -1114,6 +1114,30 @@ impl MultisigWallet {
         })
     }
 
+    /// Serialize the wallet state when the wallet runs over the in-memory backend.
+    ///
+    /// Returns `Some` only for wallets constructed over the in-memory backend and `None` for
+    /// SQLite wallets, which persist themselves. Writing the returned bytes somewhere durable
+    /// (for example IndexedDB) is up to the host.
+    pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        self.internals.database.snapshot()
+    }
+
+    /// Rebuild a wallet from the bytes returned by [`MultisigWallet::snapshot`], over the
+    /// in-memory backend.
+    ///
+    /// The wallet directory must already exist, as it holds the files the first construction
+    /// wrote; this constructor then follows the same setup path as [`MultisigWallet::new`].
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn from_snapshot(
+        snapshot: &[u8],
+        wallet_data: WalletData,
+        keys: MultisigKeys,
+    ) -> Result<Self, Error> {
+        let database = RgbLibDatabase::new_memory_from_snapshot(snapshot)?;
+        Self::new_with_database(wallet_data, keys, Some(database))
+    }
+
     /// Return the bitcoin keys of the wallet.
     pub fn get_keys(&self) -> MultisigKeys {
         self.keys.clone()
