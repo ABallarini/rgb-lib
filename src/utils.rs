@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
 );
@@ -38,10 +39,12 @@ pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 const PROXY_PROTOCOL_VERSION: &str = "1.0";
 
 // sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
 
 /// Block on a future, spawning a new thread if already inside a Tokio runtime.
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,
@@ -75,12 +78,16 @@ pub(crate) fn sync_dir<P: AsRef<Path>>(_dir: P) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(
+    not(target_os = "windows"),
+    feature = "sqlite",
+    not(target_arch = "wasm32")
+))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().display().to_string()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     const VERBATIM_PREFIX: &str = r#"\\?\"#;
     let p = p.as_ref().display().to_string();
@@ -714,6 +721,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, Error> {
     Ok(sha256::Hash::from_engine(engine).to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn log_timestamp(io: &mut dyn io::Write) -> io::Result<()> {
     let now: time::OffsetDateTime = now();
     write!(
@@ -724,10 +732,19 @@ fn log_timestamp(io: &mut dyn io::Write) -> io::Result<()> {
     )
 }
 
+/// Keeps the logger's drain alive. On wasm there is no file drain to flush, so the no-op guard
+/// keeps the same shape without spawning the async logger's thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type LoggerGuard = slog_async::AsyncGuard;
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Default)]
+pub(crate) struct LoggerGuard;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_logger<P: AsRef<Path>>(
     log_path: P,
     log_name: Option<&str>,
-) -> Result<(Logger, AsyncGuard), Error> {
+) -> Result<(Logger, LoggerGuard), Error> {
     let log_file = log_name.unwrap_or(LOG_FILE);
     let log_filepath = log_path.as_ref().join(log_file);
     let file = fs::OpenOptions::new()
@@ -743,6 +760,15 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     let logger = Logger::root(drain.fuse(), o!());
 
     Ok((logger, async_guard))
+}
+
+/// wasm: there is no filesystem to write a log file to, so callers get a discard logger.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn setup_logger<P: AsRef<Path>>(
+    _log_path: P,
+    _log_name: Option<&str>,
+) -> Result<(Logger, LoggerGuard), Error> {
+    Ok((Logger::root(slog::Discard, o!()), LoggerGuard))
 }
 
 pub(crate) fn now() -> OffsetDateTime {
@@ -1059,6 +1085,7 @@ mod tests {
         val: Option<u64>,
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_block_on_inside_tokio_runtime() {
         // calling block_on from within an active Tokio runtime takes the thread-spawn path

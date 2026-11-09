@@ -714,6 +714,9 @@ mod migrate;
 mod mint;
 #[cfg(feature = "electrum")]
 mod multisig;
+// snapshot/restore needs no hub, so it runs under the plain `wallet` feature too
+#[path = "multisig/snapshot.rs"]
+mod multisig_snapshot;
 mod new;
 #[cfg(feature = "electrum")]
 mod refresh;

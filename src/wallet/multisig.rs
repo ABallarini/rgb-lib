@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 const HUB_OPS_DIR: &str = "hub_ops";
 
 // BIP-341 NUMS H point (0250929b74...) with 32-zero chain code, formatted as a BIP-32 xpub.
@@ -1068,6 +1069,16 @@ impl MultisigWallet {
     /// Create a new RGB multisig wallet based on the provided [`WalletData`] and
     /// [`MultisigKeys`].
     pub fn new(wallet_data: WalletData, keys: MultisigKeys) -> Result<Self, Error> {
+        Self::new_with_database(wallet_data, keys, None)
+    }
+
+    // on wasm the in-memory database is single-threaded, so its `Arc` is intentional
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+    pub(crate) fn new_with_database(
+        wallet_data: WalletData,
+        keys: MultisigKeys,
+        database: Option<RgbLibDatabase>,
+    ) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
 
         // wallet keys
@@ -1078,10 +1089,12 @@ impl MultisigWallet {
             [..8]
             .to_string();
         let (wallet_dir, logger, _logger_guard) = setup_new_wallet(&wallet_data, &fingerprint)?;
+        // wasm: the host owns durable storage, so there is no hub ops directory to create
+        #[cfg(not(target_arch = "wasm32"))]
         fs::create_dir_all(wallet_dir.join(HUB_OPS_DIR))?;
 
         // setup rgb-lib DB
-        let database = setup_db(&wallet_dir)?;
+        let database = setup_db_with_backend(&wallet_dir, database)?;
 
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(
@@ -1119,6 +1132,62 @@ impl MultisigWallet {
             },
             keys,
         })
+    }
+
+    /// Serialize the wallet state when the wallet runs over the in-memory backend.
+    ///
+    /// Returns `Some` only for wallets constructed over the in-memory backend and `None` for
+    /// SQLite wallets, which persist themselves. Writing the returned bytes somewhere durable
+    /// (for example IndexedDB) is up to the host: on wasm32 use
+    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot) on an explicit
+    /// flush boundary, never concurrently for the same wallet id.
+    ///
+    /// Multisig wallets have no manifest: the snapshot is the raw database snapshot and
+    /// [`MultisigWallet::from_snapshot`] does not validate the settings.
+    pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        self.internals.database.snapshot()
+    }
+
+    /// Flush the current wallet state to the browser's durable storage.
+    ///
+    /// This is the only durable-write boundary for a wasm wallet: the in-memory backend keeps
+    /// every change in memory until this call, which serializes the wallet with
+    /// [`MultisigWallet::snapshot`] and delegates the write to
+    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot). The future
+    /// resolves once the IndexedDB transaction commits.
+    ///
+    /// Call it after a logical unit of work, and never concurrently for the same wallet id: two
+    /// overlapping writes for one id have no ordering guarantee. An error leaves the in-memory
+    /// state unchanged, so the wallet stays usable and a later flush can retry.
+    ///
+    /// Native builds expose no `flush`: their SQLite backend writes every change itself, so a
+    /// native flush would be a no-op.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn flush(&self, wallet_id: &str) -> Result<(), Error> {
+        let bytes = self.snapshot()?.ok_or_else(|| Error::Internal {
+            details: "a wasm memory wallet must produce a snapshot".to_string(),
+        })?;
+        crate::wallet::persistence::save_snapshot(wallet_id, &bytes).await
+    }
+
+    /// Rebuild a wallet from the bytes returned by [`MultisigWallet::snapshot`], over the
+    /// in-memory backend.
+    ///
+    /// The wallet directory must already exist, as it holds the files the first construction
+    /// wrote; this constructor then follows the same setup path as [`MultisigWallet::new`].
+    ///
+    /// Constructors are synchronous, so the host restores the snapshot asynchronously with
+    /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
+    /// this. The host owns the durable flush with
+    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot).
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub fn from_snapshot(
+        snapshot: &[u8],
+        wallet_data: WalletData,
+        keys: MultisigKeys,
+    ) -> Result<Self, Error> {
+        let database = RgbLibDatabase::new_memory_from_snapshot(snapshot)?;
+        Self::new_with_database(wallet_data, keys, Some(database))
     }
 
     /// Return the bitcoin keys of the wallet.

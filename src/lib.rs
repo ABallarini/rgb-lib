@@ -1,5 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 #![deny(missing_docs)]
+// The wasm32 test build leaves the native-only test modules out, so the helpers and the sea-orm
+// entities that only they use look dead to `-D warnings` (set by CI). The browser test is the only
+// consumer of this cfg, so the lints are allowed for it alone.
+#![cfg_attr(
+    all(test, target_arch = "wasm32"),
+    allow(dead_code, unused_imports, unused_mut)
+)]
 
 //! A library to manage wallets for RGB assets.
 //!
@@ -172,8 +179,15 @@ macro_rules! assert_matches {
     }};
 }
 
+// SQLite is native-only: the wasm32 build has no filesystem and runs over the in-memory backend.
+#[cfg(all(feature = "sqlite", target_arch = "wasm32"))]
+compile_error!("the `sqlite` feature is native-only and cannot be enabled on wasm32");
+
 #[cfg(feature = "_validation")]
 pub(crate) mod api;
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
 #[cfg(feature = "wallet")]
 pub(crate) mod database;
 // without the wallet only the database enums are needed, as some are shared with inspection
@@ -217,6 +231,8 @@ pub use rgbstd::{
     validation::Claim,
 };
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub use crate::utils::block_on;
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TypeOfTransition},
     error::Error,
@@ -225,7 +241,6 @@ pub use crate::{
 #[cfg(feature = "wallet")]
 pub use crate::{
     database::enums::{Encryption, TransferStatus, TransportType, WalletTransactionType},
-    utils::block_on,
 };
 
 #[cfg(feature = "_validation")]
@@ -295,14 +310,11 @@ use bdk_wallet::{
         Address as BdkAddress, Amount as BdkAmount, BlockHash, Network as BdkNetwork, NetworkKind,
         OutPoint as BdkOutPoint, ScriptBuf, TxOut,
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
-        consensus::{Decodable, Encodable},
         hashes::Hash as Sha256Hash,
         psbt::{ExtractTxError, Psbt},
         secp256k1::Secp256k1,
     },
-    chain::{
-        BlockId, CanonicalizationParams, ChainPosition, ConfirmationBlockTime, DescriptorId, Merge,
-    },
+    chain::{CanonicalizationParams, ChainPosition, Merge},
     descriptor::{IntoWalletDescriptor, Segwitv0},
     keys::{
         DerivableKey, DescriptorKey,
@@ -310,8 +322,13 @@ use bdk_wallet::{
         ExtendedKey, GeneratableKey,
         bip39::{Language, Mnemonic, WordCount},
     },
-    miniscript::{Descriptor, DescriptorPublicKey},
     signer::SignersContainer,
+};
+#[cfg(all(feature = "wallet", any(test, not(target_arch = "wasm32"))))]
+use bdk_wallet::{
+    bitcoin::consensus::{Decodable, Encodable},
+    chain::{BlockId, ConfirmationBlockTime, DescriptorId},
+    miniscript::{Descriptor, DescriptorPublicKey},
 };
 #[cfg(feature = "_online")]
 use bdk_wallet::{
@@ -348,10 +365,8 @@ use reqwest::{
     blocking::{Client as RestClient, Response},
     header::CONTENT_TYPE,
 };
-#[cfg(feature = "wallet")]
-use rgb_lib_migration::{
-    ArrayType, ColumnType, Migrator, MigratorTrait, Nullable, Value, ValueTypeErr,
-};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use rgb_lib_migration::{Migrator, MigratorTrait};
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
@@ -395,9 +410,9 @@ use rgbstd::{
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
     persistence::{
-        AllocKind, AllocSeal, AllocationFilter, AllocationRow, AllocationWrite,
-        ContractAssignments, ContractStateSnapshot, GlobalStateRow, GlobalStateWrite, Lib, LibId,
-        RgbStore, Stock, StockError, TxBegin, TxMode, Visibility, decode, encode,
+        AllocationFilter, AllocationRow, AllocationWrite, ContractAssignments,
+        ContractStateSnapshot, GlobalStateRow, GlobalStateWrite, Lib, LibId, RgbStore, Stock,
+        StockError, TxBegin, TxMode, Visibility,
     },
     rgbcore::commit_verify::{
         CommitId, Conceal, TryCommitVerify,
@@ -455,13 +470,20 @@ use scrypt::{Params, phc::Salt, scrypt};
 use sea_orm::IntoActiveValue;
 #[cfg(feature = "wallet")]
 use sea_orm::{
+    ActiveValue, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult, TryGetError,
+    TryGetable, TryIntoModel,
+};
+#[cfg(feature = "_online")]
+use sea_orm::{PaginatorTrait, RelationTrait, Select};
+#[cfg(feature = "wallet")]
+use sea_orm::{
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction,
     DbErr, DeriveActiveEnum, EntityTrait, EnumIter, Iterable, JoinType, JsonValue, QueryFilter,
     QueryOrder, QueryResult, QuerySelect, TransactionTrait, TryGetError, TryGetable, TryIntoModel,
     sea_query::{Alias, Condition, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
 };
-#[cfg(feature = "_online")]
-use sea_orm::{PaginatorTrait, RelationTrait, Select};
+#[cfg(feature = "wallet")]
+use sea_query::{ArrayType, ColumnType, Nullable, Value, ValueTypeErr};
 #[cfg(feature = "wallet")]
 use serde::Deserializer;
 #[cfg(feature = "wallet")]
@@ -525,6 +547,31 @@ use crate::no_wallet::validation::{
     validate_with_claims,
 };
 #[cfg(feature = "wallet")]
+use crate::database::entities::{
+    asset::{ActiveModel as DbAssetActMod, Model as DbAsset},
+    asset_transfer::{ActiveModel as DbAssetTransferActMod, Model as DbAssetTransfer},
+    backup_info::{ActiveModel as DbBackupInfoActMod, Model as DbBackupInfo},
+    batch_transfer::{ActiveModel as DbBatchTransferActMod, Model as DbBatchTransfer},
+    coloring::{ActiveModel as DbColoringActMod, Model as DbColoring},
+    media::{ActiveModel as DbMediaActMod, Model as DbMedia},
+    pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod,
+    reserved_txo::Model as DbReservedTxo,
+    token::{ActiveModel as DbTokenActMod, Model as DbToken},
+    token_media::{ActiveModel as DbTokenMediaActMod, Model as DbTokenMedia},
+    transfer::{ActiveModel as DbTransferActMod, Model as DbTransfer},
+    transfer_transport_endpoint::{
+        ActiveModel as DbTransferTransportEndpointActMod, Model as DbTransferTransportEndpoint,
+    },
+    transport_endpoint::{ActiveModel as DbTransportEndpointActMod, Model as DbTransportEndpoint},
+    txo::{ActiveModel as DbTxoActMod, Model as DbTxo},
+    wallet_transaction::Model as DbWalletTransaction,
+};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::database::entities::{
+    rgb_assignment::Model as DbAssignment, rgb_global_state::Model as DbGlobalState,
+    rgb_witness_ord::Model as DbWitnessOrd,
+};
+#[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
 #[cfg(feature = "electrum")]
 use crate::utils::INDEXER_BATCH_SIZE;
@@ -585,46 +632,6 @@ use crate::{
     database::rgb::migrate_rgb_fs_to_db,
     database::{
         DbData, DbTxn, RgbLibDatabase, TransportEndpointsByTransfer,
-        entities::{
-            asset::{ActiveModel as DbAssetActMod, Model as DbAsset},
-            asset_transfer::{ActiveModel as DbAssetTransferActMod, Model as DbAssetTransfer},
-            backup_info::{ActiveModel as DbBackupInfoActMod, Model as DbBackupInfo},
-            batch_transfer::{ActiveModel as DbBatchTransferActMod, Model as DbBatchTransfer},
-            coloring::{ActiveModel as DbColoringActMod, Model as DbColoring},
-            media::{ActiveModel as DbMediaActMod, Model as DbMedia},
-            pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod,
-            reserved_txo::Model as DbReservedTxo,
-            rgb_aluvm_lib::ActiveModel as DbAluvmLibActMod,
-            rgb_assignment::{ActiveModel as DbAssignmentActMod, Model as DbAssignment},
-            rgb_bundle::ActiveModel as DbBundleActMod,
-            rgb_bundle_contract::ActiveModel as DbBundleContractActMod,
-            rgb_bundle_witness::ActiveModel as DbBundleWitnessActMod,
-            rgb_genesis::{ActiveModel as DbGenesisActMod, Model as DbGenesis},
-            rgb_global_state::{ActiveModel as DbGlobalStateActMod, Model as DbGlobalState},
-            rgb_invalid_op::ActiveModel as DbInvalidOpActMod,
-            rgb_op_bundle::ActiveModel as DbOpBundleActMod,
-            rgb_op_input::{ActiveModel as DbOpInputActMod, Model as DbOpInput},
-            rgb_outpoint_opout::ActiveModel as DbOutpointOpoutActMod,
-            rgb_schema::{ActiveModel as DbSchemaActMod, Model as DbSchema},
-            rgb_schema_type_lib::ActiveModel as DbSchemaTypeLibActMod,
-            rgb_secret_seal::ActiveModel as DbSecretSealActMod,
-            rgb_secret_seal_opout::ActiveModel as DbSecretSealOpoutActMod,
-            rgb_type_lib::ActiveModel as DbTypeLibActMod,
-            rgb_witness::{ActiveModel as DbWitnessActMod, Model as DbWitness},
-            rgb_witness_ord::{ActiveModel as DbWitnessOrdActMod, Model as DbWitnessOrd},
-            token::{ActiveModel as DbTokenActMod, Model as DbToken},
-            token_media::{ActiveModel as DbTokenMediaActMod, Model as DbTokenMedia},
-            transfer::{ActiveModel as DbTransferActMod, Model as DbTransfer},
-            transfer_transport_endpoint::{
-                ActiveModel as DbTransferTransportEndpointActMod,
-                Model as DbTransferTransportEndpoint,
-            },
-            transport_endpoint::{
-                ActiveModel as DbTransportEndpointActMod, Model as DbTransportEndpoint,
-            },
-            txo::{ActiveModel as DbTxoActMod, Model as DbTxo},
-            wallet_transaction::Model as DbWalletTransaction,
-        },
         enums::{ColoringType, RecipientTypeFull, TransportEndpointKind},
         group_colorings_by_asset_transfer,
     },
@@ -632,7 +639,7 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, PURPOSE,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
         RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, atomic_tmp_path, atomic_write,
         atomic_write_with, beneficiary_from_script_buf, bfa_reject_list_url,
         from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
