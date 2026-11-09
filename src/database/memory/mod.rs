@@ -187,14 +187,15 @@ mod test {
     /// representative asset/media operations.
     #[test]
     fn memory_db_wallet_rows_match_sqlite() {
-        use super::db::{ActiveValue, DbAssetActMod, DbMediaActMod, InMemoryDb};
-        use crate::{DbAssetActMod as SqlAssetActMod, DbMediaActMod as SqlMediaActMod};
+        use super::db::InMemoryDb;
+        use crate::{DbAssetActMod, DbMediaActMod};
+        use sea_orm::ActiveValue;
 
         let dir = tempfile::tempdir().unwrap();
         let sql_db = setup_db(dir.path()).unwrap();
         let sql_txn = sql_db.begin_transaction().unwrap();
         let sql_asset_idx = sql_txn
-            .set_asset(SqlAssetActMod {
+            .set_asset(DbAssetActMod {
                 id: sea_orm::ActiveValue::Set("asset-1".to_string()),
                 schema: sea_orm::ActiveValue::Set(AssetSchema::Nia),
                 added_at: sea_orm::ActiveValue::Set(1),
@@ -206,7 +207,7 @@ mod test {
             })
             .unwrap();
         let sql_media_idx = sql_txn
-            .set_media(SqlMediaActMod {
+            .set_media(DbMediaActMod {
                 digest: sea_orm::ActiveValue::Set("digest-1".to_string()),
                 mime: sea_orm::ActiveValue::Set("image/png".to_string()),
                 ..Default::default()
@@ -265,9 +266,10 @@ mod test {
     #[test]
     fn memory_transaction_covers_db_and_rgb() {
         use super::MemoryBackend;
-        use super::db::{ActiveValue, DbAssetActMod};
+        use crate::DbAssetActMod;
         use bdk_wallet::bitcoin::{Txid, hashes::Hash};
         use rgbstd::vm::WitnessOrd;
+        use sea_orm::ActiveValue;
         use std::sync::Arc;
 
         fn asset(id: &str) -> DbAssetActMod {

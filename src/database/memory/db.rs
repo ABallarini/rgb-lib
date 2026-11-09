@@ -4,7 +4,21 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use sea_orm::ActiveValue;
+
+use crate::database::entities::{
+    pending_witness_script::Model as DbPendingWitnessScript,
+    reserved_txo::ActiveModel as DbReservedTxoActMod,
+    wallet_transaction::ActiveModel as DbWalletTransactionActMod,
+};
+use crate::{
+    DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
+    DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
+    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbReservedTxo, DbToken, DbTokenActMod,
+    DbTokenMedia, DbTokenMediaActMod, DbTransfer, DbTransferActMod, DbTransferTransportEndpoint,
+    DbTransferTransportEndpointActMod, DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
+    DbTxoActMod, DbWalletTransaction,
+};
 use std::str::FromStr;
 
 use bdk_chain::Merge;
@@ -21,488 +35,28 @@ use crate::database::{LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
 use crate::wallet::{Balance, Outpoint};
 
-/// Lightweight ActiveValue (mirrors sea_orm::ActiveValue without the dependency).
-#[derive(Clone, Debug)]
-pub enum ActiveValue<T> {
-    Set(T),
-    Unchanged(T),
-    NotSet,
-}
-
-impl<T> Default for ActiveValue<T> {
-    fn default() -> Self {
-        ActiveValue::NotSet
-    }
-}
-
-impl<T> ActiveValue<T> {
-    pub fn unwrap(self) -> T {
-        match self {
-            ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v,
-            ActiveValue::NotSet => panic!("called unwrap on ActiveValue::NotSet"),
-        }
-    }
-}
-
-/// Extract value from ActiveValue; use default for NotSet.
-fn av<T: Default>(v: ActiveValue<T>) -> T {
+fn av<T: Into<sea_orm::Value>>(v: ActiveValue<T>) -> T {
     match v {
-        ActiveValue::Set(x) | ActiveValue::Unchanged(x) => x,
-        ActiveValue::NotSet => T::default(),
+        ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v,
+        ActiveValue::NotSet => panic!("active value is not set"),
     }
 }
 
-/// Extract value from ActiveValue; use given default for NotSet.
-fn av_or<T>(v: ActiveValue<T>, default: T) -> T {
+fn av_opt<T>(v: ActiveValue<Option<T>>) -> Option<T>
+where
+    Option<T>: Into<sea_orm::Value>,
+{
     match v {
-        ActiveValue::Set(x) | ActiveValue::Unchanged(x) => x,
+        ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v,
+        ActiveValue::NotSet => None,
+    }
+}
+
+fn av_or<T: Into<sea_orm::Value>>(v: ActiveValue<T>, default: T) -> T {
+    match v {
+        ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v,
         ActiveValue::NotSet => default,
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbAsset {
-    pub idx: i32,
-    pub media_idx: Option<i32>,
-    pub id: String,
-    pub schema: AssetSchema,
-    pub added_at: i64,
-    pub details: Option<String>,
-    pub initial_supply: String,
-    pub name: String,
-    pub precision: u8,
-    pub ticker: Option<String>,
-    pub timestamp: i64,
-    pub max_supply: Option<String>,
-    pub known_circulating_supply: Option<String>,
-    pub reject_list_url: Option<String>,
-    pub linked_from_contract: Option<String>,
-    pub linked_to_contract: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbAssetActMod {
-    pub idx: ActiveValue<i32>,
-    pub media_idx: ActiveValue<Option<i32>>,
-    pub id: ActiveValue<String>,
-    pub schema: ActiveValue<AssetSchema>,
-    pub added_at: ActiveValue<i64>,
-    pub details: ActiveValue<Option<String>>,
-    pub initial_supply: ActiveValue<String>,
-    pub name: ActiveValue<String>,
-    pub precision: ActiveValue<u8>,
-    pub ticker: ActiveValue<Option<String>>,
-    pub timestamp: ActiveValue<i64>,
-    pub max_supply: ActiveValue<Option<String>>,
-    pub known_circulating_supply: ActiveValue<Option<String>>,
-    pub reject_list_url: ActiveValue<Option<String>>,
-    pub linked_from_contract: ActiveValue<Option<String>>,
-    pub linked_to_contract: ActiveValue<Option<String>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbAssetTransfer {
-    pub idx: i32,
-    pub user_driven: bool,
-    pub batch_transfer_idx: i32,
-    pub asset_id: Option<String>,
-    pub transition_type: Option<TypeOfTransition>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbAssetTransferActMod {
-    pub idx: ActiveValue<i32>,
-    pub user_driven: ActiveValue<bool>,
-    pub batch_transfer_idx: ActiveValue<i32>,
-    pub asset_id: ActiveValue<Option<String>>,
-    pub transition_type: ActiveValue<Option<TypeOfTransition>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbBackupInfo {
-    pub idx: i32,
-    pub last_backup_timestamp: String,
-    pub last_operation_timestamp: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbBackupInfoActMod {
-    pub idx: ActiveValue<i32>,
-    pub last_backup_timestamp: ActiveValue<String>,
-    pub last_operation_timestamp: ActiveValue<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbBatchTransfer {
-    pub idx: i32,
-    pub txid: Option<String>,
-    pub status: TransferStatus,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub expiration: Option<i64>,
-    pub min_confirmations: u8,
-    pub incoming: bool,
-    pub operation_secret_key: Option<Vec<u8>>,
-    pub broadcast_deadline: Option<i64>,
-    pub retention_deadline: Option<i64>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbBatchTransferActMod {
-    pub idx: ActiveValue<i32>,
-    pub txid: ActiveValue<Option<String>>,
-    pub status: ActiveValue<TransferStatus>,
-    pub created_at: ActiveValue<i64>,
-    pub updated_at: ActiveValue<i64>,
-    pub expiration: ActiveValue<Option<i64>>,
-    pub min_confirmations: ActiveValue<u8>,
-    pub incoming: ActiveValue<bool>,
-    pub operation_secret_key: ActiveValue<Option<Vec<u8>>>,
-    pub broadcast_deadline: ActiveValue<Option<i64>>,
-    pub retention_deadline: ActiveValue<Option<i64>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbColoring {
-    pub idx: i32,
-    pub txo_idx: i32,
-    pub asset_transfer_idx: i32,
-    pub r#type: ColoringType,
-    pub assignment: Assignment,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbColoringActMod {
-    pub idx: ActiveValue<i32>,
-    pub txo_idx: ActiveValue<i32>,
-    pub asset_transfer_idx: ActiveValue<i32>,
-    pub r#type: ActiveValue<ColoringType>,
-    pub assignment: ActiveValue<Assignment>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbMedia {
-    pub idx: i32,
-    pub digest: String,
-    pub mime: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbMediaActMod {
-    pub idx: ActiveValue<i32>,
-    pub digest: ActiveValue<String>,
-    pub mime: ActiveValue<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbPendingWitnessScript {
-    pub idx: i32,
-    pub script: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbPendingWitnessScriptActMod {
-    pub idx: ActiveValue<i32>,
-    pub script: ActiveValue<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbReservedTxo {
-    pub idx: i32,
-    pub txid: String,
-    pub vout: u32,
-    pub reserved_for_vanilla: Option<i32>,
-    pub reserved_for_colored: Option<i32>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbReservedTxoActMod {
-    pub idx: ActiveValue<i32>,
-    pub txid: ActiveValue<String>,
-    pub vout: ActiveValue<u32>,
-    pub reserved_for_vanilla: ActiveValue<Option<i32>>,
-    pub reserved_for_colored: ActiveValue<Option<i32>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbToken {
-    pub idx: i32,
-    pub asset_idx: i32,
-    pub index: u32,
-    pub ticker: Option<String>,
-    pub name: Option<String>,
-    pub details: Option<String>,
-    pub embedded_media: bool,
-    pub reserves: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbTokenActMod {
-    pub idx: ActiveValue<i32>,
-    pub asset_idx: ActiveValue<i32>,
-    pub index: ActiveValue<u32>,
-    pub ticker: ActiveValue<Option<String>>,
-    pub name: ActiveValue<Option<String>>,
-    pub details: ActiveValue<Option<String>>,
-    pub embedded_media: ActiveValue<bool>,
-    pub reserves: ActiveValue<bool>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbTokenMedia {
-    pub idx: i32,
-    pub token_idx: i32,
-    pub media_idx: i32,
-    pub attachment_id: Option<u8>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbTokenMediaActMod {
-    pub idx: ActiveValue<i32>,
-    pub token_idx: ActiveValue<i32>,
-    pub media_idx: ActiveValue<i32>,
-    pub attachment_id: ActiveValue<Option<u8>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbTransfer {
-    pub idx: i32,
-    pub asset_transfer_idx: i32,
-    pub requested_assignment: Option<Assignment>,
-    pub incoming: bool,
-    pub recipient_type: Option<RecipientTypeFull>,
-    pub recipient_id: Option<String>,
-    pub ack: Option<bool>,
-    pub invoice_string: Option<String>,
-    pub recipient_pubkey: Option<Vec<u8>>,
-    pub consignment_hash: Option<String>,
-    pub recipient_encryption: Encryption,
-    pub ack_signature: Option<Vec<u8>>,
-    pub proxy_transfer_id: Option<String>,
-    pub invoice_expiration: Option<i64>,
-    pub burn_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbTransferActMod {
-    pub idx: ActiveValue<i32>,
-    pub asset_transfer_idx: ActiveValue<i32>,
-    pub requested_assignment: ActiveValue<Option<Assignment>>,
-    pub incoming: ActiveValue<bool>,
-    pub recipient_type: ActiveValue<Option<RecipientTypeFull>>,
-    pub recipient_id: ActiveValue<Option<String>>,
-    pub ack: ActiveValue<Option<bool>>,
-    pub invoice_string: ActiveValue<Option<String>>,
-    pub recipient_pubkey: ActiveValue<Option<Vec<u8>>>,
-    pub consignment_hash: ActiveValue<Option<String>>,
-    pub recipient_encryption: ActiveValue<Encryption>,
-    pub ack_signature: ActiveValue<Option<Vec<u8>>>,
-    pub proxy_transfer_id: ActiveValue<Option<String>>,
-    pub invoice_expiration: ActiveValue<Option<i64>>,
-    pub burn_reason: ActiveValue<Option<String>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbTransferTransportEndpoint {
-    pub idx: i32,
-    pub transfer_idx: i32,
-    pub transport_endpoint_idx: i32,
-    pub used: bool,
-    pub kind: TransportEndpointKind,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbTransferTransportEndpointActMod {
-    pub idx: ActiveValue<i32>,
-    pub transfer_idx: ActiveValue<i32>,
-    pub transport_endpoint_idx: ActiveValue<i32>,
-    pub used: ActiveValue<bool>,
-    pub kind: ActiveValue<TransportEndpointKind>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbTransportEndpoint {
-    pub idx: i32,
-    pub transport_type: TransportType,
-    pub endpoint: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbTransportEndpointActMod {
-    pub idx: ActiveValue<i32>,
-    pub transport_type: ActiveValue<TransportType>,
-    pub endpoint: ActiveValue<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DbTxo {
-    pub idx: i32,
-    pub txid: String,
-    pub vout: u32,
-    pub btc_amount: String,
-    pub spent: bool,
-    pub exists: bool,
-    pub pending_witness: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbTxoActMod {
-    pub idx: ActiveValue<i32>,
-    pub txid: ActiveValue<String>,
-    pub vout: ActiveValue<u32>,
-    pub btc_amount: ActiveValue<String>,
-    pub spent: ActiveValue<bool>,
-    pub exists: ActiveValue<bool>,
-    pub pending_witness: ActiveValue<bool>,
-}
-
-impl From<DbTxo> for DbTxoActMod {
-    fn from(x: DbTxo) -> DbTxoActMod {
-        DbTxoActMod {
-            idx: ActiveValue::Unchanged(x.idx),
-            txid: ActiveValue::Unchanged(x.txid),
-            vout: ActiveValue::Unchanged(x.vout),
-            btc_amount: ActiveValue::Unchanged(x.btc_amount),
-            spent: ActiveValue::Unchanged(x.spent),
-            exists: ActiveValue::Unchanged(x.exists),
-            pending_witness: ActiveValue::Unchanged(x.pending_witness),
-        }
-    }
-}
-
-impl DbColoring {
-    pub(crate) fn incoming(&self) -> bool {
-        [
-            ColoringType::Receive,
-            ColoringType::Change,
-            ColoringType::Issue,
-        ]
-        .contains(&self.r#type)
-    }
-}
-
-impl DbTransfer {
-    pub(crate) fn related_transfers(
-        &self,
-        asset_transfers: &[DbAssetTransfer],
-        batch_transfers: &[DbBatchTransfer],
-    ) -> Result<(DbAssetTransfer, DbBatchTransfer), InternalError> {
-        let asset_transfer = asset_transfers
-            .iter()
-            .find(|t| t.idx == self.asset_transfer_idx)
-            .ok_or(InternalError::Unexpected)?;
-        let batch_transfer = batch_transfers
-            .iter()
-            .find(|t| t.idx == asset_transfer.batch_transfer_idx)
-            .ok_or(InternalError::Unexpected)?;
-        Ok((asset_transfer.clone(), batch_transfer.clone()))
-    }
-}
-
-impl DbTxo {
-    pub(crate) fn outpoint(&self) -> Outpoint {
-        Outpoint {
-            txid: self.txid.to_string(),
-            vout: self.vout,
-        }
-    }
-}
-
-impl DbBatchTransfer {
-    pub(crate) fn failed(&self) -> bool {
-        self.status.failed()
-    }
-
-    pub(crate) fn is_legacy(&self) -> bool {
-        self.operation_secret_key.is_none()
-    }
-
-    pub(crate) fn is_expired(&self, now: i64) -> bool {
-        self.expiration.is_some_and(|expiration| expiration < now)
-    }
-
-    pub(crate) fn is_expired_with_margin(&self, now: i64, margin: u32) -> bool {
-        self.expiration
-            .is_some_and(|expiration| expiration + i64::from(margin) < now)
-    }
-
-    #[cfg(feature = "_online")]
-    pub(crate) fn waiting(&self) -> bool {
-        self.status.waiting()
-    }
-
-    pub(crate) fn waiting_confirmations(&self) -> bool {
-        self.status.waiting_confirmations()
-    }
-
-    #[cfg(feature = "_online")]
-    pub(crate) fn is_fallible(&self) -> bool {
-        self.status.is_fallible()
-    }
-
-    pub(crate) fn get_asset_transfers(
-        &self,
-        asset_transfers: &[DbAssetTransfer],
-    ) -> Vec<DbAssetTransfer> {
-        asset_transfers
-            .iter()
-            .filter(|&t| t.batch_transfer_idx == self.idx)
-            .cloned()
-            .collect()
-    }
-}
-
-impl DbTransfer {
-    pub(crate) fn uses_out_of_band_exchange(&self) -> bool {
-        self.invoice_string
-            .as_deref()
-            .and_then(|s| rgbinvoice::RgbInvoice::from_str(s).ok())
-            .map(|invoice| invoice.transports == vec![])
-            .unwrap_or(false)
-    }
-}
-
-/// Group colorings by the asset transfer they belong to, each group ordered by index.
-pub(crate) fn group_colorings_by_asset_transfer(
-    colorings: Vec<DbColoring>,
-) -> HashMap<i32, Vec<DbColoring>> {
-    let mut colorings_by_asset_transfer: HashMap<i32, Vec<DbColoring>> = HashMap::new();
-    for coloring in colorings {
-        colorings_by_asset_transfer
-            .entry(coloring.asset_transfer_idx)
-            .or_default()
-            .push(coloring);
-    }
-    colorings_by_asset_transfer
-        .values_mut()
-        .for_each(|c| c.sort_by_key(|c| c.idx));
-    colorings_by_asset_transfer
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbWalletTransaction {
-    pub idx: i32,
-    pub txid: String,
-    pub r#type: WalletTransactionType,
-    pub status: TransferStatus,
-    pub expiration: Option<i64>,
-    pub inputs: Vec<Outpoint>,
-    pub sent: u64,
-    pub received: u64,
-    pub fee: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DbWalletTransactionActMod {
-    pub idx: ActiveValue<i32>,
-    pub txid: ActiveValue<String>,
-    pub r#type: ActiveValue<WalletTransactionType>,
-    pub status: ActiveValue<TransferStatus>,
-    pub expiration: ActiveValue<Option<i64>>,
-    pub inputs: ActiveValue<Vec<Outpoint>>,
-    pub sent: ActiveValue<u64>,
-    pub received: ActiveValue<u64>,
-    pub fee: ActiveValue<u64>,
 }
 
 impl Default for AssetSchema {
@@ -541,129 +95,9 @@ impl Default for Assignment {
     }
 }
 
-impl DbAssetActMod {
-    pub fn try_into_model(self) -> Result<DbAsset, ()> {
-        Ok(DbAsset {
-            idx: av(self.idx),
-            media_idx: av(self.media_idx),
-            id: av(self.id),
-            schema: av(self.schema),
-            added_at: av(self.added_at),
-            details: av(self.details),
-            initial_supply: av(self.initial_supply),
-            name: av(self.name),
-            precision: av(self.precision),
-            ticker: av(self.ticker),
-            timestamp: av(self.timestamp),
-            max_supply: av(self.max_supply),
-            known_circulating_supply: av(self.known_circulating_supply),
-            reject_list_url: av(self.reject_list_url),
-            linked_from_contract: av(self.linked_from_contract),
-            linked_to_contract: av(self.linked_to_contract),
-        })
-    }
-}
-
-impl From<DbBatchTransfer> for DbBatchTransferActMod {
-    fn from(m: DbBatchTransfer) -> Self {
-        Self {
-            idx: ActiveValue::Unchanged(m.idx),
-            txid: ActiveValue::Unchanged(m.txid),
-            status: ActiveValue::Unchanged(m.status),
-            created_at: ActiveValue::Unchanged(m.created_at),
-            updated_at: ActiveValue::Unchanged(m.updated_at),
-            expiration: ActiveValue::Unchanged(m.expiration),
-            min_confirmations: ActiveValue::Unchanged(m.min_confirmations),
-            incoming: ActiveValue::Unchanged(m.incoming),
-            operation_secret_key: ActiveValue::Unchanged(m.operation_secret_key),
-            broadcast_deadline: ActiveValue::Unchanged(m.broadcast_deadline),
-            retention_deadline: ActiveValue::Unchanged(m.retention_deadline),
-        }
-    }
-}
-
-impl From<DbBackupInfo> for DbBackupInfoActMod {
-    fn from(m: DbBackupInfo) -> Self {
-        Self {
-            idx: ActiveValue::Unchanged(m.idx),
-            last_backup_timestamp: ActiveValue::Unchanged(m.last_backup_timestamp),
-            last_operation_timestamp: ActiveValue::Unchanged(m.last_operation_timestamp),
-        }
-    }
-}
-
-impl From<DbAssetTransfer> for DbAssetTransferActMod {
-    fn from(m: DbAssetTransfer) -> Self {
-        Self {
-            idx: ActiveValue::Unchanged(m.idx),
-            user_driven: ActiveValue::Unchanged(m.user_driven),
-            batch_transfer_idx: ActiveValue::Unchanged(m.batch_transfer_idx),
-            asset_id: ActiveValue::Unchanged(m.asset_id),
-            transition_type: ActiveValue::Unchanged(m.transition_type),
-        }
-    }
-}
-
-impl From<DbTransfer> for DbTransferActMod {
-    fn from(m: DbTransfer) -> Self {
-        Self {
-            idx: ActiveValue::Unchanged(m.idx),
-            asset_transfer_idx: ActiveValue::Unchanged(m.asset_transfer_idx),
-            requested_assignment: ActiveValue::Unchanged(m.requested_assignment),
-            incoming: ActiveValue::Unchanged(m.incoming),
-            recipient_type: ActiveValue::Unchanged(m.recipient_type),
-            recipient_id: ActiveValue::Unchanged(m.recipient_id),
-            ack: ActiveValue::Unchanged(m.ack),
-            invoice_string: ActiveValue::Unchanged(m.invoice_string),
-            recipient_pubkey: ActiveValue::Unchanged(m.recipient_pubkey),
-            consignment_hash: ActiveValue::Unchanged(m.consignment_hash),
-            recipient_encryption: ActiveValue::Unchanged(m.recipient_encryption),
-            ack_signature: ActiveValue::Unchanged(m.ack_signature),
-            proxy_transfer_id: ActiveValue::Unchanged(m.proxy_transfer_id),
-            invoice_expiration: ActiveValue::Unchanged(m.invoice_expiration),
-            burn_reason: ActiveValue::Unchanged(m.burn_reason),
-        }
-    }
-}
-
-impl From<DbTransferTransportEndpoint> for DbTransferTransportEndpointActMod {
-    fn from(m: DbTransferTransportEndpoint) -> Self {
-        Self {
-            idx: ActiveValue::Unchanged(m.idx),
-            transfer_idx: ActiveValue::Unchanged(m.transfer_idx),
-            transport_endpoint_idx: ActiveValue::Unchanged(m.transport_endpoint_idx),
-            used: ActiveValue::Unchanged(m.used),
-            kind: ActiveValue::Unchanged(m.kind),
-        }
-    }
-}
-
-impl From<DbAsset> for DbAssetActMod {
-    fn from(m: DbAsset) -> Self {
-        Self {
-            idx: ActiveValue::Unchanged(m.idx),
-            media_idx: ActiveValue::Unchanged(m.media_idx),
-            id: ActiveValue::Unchanged(m.id),
-            schema: ActiveValue::Unchanged(m.schema),
-            added_at: ActiveValue::Unchanged(m.added_at),
-            details: ActiveValue::Unchanged(m.details),
-            initial_supply: ActiveValue::Unchanged(m.initial_supply),
-            name: ActiveValue::Unchanged(m.name),
-            precision: ActiveValue::Unchanged(m.precision),
-            ticker: ActiveValue::Unchanged(m.ticker),
-            timestamp: ActiveValue::Unchanged(m.timestamp),
-            max_supply: ActiveValue::Unchanged(m.max_supply),
-            known_circulating_supply: ActiveValue::Unchanged(m.known_circulating_supply),
-            reject_list_url: ActiveValue::Unchanged(m.reject_list_url),
-            linked_from_contract: ActiveValue::Unchanged(m.linked_from_contract),
-            linked_to_contract: ActiveValue::Unchanged(m.linked_to_contract),
-        }
-    }
-}
-
 /// In-memory store: one Vec per entity, next_id per table for insert idx.
 /// RefCell for interior mutability so methods can take &self (Arc<Backend>).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 /// In-memory database replacing SeaORM/SQLite for WASM targets.
 ///
 /// **Design constraint:** All fields use `RefCell` for interior mutability. Methods must NOT
@@ -751,21 +185,19 @@ impl InMemoryDb {
         *self.next_asset_idx.borrow_mut() += 1;
         let row = DbAsset {
             idx,
-            media_idx: av(a.media_idx),
+            media_idx: av_opt(a.media_idx),
             id: av(a.id),
             schema: av_or(a.schema, AssetSchema::Nia),
             added_at: av(a.added_at),
-            details: av(a.details),
+            details: av_opt(a.details),
             initial_supply: av(a.initial_supply),
             name: av(a.name),
             precision: av(a.precision),
-            ticker: av(a.ticker),
+            ticker: av_opt(a.ticker),
             timestamp: av(a.timestamp),
-            max_supply: av(a.max_supply),
-            known_circulating_supply: av(a.known_circulating_supply),
-            reject_list_url: av(a.reject_list_url),
-            linked_from_contract: av(a.linked_from_contract),
-            linked_to_contract: av(a.linked_to_contract),
+            max_supply: av_opt(a.max_supply),
+            known_circulating_supply: av_opt(a.known_circulating_supply),
+            reject_list_url: av_opt(a.reject_list_url),
         };
         self.assets.borrow_mut().push(row);
         Ok(idx)
@@ -779,10 +211,9 @@ impl InMemoryDb {
         *self.next_asset_transfer_idx.borrow_mut() += 1;
         let row = DbAssetTransfer {
             idx,
-            user_driven: av(a.user_driven),
+            user_driven: av_or(a.user_driven, false),
             batch_transfer_idx: av(a.batch_transfer_idx),
-            asset_id: av(a.asset_id),
-            transition_type: av(a.transition_type),
+            asset_id: av_opt(a.asset_id),
         };
         self.asset_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -795,6 +226,7 @@ impl InMemoryDb {
             idx,
             last_backup_timestamp: av(b.last_backup_timestamp),
             last_operation_timestamp: av(b.last_operation_timestamp),
+            last_processed_operation_idx: av(b.last_processed_operation_idx),
         };
         *self.backup_info.borrow_mut() = Some(row);
         Ok(idx)
@@ -809,16 +241,16 @@ impl InMemoryDb {
         let created = av(b.created_at);
         let row = DbBatchTransfer {
             idx,
-            txid: av(b.txid),
+            txid: av_opt(b.txid),
             status: av_or(b.status, TransferStatus::Settled),
             created_at: created,
             updated_at: av_or(b.updated_at, created),
-            expiration: av(b.expiration),
+            expiration: av_opt(b.expiration),
             min_confirmations: av(b.min_confirmations),
-            incoming: av(b.incoming),
-            operation_secret_key: av(b.operation_secret_key),
-            broadcast_deadline: av(b.broadcast_deadline),
-            retention_deadline: av(b.retention_deadline),
+            incoming: av_or(b.incoming, false),
+            operation_secret_key: av_opt(b.operation_secret_key),
+            broadcast_deadline: av_opt(b.broadcast_deadline),
+            retention_deadline: av_opt(b.retention_deadline),
         };
         self.batch_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -877,8 +309,8 @@ impl InMemoryDb {
                 idx,
                 txid: av(r.txid),
                 vout: av(r.vout),
-                reserved_for_vanilla: av(r.reserved_for_vanilla),
-                reserved_for_colored: av(r.reserved_for_colored),
+                reserved_for_vanilla: av_opt(r.reserved_for_vanilla),
+                reserved_for_colored: av_opt(r.reserved_for_colored),
             });
         }
         Ok(())
@@ -891,11 +323,11 @@ impl InMemoryDb {
             idx,
             asset_idx: av(t.asset_idx),
             index: av(t.index),
-            ticker: av(t.ticker),
+            ticker: av_opt(t.ticker),
             name: av(t.name),
-            details: av(t.details),
-            embedded_media: av(t.embedded_media),
-            reserves: av(t.reserves),
+            details: av_opt(t.details),
+            embedded_media: av_or(t.embedded_media, false),
+            reserves: av_or(t.reserves, false),
         };
         self.tokens.borrow_mut().push(row);
         Ok(idx)
@@ -908,7 +340,7 @@ impl InMemoryDb {
             idx,
             token_idx: av(t.token_idx),
             media_idx: av(t.media_idx),
-            attachment_id: av(t.attachment_id),
+            attachment_id: av_opt(t.attachment_id),
         };
         self.token_medias.borrow_mut().push(row);
         Ok(idx)
@@ -935,19 +367,17 @@ impl InMemoryDb {
         let row = DbTransfer {
             idx,
             asset_transfer_idx: av(t.asset_transfer_idx),
-            requested_assignment: av(t.requested_assignment),
-            incoming: av(t.incoming),
-            recipient_type: av(t.recipient_type),
-            recipient_id: av(t.recipient_id),
-            ack: av(t.ack),
-            invoice_string: av(t.invoice_string),
-            recipient_pubkey: av(t.recipient_pubkey),
-            consignment_hash: av(t.consignment_hash),
+            requested_assignment: av_opt(t.requested_assignment),
+            recipient_type: av_opt(t.recipient_type),
+            recipient_id: av_opt(t.recipient_id),
+            ack: av_opt(t.ack),
+            invoice_string: av_opt(t.invoice_string),
+            recipient_pubkey: av_opt(t.recipient_pubkey),
+            consignment_hash: av_opt(t.consignment_hash),
             recipient_encryption: av_or(t.recipient_encryption, Encryption::Required),
-            ack_signature: av(t.ack_signature),
-            proxy_transfer_id: av(t.proxy_transfer_id),
-            invoice_expiration: av(t.invoice_expiration),
-            burn_reason: av(t.burn_reason),
+            ack_signature: av_opt(t.ack_signature),
+            proxy_transfer_id: av_opt(t.proxy_transfer_id),
+            invoice_expiration: av_opt(t.invoice_expiration),
         };
         self.transfers.borrow_mut().push(row);
         Ok(idx)
@@ -997,9 +427,9 @@ impl InMemoryDb {
             txid,
             vout,
             btc_amount: av(t.btc_amount),
-            spent: av(t.spent),
-            exists: av(t.exists),
-            pending_witness: av(t.pending_witness),
+            spent: av_or(t.spent, false),
+            exists: av_or(t.exists, true),
+            pending_witness: av_or(t.pending_witness, false),
         };
         self.txos.borrow_mut().push(row);
         Ok(idx)
@@ -1015,12 +445,6 @@ impl InMemoryDb {
             idx,
             txid: av(w.txid),
             r#type: av_or(w.r#type, WalletTransactionType::CreateUtxos),
-            status: av_or(w.status, TransferStatus::Initiated),
-            expiration: av(w.expiration),
-            inputs: av(w.inputs),
-            sent: av(w.sent),
-            received: av(w.received),
-            fee: av(w.fee),
         };
         self.wallet_transactions.borrow_mut().push(row);
         Ok(idx)
@@ -1042,9 +466,6 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &t.requested_assignment {
             row.requested_assignment = v.clone();
-        }
-        if let ActiveValue::Set(v) = t.incoming {
-            row.incoming = v;
         }
         if let ActiveValue::Set(v) = &t.recipient_type {
             row.recipient_type = v.clone();
@@ -1075,9 +496,6 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = t.invoice_expiration {
             row.invoice_expiration = v;
-        }
-        if let ActiveValue::Set(v) = &t.burn_reason {
-            row.burn_reason = v.clone();
         }
         Ok(row.clone())
     }
@@ -1116,12 +534,6 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &a.reject_list_url {
             row.reject_list_url = v.clone();
-        }
-        if let ActiveValue::Set(v) = &a.linked_from_contract {
-            row.linked_from_contract = v.clone();
-        }
-        if let ActiveValue::Set(v) = &a.linked_to_contract {
-            row.linked_to_contract = v.clone();
         }
         Ok(row.clone())
     }
@@ -1706,25 +1118,6 @@ impl InMemoryDb {
             .cloned())
     }
 
-    pub(crate) fn update_wallet_transaction(
-        &self,
-        w: DbWalletTransactionActMod,
-    ) -> Result<(), InternalError> {
-        let idx = av(w.idx);
-        let mut wallet_transactions = self.wallet_transactions.borrow_mut();
-        let row = wallet_transactions
-            .iter_mut()
-            .find(|r| r.idx == idx)
-            .ok_or(InternalError::Unexpected)?;
-        if let ActiveValue::Set(v) = w.status {
-            row.status = v;
-        }
-        if let ActiveValue::Set(v) = w.expiration {
-            row.expiration = v;
-        }
-        Ok(())
-    }
-
     pub(crate) fn get_transfer_transport_endpoints_data(
         &self,
         transfer_idx: i32,
@@ -1898,29 +1291,22 @@ impl InMemoryDb {
         let witness_pending: u64 = transfers
             .iter()
             .filter(|t| {
-                t.incoming && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
+                t.related_transfers(&asset_transfers, &batch_transfers)
+                    .1
+                    .incoming
+                    && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
             })
-            .filter_map(
-                |t| match t.related_transfers(&asset_transfers, &batch_transfers) {
-                    Ok((at, bt)) => {
-                        if bt.status.waiting_confirmations() {
-                            if at.asset_id.as_deref() != Some(asset_id.as_str()) {
-                                return None;
-                            }
-                            Some(Ok(t
-                                .requested_assignment
-                                .as_ref()
-                                .map(|a| a.main_amount())
-                                .unwrap_or(0)))
-                        } else {
-                            None
-                        }
-                    }
-                    Err(e) => Some(Err(e)),
-                },
-            )
-            .collect::<Result<Vec<u64>, InternalError>>()?
-            .iter()
+            .filter_map(|t| {
+                let (at, bt) = t.related_transfers(&asset_transfers, &batch_transfers);
+                (bt.status.waiting_confirmations()
+                    && at.asset_id.as_deref() == Some(asset_id.as_str()))
+                .then(|| {
+                    t.requested_assignment
+                        .as_ref()
+                        .map(|a| a.main_amount())
+                        .unwrap_or(0)
+                })
+            })
             .sum();
         ass_pending_incoming += witness_pending;
         let ass_pending_outgoing: u64 = ass_allocations
@@ -2084,13 +1470,19 @@ impl InMemoryDb {
 
         let pending_blinded_utxos = transfers
             .iter()
-            .filter_map(|t| match (&t.recipient_type, t.incoming) {
-                (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => t
-                    .related_transfers(&asset_transfers, &batch_transfers)
-                    .ok()
-                    .filter(|(_, bt)| bt.status.waiting_counterparty())
-                    .map(|_| unblinded_utxo),
-                _ => None,
+            .filter_map(|t| {
+                match (
+                    &t.recipient_type,
+                    t.related_transfers(&asset_transfers, &batch_transfers)
+                        .1
+                        .incoming,
+                ) {
+                    (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => {
+                        let (_, bt) = t.related_transfers(&asset_transfers, &batch_transfers);
+                        bt.status.waiting_counterparty().then_some(unblinded_utxo)
+                    }
+                    _ => None,
+                }
             })
             .fold(HashMap::new(), |mut acc, utxo| {
                 *acc.entry(utxo).or_insert(0) += 1;
@@ -2418,10 +1810,9 @@ mod tests {
         }
     }
 
-    fn make_transfer_mod(asset_transfer_idx: i32, incoming: bool) -> DbTransferActMod {
+    fn make_transfer_mod(asset_transfer_idx: i32, _incoming: bool) -> DbTransferActMod {
         DbTransferActMod {
             asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-            incoming: ActiveValue::Set(incoming),
             ..Default::default()
         }
     }
@@ -2773,7 +2164,6 @@ mod tests {
 
         let transfers = db.iter_transfers().unwrap();
         assert_eq!(transfers.len(), 1);
-        assert!(transfers[0].incoming);
     }
 
     #[test]
@@ -2789,7 +2179,6 @@ mod tests {
 
         assert_eq!(updated.ack, Some(true));
         assert_eq!(updated.recipient_id, Some("rid1".to_string()));
-        assert!(updated.incoming); // unchanged
     }
 
     // ── AssetTransfer ──────────────────────────────────────────────
@@ -3064,60 +2453,30 @@ mod tests {
             .unwrap();
         assert_eq!(idx, 1);
 
-        let input = Outpoint {
-            txid: "in".to_string(),
-            vout: 1,
-        };
         let idx = db
             .set_wallet_transaction(DbWalletTransactionActMod {
                 txid: ActiveValue::Set("wtx2".to_string()),
                 r#type: ActiveValue::Set(WalletTransactionType::Drain),
-                expiration: ActiveValue::Set(Some(10)),
-                inputs: ActiveValue::Set(vec![input.clone()]),
-                sent: ActiveValue::Set(5),
                 ..Default::default()
             })
             .unwrap();
+        assert_eq!(idx, 2);
 
         let items = db.iter_wallet_transactions().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].r#type, WalletTransactionType::CreateUtxos);
         assert_eq!(items[1].r#type, WalletTransactionType::Drain);
-        assert_eq!(items[0].status, TransferStatus::Initiated);
-        assert_eq!(items[0].expiration, None);
-        assert!(items[0].inputs.is_empty());
-        assert_eq!((items[0].sent, items[0].received, items[0].fee), (0, 0, 0));
 
         assert!(
             db.get_wallet_transaction_by_txid("other")
                 .unwrap()
                 .is_none()
         );
-        db.update_wallet_transaction(DbWalletTransactionActMod {
-            idx: ActiveValue::Set(idx),
-            status: ActiveValue::Set(TransferStatus::Failed),
-            expiration: ActiveValue::Set(Some(20)),
-            ..Default::default()
-        })
-        .unwrap();
         let row = db.get_wallet_transaction_by_txid("wtx2").unwrap().unwrap();
         assert_eq!(row.idx, idx);
         assert_eq!(row.r#type, WalletTransactionType::Drain);
-        assert_eq!(row.status, TransferStatus::Failed);
-        assert_eq!(row.expiration, Some(20));
-        assert_eq!(row.inputs, vec![input]);
-        assert_eq!((row.sent, row.received, row.fee), (5, 0, 0));
-
-        let missing = DbWalletTransactionActMod {
-            idx: ActiveValue::Set(idx + 1),
-            ..Default::default()
-        };
-        assert!(db.update_wallet_transaction(missing).is_err());
     }
 
-    // ── BackupInfo ─────────────────────────────────────────────────
-
-    #[test]
     fn test_backup_info_set_get_update_del() {
         let db = make_db();
 
