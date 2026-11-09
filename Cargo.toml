@@ -129,6 +129,16 @@ getrandom_04 = { package = "getrandom", version = "=0.4.3", optional = true, def
     "wasm_js",
 ] }
 
+# Browser clock for the wasm32 wallet: `time` reads the clock with SystemTime::now(), which panics
+# on wasm32-unknown-unknown unless its browser shim is enabled. Same version and features as the
+# native entry above, plus `wasm-bindgen`; optional and enabled by `wallet`, so the native
+# dependency graph and the wallet-less wasm build stay unchanged.
+[target.'cfg(target_arch = "wasm32")'.dependencies.time]
+version = "0.3.55"
+optional = true
+default-features = false
+features = ["wasm-bindgen"]
+
 [dev-dependencies]
 biscuit-auth = { version = "6.0.0", default-features = false, features = [
     "datalog-macro",
