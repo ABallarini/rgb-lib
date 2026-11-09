@@ -288,7 +288,9 @@ impl Wallet {
     ///
     /// Returns `Some` only for wallets constructed over the in-memory backend and `None` for
     /// SQLite wallets, which persist themselves. Writing the returned bytes somewhere durable
-    /// (for example IndexedDB) is up to the host.
+    /// (for example IndexedDB) is up to the host: on wasm32 use
+    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot) on an explicit
+    /// flush boundary, never concurrently for the same wallet id.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
         self.internals.database.snapshot()
     }
@@ -298,8 +300,13 @@ impl Wallet {
     ///
     /// The wallet directory must already exist, as it holds the manifest the first construction
     /// wrote; this constructor then follows the same setup path as [`Wallet::new`].
+    ///
+    /// Constructors are synchronous, so the host restores the snapshot asynchronously with
+    /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
+    /// this. The host owns the durable flush with
+    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot).
     #[cfg(any(test, target_arch = "wasm32"))]
-    pub(crate) fn from_snapshot(
+    pub fn from_snapshot(
         snapshot: &[u8],
         wallet_data: WalletData,
         keys: SinglesigKeys,

@@ -12,7 +12,7 @@ pub(crate) mod offline;
 #[cfg(feature = "_online")]
 pub(crate) mod online;
 #[cfg(target_arch = "wasm32")]
-pub(crate) mod persistence;
+pub mod persistence;
 pub mod rust_only;
 pub(crate) mod singlesig;
 

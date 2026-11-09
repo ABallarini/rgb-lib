@@ -1,13 +1,42 @@
-//! IndexedDB persistence for the wasm32 wallet snapshot.
+//! Browser durable persistence for the in-memory backend; native builds use SQLite and do not use
+//! this module.
 //!
 //! The wallet over the in-memory backend serializes its whole state with
 //! [`Wallet::snapshot`](crate::wallet::Wallet::snapshot); the browser has no filesystem to write
 //! those bytes to, so this module stores them in IndexedDB. One database (`rgb-lib`, version 1)
-//! holds a single object store (`snapshots`) mapping the wallet id to the snapshot bytes.
+//! holds a single object store (`snapshots`) mapping the wallet id to the snapshot bytes. The
+//! wallet id is the object store key: saving the same id replaces the previous snapshot.
 //!
 //! Only the wallet id and the snapshot are written: the snapshot excludes the mnemonic and the
 //! signing keys (see `Wallet::snapshot`), so the stored value carries no secret material.
 //! Errors surface as [`Error::Internal`] with the JS failure message and never with a value.
+//!
+//! # Host lifecycle
+//!
+//! Restoring is asynchronous, so the host loads the snapshot first and only then constructs the
+//! wallet. Persist only on explicit flush boundaries, never concurrently for the same wallet id,
+//! and delete the entry when the wallet is deleted.
+//!
+//! ```ignore
+//! # // wasm32-only example: it cannot compile or run in a native doctest.
+//! # async fn host_flow(wallet_data: WalletData, keys: SinglesigKeys) -> Result<(), Error> {
+//! let wallet_id = keys.master_fingerprint.clone();
+//! let restored = match load_snapshot(&wallet_id).await? {
+//!     Some(bytes) => Wallet::from_snapshot(&bytes, wallet_data.clone(), keys)?,
+//!     None => Wallet::new(wallet_data, keys)?,
+//! };
+//! // ... use the wallet ...
+//! if let Some(bytes) = restored.snapshot()? {
+//!     save_snapshot(&wallet_id, &bytes).await?;
+//! }
+//! // when the wallet is deleted
+//! delete_snapshot(&wallet_id).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The wallet id is the key, so the caller passes the same id to every call.
+//! `save_snapshot` waits for the IndexedDB transaction to commit before it returns.
 
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
@@ -139,7 +168,16 @@ fn transaction_future(transaction: &IdbTransaction) -> JsFuture {
 }
 
 /// Store the snapshot bytes under the wallet id, replacing any previous value.
-pub(crate) async fn save_snapshot(wallet_id: &str, bytes: &[u8]) -> Result<(), Error> {
+///
+/// Asynchronous: it resolves once the IndexedDB transaction commits, so the bytes are durable when
+/// the future completes. `wallet_id` is the object store key, so saving the same id overwrites the
+/// stored snapshot. The bytes are the output of [`Wallet::snapshot`](crate::wallet::Wallet::snapshot)
+/// and carry no secret material. Errors are returned as [`Error::Internal`] with the JS failure
+/// message.
+///
+/// Call this only on an explicit flush boundary, never concurrently for the same wallet id: two
+/// overlapping writes for one id have no ordering guarantee.
+pub async fn save_snapshot(wallet_id: &str, bytes: &[u8]) -> Result<(), Error> {
     let db = open().await?;
     let result = write(&db, wallet_id, bytes).await;
     db.close();
@@ -147,7 +185,13 @@ pub(crate) async fn save_snapshot(wallet_id: &str, bytes: &[u8]) -> Result<(), E
 }
 
 /// Return the snapshot stored under the wallet id, if any.
-pub(crate) async fn load_snapshot(wallet_id: &str) -> Result<Option<Vec<u8>>, Error> {
+///
+/// Asynchronous: the host awaits it before constructing the wallet, because wallet constructors
+/// are synchronous and cannot wait for IndexedDB. `wallet_id` is the object store key; `None`
+/// means no snapshot has been saved for it yet. The returned bytes can be passed to
+/// [`Wallet::from_snapshot`](crate::wallet::Wallet::from_snapshot). Errors are returned as
+/// [`Error::Internal`] with the JS failure message.
+pub async fn load_snapshot(wallet_id: &str) -> Result<Option<Vec<u8>>, Error> {
     let db = open().await?;
     let result = read(&db, wallet_id).await;
     db.close();
@@ -155,7 +199,11 @@ pub(crate) async fn load_snapshot(wallet_id: &str) -> Result<Option<Vec<u8>>, Er
 }
 
 /// Remove the snapshot stored under the wallet id; missing entries are not an error.
-pub(crate) async fn delete_snapshot(wallet_id: &str) -> Result<(), Error> {
+///
+/// Asynchronous: call it when the host deletes the wallet. `wallet_id` is the object store key,
+/// and deleting an id that has no snapshot succeeds. Errors are returned as [`Error::Internal`]
+/// with the JS failure message.
+pub async fn delete_snapshot(wallet_id: &str) -> Result<(), Error> {
     let db = open().await?;
     let result = remove(&db, wallet_id).await;
     db.close();

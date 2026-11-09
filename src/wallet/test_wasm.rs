@@ -5,20 +5,17 @@
 //! snapshot in IndexedDB, rebuilds the wallet from the loaded bytes and checks the state survived.
 //! No indexer or network access is involved.
 //!
-//! The test lives inside the crate because `Wallet::from_snapshot` and the IndexedDB helpers are
-//! crate-internal.
+//! The test lives inside the crate, so it compiles against the public API the way a host would use
+//! it: the persistence functions and the wallet restore entry point.
 
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 use super::*;
+use crate::wallet::persistence::{delete_snapshot, load_snapshot, save_snapshot};
 use crate::{
     database::entities::txo::ActiveModel as DbTxoActMod,
     keys::generate_keys,
-    wallet::{
-        core::WalletCore,
-        offline::RgbWalletOpsOffline,
-        persistence::{delete_snapshot, load_snapshot, save_snapshot},
-    },
+    wallet::{core::WalletCore, offline::RgbWalletOpsOffline},
 };
 use sea_orm::ActiveValue;
 
