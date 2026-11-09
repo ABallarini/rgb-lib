@@ -297,6 +297,28 @@ impl Wallet {
         self.internals.database.snapshot()
     }
 
+    /// Flush the current wallet state to the browser's durable storage.
+    ///
+    /// This is the only durable-write boundary for a wasm wallet: the in-memory backend keeps
+    /// every change in memory until this call, which serializes the wallet with [`Wallet::snapshot`]
+    /// and delegates the write to
+    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot). The future
+    /// resolves once the IndexedDB transaction commits.
+    ///
+    /// Call it after a logical unit of work, and never concurrently for the same wallet id: two
+    /// overlapping writes for one id have no ordering guarantee. An error leaves the in-memory
+    /// state unchanged, so the wallet stays usable and a later flush can retry.
+    ///
+    /// Native builds expose no `flush`: their SQLite backend writes every change itself, so a
+    /// native flush would be a no-op.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn flush(&self, wallet_id: &str) -> Result<(), Error> {
+        let bytes = self.snapshot()?.ok_or_else(|| Error::Internal {
+            details: "a wasm memory wallet must produce a snapshot".to_string(),
+        })?;
+        crate::wallet::persistence::save_snapshot(wallet_id, &bytes).await
+    }
+
     /// Rebuild a wallet from the bytes returned by [`Wallet::snapshot`], over the in-memory
     /// backend.
     ///

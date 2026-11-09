@@ -13,9 +13,17 @@
 //!
 //! # Host lifecycle
 //!
+//! The wallet owns every in-memory change until the host flushes it. On wasm32
+//! [`Wallet::flush`](crate::wallet::Wallet::flush) and
+//! [`MultisigWallet::flush`](crate::wallet::MultisigWallet::flush) serialize the wallet with
+//! `snapshot` and delegate the write to [`save_snapshot`]. Flush is the only durable-write
+//! boundary, and its future resolves once the IndexedDB transaction commits. Native builds expose
+//! no flush method: their SQLite backend writes every change itself, so a native flush would be a
+//! no-op.
+//!
 //! Restoring is asynchronous, so the host loads the snapshot first and only then constructs the
-//! wallet. Persist only on explicit flush boundaries, never concurrently for the same wallet id,
-//! and delete the entry when the wallet is deleted.
+//! wallet with `from_snapshot`; constructors are synchronous and cannot await IndexedDB. Delete the
+//! entry when the host deletes the wallet.
 //!
 //! ```ignore
 //! # // wasm32-only example: it cannot compile or run in a native doctest.
@@ -26,14 +34,19 @@
 //!     None => Wallet::new(wallet_data, keys)?,
 //! };
 //! // ... use the wallet ...
-//! if let Some(bytes) = restored.snapshot()? {
-//!     save_snapshot(&wallet_id, &bytes).await?;
-//! }
+//! restored.flush(&wallet_id).await?;
 //! // when the wallet is deleted
 //! delete_snapshot(&wallet_id).await?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Crash and concurrency semantics
+//!
+//! The last flushed snapshot wins: changes made after the last flush are lost if the wallet goes
+//! away without another flush. A flush error leaves the in-memory wallet usable, so the host can
+//! retry. Two overlapping flushes for the same wallet id have no ordering guarantee: keep one
+//! writer per wallet id.
 //!
 //! The wallet id is the key, so the caller passes the same id to every call.
 //! `save_snapshot` waits for the IndexedDB transaction to commit before it returns.

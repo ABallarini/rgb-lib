@@ -1,17 +1,17 @@
 //! Browser wallet lifecycle over IndexedDB.
 //!
 //! Runs under `wasm-bindgen-test` in a real browser (see the `wasm_browser_lifecycle` job). It
-//! builds a wallet over the in-memory backend, issues an asset offline, snapshots it, stores the
-//! snapshot in IndexedDB, rebuilds the wallet from the loaded bytes and checks the state survived.
-//! No indexer or network access is involved.
+//! builds a wallet over the in-memory backend, issues an asset offline, flushes it through the
+//! wallet to IndexedDB twice, rebuilds the wallet from the loaded bytes and checks the newest state
+//! survived. No indexer or network access is involved.
 //!
 //! The test lives inside the crate, so it compiles against the public API the way a host would use
-//! it: the persistence functions and the wallet restore entry point.
+//! it: the wallet flush entry point and the persistence functions.
 
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 use super::*;
-use crate::wallet::persistence::{delete_snapshot, load_snapshot, save_snapshot};
+use crate::wallet::persistence::{delete_snapshot, load_snapshot};
 use crate::{
     database::entities::txo::ActiveModel as DbTxoActMod,
     keys::generate_keys,
@@ -45,7 +45,7 @@ async fn wallet_lifecycle_over_indexed_db() {
     let keys = generate_keys(wallet_data.bitcoin_network, WitnessVersion::Taproot);
     let wallet_keys = SinglesigKeys::from_keys(&keys, None);
 
-    let wallet = Wallet::new_with_database(
+    let mut wallet = Wallet::new_with_database(
         wallet_data.clone(),
         wallet_keys.clone(),
         Some(RgbLibDatabase::new_memory()),
@@ -93,10 +93,17 @@ async fn wallet_lifecycle_over_indexed_db() {
             .any(|window| window == mnemonic)
     );
 
-    // persist, then read back what IndexedDB stored
-    save_snapshot(WALLET_ID, &snapshot).await.unwrap();
+    // flush through the wallet, then read back what IndexedDB stored
+    wallet.flush(WALLET_ID).await.unwrap();
     let stored = load_snapshot(WALLET_ID).await.unwrap();
     assert_eq!(stored.as_deref(), Some(snapshot.as_slice()));
+
+    // a second flush must persist the newer state: derive two addresses, flush, then derive one
+    // more that the restored wallet has to hand out next
+    let _ = wallet.get_address().unwrap();
+    let _ = wallet.get_address().unwrap();
+    wallet.flush(WALLET_ID).await.unwrap();
+    let next_address = wallet.get_address().unwrap();
     drop(wallet);
 
     // rebuild the wallet from the stored bytes alone
@@ -104,7 +111,7 @@ async fn wallet_lifecycle_over_indexed_db() {
         .await
         .unwrap()
         .expect("the snapshot saved above");
-    let restored =
+    let mut restored =
         Wallet::from_snapshot(&loaded, wallet_data.clone(), wallet_keys).expect("wallet restore");
     assert_eq!(restored.get_keys().master_fingerprint, fingerprint);
     assert_eq!(
@@ -119,6 +126,11 @@ async fn wallet_lifecycle_over_indexed_db() {
             .iter()
             .any(|a| a.asset_id == asset.asset_id),
         "the asset issued before the snapshot is missing after the restore"
+    );
+    assert_eq!(
+        restored.get_address().unwrap(),
+        next_address,
+        "the second flush did not persist the newest state"
     );
 
     delete_snapshot(WALLET_ID).await.unwrap();
