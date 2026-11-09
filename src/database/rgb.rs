@@ -11,10 +11,15 @@
 //! The module also holds the one-time migration of the legacy filesystem RGB store,
 //! into the database, and the legacy consignment files, on disk.
 
+// The SQLite `RgbStore` implementation and its row helpers are native-only; the wasm build keeps
+// only the backend dispatcher over `DbTxn`, so the rest looks dead there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 #[cfg(any(test, target_arch = "wasm32"))]
 use super::memory::MemoryTxn;
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::database::entities::{
     rgb_aluvm_lib, rgb_assignment, rgb_bundle, rgb_bundle_contract, rgb_bundle_witness,
     rgb_genesis, rgb_global_state, rgb_invalid_op, rgb_op_bundle, rgb_op_input, rgb_outpoint_opout,

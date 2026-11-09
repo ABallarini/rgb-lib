@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 const HUB_OPS_DIR: &str = "hub_ops";
 
 // BIP-341 NUMS H point (0250929b74...) with 32-zero chain code, formatted as a BIP-32 xpub.
@@ -1057,6 +1058,8 @@ impl MultisigWallet {
         Self::new_with_database(wallet_data, keys, None)
     }
 
+    // on wasm the in-memory database is single-threaded, so its `Arc` is intentional
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub(crate) fn new_with_database(
         wallet_data: WalletData,
         keys: MultisigKeys,

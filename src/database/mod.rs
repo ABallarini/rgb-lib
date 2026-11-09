@@ -5,6 +5,7 @@ pub(crate) mod rgb;
 
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::database::entities::{
     asset, asset_transfer, batch_transfer, coloring, media, prelude::*, transfer,
     transfer_transport_endpoint, transport_endpoint, txo, wallet_transaction,
@@ -217,6 +218,9 @@ impl DbTxo {
         }
     }
 
+    // only the native SQLite path reads these allocations; the wasm build uses the in-memory
+    // backend's own implementation
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn get_utxo_allocations(
         &self,
         colorings: &[DbColoring],
@@ -1271,6 +1275,8 @@ impl RgbLibDatabase {
         Self::Sqlite(SqliteDatabase::new(connection))
     }
 
+    // the in-memory backend is single-threaded by design (wasm and tests)
+    #[allow(clippy::arc_with_non_send_sync)]
     #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn new_memory() -> Self {
         Self::Memory(std::sync::Arc::new(
@@ -1279,6 +1285,8 @@ impl RgbLibDatabase {
     }
 
     /// Rebuild an in-memory database from the bytes of [`MemoryBackend::to_snapshot`].
+    // the in-memory backend is single-threaded by design (wasm and tests)
+    #[allow(clippy::arc_with_non_send_sync)]
     #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn new_memory_from_snapshot(snapshot: &[u8]) -> Result<Self, Error> {
         Ok(Self::Memory(std::sync::Arc::new(
@@ -1299,6 +1307,7 @@ impl RgbLibDatabase {
     }
 
     /// The in-memory backend, when this database runs in memory mode.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn memory_backend(
         &self,
@@ -1378,9 +1387,12 @@ impl DbTxn {
                 let savepoint = DbTxn::Sqlite(savepoint);
                 // on error the savepoint is dropped, which rolls it back
                 let res = f(&savepoint)?;
+                // the memory arm is compiled out on native non-test builds
+                #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+                let DbTxn::Sqlite(mut savepoint) = savepoint;
+                #[cfg(any(test, target_arch = "wasm32"))]
                 let mut savepoint = match savepoint {
                     DbTxn::Sqlite(savepoint) => savepoint,
-                    #[cfg(any(test, target_arch = "wasm32"))]
                     DbTxn::Memory(_) => unreachable!("took the same arm it matched"),
                 };
                 let txn = savepoint.txn.take().expect("txn already consumed");

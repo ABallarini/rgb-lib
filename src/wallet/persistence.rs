@@ -83,10 +83,10 @@ async fn open() -> Result<IdbDatabase, Error> {
     // the only upgrade path is 0 -> 1, where the store cannot exist yet
     let upgrade_request = request.clone();
     let on_upgrade = Closure::once(move || {
-        if let Ok(value) = upgrade_request.result() {
-            if let Ok(db) = value.dyn_into::<IdbDatabase>() {
-                let _ = db.create_object_store(STORE_NAME);
-            }
+        if let Ok(value) = upgrade_request.result()
+            && let Ok(db) = value.dyn_into::<IdbDatabase>()
+        {
+            let _ = db.create_object_store(STORE_NAME);
         }
     });
     request.set_onupgradeneeded(Some(on_upgrade.into_js_value().unchecked_ref()));

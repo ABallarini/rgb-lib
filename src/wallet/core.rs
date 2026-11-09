@@ -12,6 +12,7 @@ pub(crate) const BDK_PENDING_FILE: &str = "bdk_pending.json";
 
 pub(crate) const NUM_KNOWN_SCHEMAS: usize = 4;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const RGB_LIB_DB_NAME: &str = "rgb_lib_db";
 
 pub(crate) const ASSETS_DIR: &str = "assets";
@@ -318,7 +319,7 @@ pub(crate) fn setup_db<P: AsRef<Path>>(_wallet_dir: P) -> Result<RgbLibDatabase,
 /// created wallet wrote its descriptors) so a left-behind store is never read a second time.
 ///
 /// Returns whether anything was imported.
-#[cfg(feature = "bdk_file_store_migration")]
+#[cfg(all(feature = "bdk_file_store_migration", not(target_arch = "wasm32")))]
 fn import_legacy_bdk_store(
     txn: &DbTxn,
     wallet_dir: &Path,
@@ -356,7 +357,7 @@ fn import_legacy_bdk_store(
 }
 
 /// Without the `bdk_file_store_migration` feature there is nothing to import from.
-#[cfg(not(feature = "bdk_file_store_migration"))]
+#[cfg(all(not(feature = "bdk_file_store_migration"), not(target_arch = "wasm32")))]
 fn import_legacy_bdk_store(
     _txn: &DbTxn,
     _wallet_dir: &Path,

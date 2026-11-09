@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
 );
@@ -186,12 +187,12 @@ pub(crate) fn sync_dir<P: AsRef<Path>>(_dir: P) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().display().to_string()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(target_arch = "wasm32")))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     const VERBATIM_PREFIX: &str = r#"\\?\"#;
     let p = p.as_ref().display().to_string();
@@ -838,6 +839,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, Error> {
     Ok(sha256::Hash::from_engine(engine).to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn log_timestamp(io: &mut dyn io::Write) -> io::Result<()> {
     let now: time::OffsetDateTime = now();
     write!(

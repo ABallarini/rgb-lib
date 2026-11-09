@@ -24,6 +24,8 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Check wallet-less build for wasm32
         run: cargo check --lib --target wasm32-unknown-unknown --no-default-features
+      - name: Clippy the wasm wallet build
+        run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wallet -- -D warnings
 
   # Required browser proof: the wallet lifecycle test creates a wallet over the in-memory backend,
   # snapshots it, persists the snapshot in IndexedDB, restores the wallet from the stored bytes and

@@ -1,4 +1,8 @@
 //! In-memory wallet DB for wasm32: same API as RgbLibDatabase, backed by Vec/HashMap.
+
+// The in-memory backend mirrors the whole `RgbLibDatabase` API; the wallet-only wasm build uses a
+// subset, so the rest of the mirror looks dead there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #![allow(clippy::derivable_impls)]
 
 use std::cell::RefCell;
@@ -19,7 +23,6 @@ use crate::{
     DbTransferTransportEndpointActMod, DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
     DbTxoActMod, DbWalletTransaction,
 };
-use std::str::FromStr;
 
 use bdk_chain::Merge;
 use bdk_wallet::ChangeSet;
@@ -29,7 +32,7 @@ use crate::Error;
 use crate::database::DbBatchTransferData;
 use crate::database::enums::{
     AssetSchema, Assignment, ColoringType, Encryption, RecipientTypeFull, TransferStatus,
-    TransportEndpointKind, TransportType, TypeOfTransition, WalletTransactionType,
+    TransportEndpointKind, TransportType, WalletTransactionType,
 };
 use crate::database::{LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;

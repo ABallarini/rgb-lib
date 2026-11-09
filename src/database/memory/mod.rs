@@ -134,6 +134,7 @@ impl MemoryTxn {
     }
 
     /// Snapshot both halves of the backend for a savepoint of this transaction.
+    #[cfg(feature = "_online")]
     pub(crate) fn savepoint_state(&self) -> (InMemoryDb, RgbSavepoint) {
         let db = self.backend.db.snapshot();
         let rgb = self
@@ -146,6 +147,7 @@ impl MemoryTxn {
     }
 
     /// Restore both halves of the backend to a state taken with [`Self::savepoint_state`].
+    #[cfg(feature = "_online")]
     pub(crate) fn restore_savepoint(&self, db: InMemoryDb, rgb: RgbSavepoint) {
         self.backend.db.restore(db);
         self.backend
@@ -156,11 +158,13 @@ impl MemoryTxn {
     }
 
     /// Number of `on_commit` callbacks registered so far, a savepoint boundary.
+    #[cfg(feature = "_online")]
     pub(crate) fn callbacks_len(&self) -> usize {
         self.on_commit.borrow().len()
     }
 
     /// Drop the callbacks registered after the boundary taken with [`Self::callbacks_len`].
+    #[cfg(feature = "_online")]
     pub(crate) fn truncate_callbacks(&self, len: usize) {
         self.on_commit.borrow_mut().truncate(len);
     }
@@ -204,7 +208,7 @@ impl MemoryTxn {
         self.rgb_snapshot = None;
         self.backend.db.close_tx();
         {
-            let mut rgb = self
+            let rgb = self
                 .backend
                 .rgb
                 .lock()

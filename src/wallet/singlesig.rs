@@ -203,6 +203,8 @@ impl Wallet {
         Self::new_with_database(wallet_data, keys, None)
     }
 
+    // on wasm the in-memory database is single-threaded, so its `Arc` is intentional
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub(crate) fn new_with_database(
         wallet_data: WalletData,
         keys: SinglesigKeys,
