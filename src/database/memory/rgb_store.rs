@@ -26,6 +26,9 @@ use rgbstd::{
 use strict_encoding::{StrictDecode, StrictEncode};
 use strict_types::{TypeLib, TypeLibId};
 
+use super::MemoryTxn;
+use crate::{Error, RgbTxid};
+
 type AllocKey = (ContractId, OpId, AssignmentType, u16);
 type GlobalKey = (ContractId, GlobalStateType, OpId, u16);
 
@@ -132,6 +135,10 @@ pub(crate) struct MemRgbStore {
     /// `Some(Some(_))`: write transaction with the tables to restore on rollback.
     tx: RefCell<Option<Option<Tables>>>,
 }
+
+/// Opaque snapshot of the RGB tables, used by a savepoint of the shared transaction.
+#[derive(Clone, Debug)]
+pub(crate) struct RgbSavepoint(Tables);
 
 impl RgbStore for MemRgbStore {
     type Error = Infallible;
@@ -677,6 +684,575 @@ impl RgbStore for MemRgbStore {
     }
 }
 
+// Lifts the `Infallible` error of the shared [`MemRgbStore`] into the crate `Error`:
+// the error variant can never be produced, so only the value is carried over.
+trait LiftInfallible<T> {
+    fn lift(self) -> Result<T, Error>;
+}
+
+impl<T> LiftInfallible<T> for Result<T, Infallible> {
+    fn lift(self) -> Result<T, Error> {
+        Ok(match self {
+            Ok(value) => value,
+            Err(never) => match never {},
+        })
+    }
+}
+
+/// [`RgbStore`] view of the RGB half of a [`MemoryTxn`](super::MemoryTxn): every call locks the
+/// backend's RGB store, so concurrent hosts cannot interleave with the wallet transaction. The
+/// transaction itself is controlled by `MemoryTxn` (`begin`/`commit`/`rollback` are no-ops), so
+/// the wallet tables and the RGB stock stay one unit of work.
+impl RgbStore for &MemoryTxn {
+    type Error = Error;
+
+    // the RGB transaction was opened by `MemoryBackend::begin_transaction` in write mode
+    fn begin(&self, _mode: TxMode) -> Result<TxBegin, Error> {
+        Ok(TxBegin::AlreadyOpen)
+    }
+
+    // handled by `MemoryTxn::commit` alongside the wallet tables
+    fn commit(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    // handled by `MemoryTxn` rollback on drop
+    fn rollback(&self) {}
+
+    fn schema(&self, schema_id: SchemaId) -> Result<Option<Schema>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::schema(&rgb, schema_id).lift()
+    }
+
+    fn put_schema(&mut self, schema: &Schema) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_schema(&mut rgb, schema).lift()
+    }
+
+    fn schemata(&self) -> impl Iterator<Item = Result<Schema, Error>> + '_ {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        let items: Vec<_> = <MemRgbStore as RgbStore>::schemata(&rgb)
+            .map(|item| item.lift())
+            .collect();
+        items.into_iter()
+    }
+
+    fn type_libs(&self, schema_id: SchemaId) -> Result<BTreeMap<TypeLibId, TypeLib>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::type_libs(&rgb, schema_id).lift()
+    }
+
+    fn put_type_lib(&mut self, schema_id: SchemaId, type_lib: &TypeLib) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_type_lib(&mut rgb, schema_id, type_lib).lift()
+    }
+
+    fn aluvm_lib(&self, aluvm_lib_id: LibId) -> Result<Option<Lib>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::aluvm_lib(&rgb, aluvm_lib_id).lift()
+    }
+
+    fn put_aluvm_lib(&mut self, aluvm_lib: &Lib) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_aluvm_lib(&mut rgb, aluvm_lib).lift()
+    }
+
+    fn genesis(&self, contract_id: ContractId) -> Result<Option<Genesis>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::genesis(&rgb, contract_id).lift()
+    }
+
+    fn put_genesis(&mut self, genesis: &Genesis) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_genesis(&mut rgb, genesis).lift()
+    }
+
+    fn geneses(&self) -> impl Iterator<Item = Result<Genesis, Error>> + '_ {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        let items: Vec<_> = <MemRgbStore as RgbStore>::geneses(&rgb)
+            .map(|item| item.lift())
+            .collect();
+        items.into_iter()
+    }
+
+    fn contract_schema(&self, contract_id: ContractId) -> Result<Option<Schema>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::contract_schema(&rgb, contract_id).lift()
+    }
+
+    fn bundle(&self, bundle_id: BundleId) -> Result<Option<TransitionBundle>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::bundle(&rgb, bundle_id).lift()
+    }
+
+    fn put_bundle(&mut self, bundle: &TransitionBundle) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_bundle(&mut rgb, bundle).lift()
+    }
+
+    fn witness(&self, txid: RgbTxid) -> Result<Option<SealWitness>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witness(&rgb, txid).lift()
+    }
+
+    fn put_witness(&mut self, witness: &SealWitness) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_witness(&mut rgb, witness).lift()
+    }
+
+    fn witness_tx(&self, txid: RgbTxid) -> Result<Option<bdk_wallet::bitcoin::Transaction>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witness_tx(&rgb, txid).lift()
+    }
+
+    fn witness_spv_proof(&self, txid: RgbTxid) -> Result<Option<SpvProof>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witness_spv_proof(&rgb, txid).lift()
+    }
+
+    fn set_witness_spv_proof(
+        &mut self,
+        txid: RgbTxid,
+        spv_proof: Option<&SpvProof>,
+    ) -> Result<bool, Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::set_witness_spv_proof(&mut rgb, txid, spv_proof).lift()
+    }
+
+    fn seal_of_secret(&self, secret_seal: SecretSeal) -> Result<Option<GraphSeal>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::seal_of_secret(&rgb, secret_seal).lift()
+    }
+
+    fn put_secret_seal(
+        &mut self,
+        graph_seal: &GraphSeal,
+        secret_seal: SecretSeal,
+    ) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_secret_seal(&mut rgb, graph_seal, secret_seal).lift()
+    }
+
+    fn globals(
+        &self,
+        contract_id: ContractId,
+        type_id: GlobalStateType,
+        visibility: Visibility,
+    ) -> Result<Vec<GlobalStateRow>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::globals(&rgb, contract_id, type_id, visibility).lift()
+    }
+
+    fn put_global(&mut self, global_state: GlobalStateWrite<'_>) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_global(&mut rgb, global_state).lift()
+    }
+
+    fn allocations(
+        &self,
+        contract_id: ContractId,
+        filter: AllocationFilter<'_>,
+    ) -> Result<Vec<AllocationRow>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::allocations(&rgb, contract_id, filter).lift()
+    }
+
+    fn all_allocations_at_outpoints(
+        &self,
+        outpoints: &BTreeSet<OutPoint>,
+        visibility: Visibility,
+    ) -> Result<Vec<(ContractId, AllocationRow)>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::all_allocations_at_outpoints(&rgb, outpoints, visibility).lift()
+    }
+
+    fn put_allocation(&mut self, allocation: AllocationWrite<'_>) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_allocation(&mut rgb, allocation).lift()
+    }
+
+    fn witness_ord(&self, txid: RgbTxid) -> Result<Option<WitnessOrd>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witness_ord(&rgb, txid).lift()
+    }
+
+    fn witness_ords(
+        &self,
+        txids: &BTreeSet<RgbTxid>,
+    ) -> Result<BTreeMap<RgbTxid, WitnessOrd>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witness_ords(&rgb, txids).lift()
+    }
+
+    fn witness_ords_to_refresh(&self, min_height: NonZeroU32) -> Result<BTreeSet<RgbTxid>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witness_ords_to_refresh(&rgb, min_height).lift()
+    }
+
+    fn all_witness_ords(&self) -> Result<BTreeMap<RgbTxid, WitnessOrd>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::all_witness_ords(&rgb).lift()
+    }
+
+    fn put_witness_ord(&mut self, txid: RgbTxid, ord: WitnessOrd) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_witness_ord(&mut rgb, txid, ord).lift()
+    }
+
+    fn all_invalid_ops(&self) -> Result<BTreeSet<OpId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::all_invalid_ops(&rgb).lift()
+    }
+
+    fn any_op_invalid(&self, opids: &BTreeSet<OpId>) -> Result<bool, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::any_op_invalid(&rgb, opids).lift()
+    }
+
+    fn set_op_validity(&mut self, opid: OpId, valid: bool) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::set_op_validity(&mut rgb, opid, valid).lift()
+    }
+
+    fn contract_registered(&self, contract_id: ContractId) -> Result<bool, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::contract_registered(&rgb, contract_id).lift()
+    }
+
+    fn bundle_contract(&self, bundle_id: BundleId) -> Result<Option<ContractId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::bundle_contract(&rgb, bundle_id).lift()
+    }
+
+    fn put_bundle_contract(
+        &mut self,
+        bundle_id: BundleId,
+        contract_id: ContractId,
+    ) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_bundle_contract(&mut rgb, bundle_id, contract_id).lift()
+    }
+
+    fn bundle_witnesses(&self, bundle_id: BundleId) -> Result<BTreeSet<RgbTxid>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::bundle_witnesses(&rgb, bundle_id).lift()
+    }
+
+    fn witnesses_of_bundles(
+        &self,
+        bundle_ids: &BTreeSet<BundleId>,
+    ) -> Result<BTreeMap<BundleId, BTreeSet<RgbTxid>>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::witnesses_of_bundles(&rgb, bundle_ids).lift()
+    }
+
+    fn bundles_of_witness(&self, txid: RgbTxid) -> Result<BTreeSet<BundleId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::bundles_of_witness(&rgb, txid).lift()
+    }
+
+    fn put_bundle_witness(&mut self, bundle_id: BundleId, txid: RgbTxid) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_bundle_witness(&mut rgb, bundle_id, txid).lift()
+    }
+
+    fn bundle_of_op(&self, opid: OpId) -> Result<Option<BundleId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::bundle_of_op(&rgb, opid).lift()
+    }
+
+    fn ops_in_bundle(&self, bundle_id: BundleId) -> Result<BTreeSet<OpId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::ops_in_bundle(&rgb, bundle_id).lift()
+    }
+
+    fn put_op_bundle(&mut self, opid: OpId, bundle_id: BundleId) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_op_bundle(&mut rgb, opid, bundle_id).lift()
+    }
+
+    fn child_bundles_of_op(&self, opid: OpId) -> Result<BTreeSet<BundleId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::child_bundles_of_op(&rgb, opid).lift()
+    }
+
+    fn child_ops_of_op(&self, opid: OpId) -> Result<BTreeSet<(OpId, BundleId)>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::child_ops_of_op(&rgb, opid).lift()
+    }
+
+    fn input_opouts_for_op(&self, opid: OpId) -> Result<BTreeSet<Opout>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::input_opouts_for_op(&rgb, opid).lift()
+    }
+
+    fn put_op_input(
+        &mut self,
+        spent_opout: Opout,
+        child_opid: OpId,
+        child_bundle_id: BundleId,
+    ) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_op_input(&mut rgb, spent_opout, child_opid, child_bundle_id)
+            .lift()
+    }
+
+    fn opouts_at(
+        &self,
+        contract_id: ContractId,
+        outpoints: &BTreeSet<OutPoint>,
+    ) -> Result<BTreeMap<OutPoint, BTreeSet<Opout>>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::opouts_at(&rgb, contract_id, outpoints).lift()
+    }
+
+    fn contracts_assigning(
+        &self,
+        outpoints: &BTreeSet<OutPoint>,
+    ) -> Result<BTreeSet<ContractId>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::contracts_assigning(&rgb, outpoints).lift()
+    }
+
+    fn put_outpoint_opout(
+        &mut self,
+        contract_id: ContractId,
+        outpoint: OutPoint,
+        opout: Opout,
+    ) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_outpoint_opout(&mut rgb, contract_id, outpoint, opout).lift()
+    }
+
+    fn opouts_by_secrets(
+        &self,
+        contract_id: ContractId,
+        secret_seals: &BTreeSet<SecretSeal>,
+    ) -> Result<BTreeSet<Opout>, Error> {
+        let rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::opouts_by_secrets(&rgb, contract_id, secret_seals).lift()
+    }
+
+    fn put_secret_opout(
+        &mut self,
+        contract_id: ContractId,
+        secret_seal: SecretSeal,
+        opout: Opout,
+    ) -> Result<(), Error> {
+        let mut rgb = self
+            .backend
+            .rgb
+            .lock()
+            .expect("rgb store mutex is never poisoned");
+        <MemRgbStore as RgbStore>::put_secret_opout(&mut rgb, contract_id, secret_seal, opout)
+            .lift()
+    }
+}
+
 fn put<T: StrictEncode>(out: &mut Vec<u8>, val: &T) -> io::Result<()> {
     let blob = encode(val)?;
     out.extend((blob.len() as u32).to_le_bytes());
@@ -714,6 +1290,16 @@ impl Reader<'_> {
 use amplify::s;
 
 impl MemRgbStore {
+    /// Snapshot the tables for a savepoint of the shared transaction.
+    pub(crate) fn savepoint(&self) -> RgbSavepoint {
+        RgbSavepoint(self.tables.borrow().clone())
+    }
+
+    /// Restore the tables to a savepoint taken with [`Self::savepoint`].
+    pub(crate) fn restore_savepoint(&self, savepoint: RgbSavepoint) {
+        *self.tables.borrow_mut() = savepoint.0;
+    }
+
     /// Encodes all tables. Call it outside of a transaction.
     pub(crate) fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let t = self.tables.borrow();

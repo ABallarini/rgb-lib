@@ -50,9 +50,11 @@ pub use online::{RgbWalletOpsOnline, check_indexer_url};
 pub use singlesig::{SinglesigKeys, Wallet};
 
 pub(crate) use backup::WalletBackup;
+#[cfg(test)]
+pub(crate) use core::setup_db;
 pub(crate) use core::{
     ASSETS_DIR, MEDIA_DIR, NUM_KNOWN_SCHEMAS, WalletCore, WalletInternals, WalletManifest,
-    setup_bdk, setup_db, setup_new_wallet, setup_rgb,
+    setup_bdk, setup_db_with_backend, setup_new_wallet, setup_rgb,
 };
 #[cfg(feature = "_online")]
 pub use core::{SyncKeychain, SyncOptions, SyncStrategy};

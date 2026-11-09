@@ -1,5 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 #![deny(missing_docs)]
+// The wasm32 test build leaves the native-only test modules out, so the helpers and the sea-orm
+// entities that only they use look dead to `-D warnings` (set by CI). The browser test is the only
+// consumer of this cfg, so the lints are allowed for it alone.
+#![cfg_attr(
+    all(test, target_arch = "wasm32"),
+    allow(dead_code, unused_imports, unused_mut)
+)]
 
 //! A library to manage wallets for RGB assets.
 //!
@@ -121,8 +128,15 @@ compile_error!(
      `esplora` instead"
 );
 
+// SQLite is native-only: the wasm32 build has no filesystem and runs over the in-memory backend.
+#[cfg(all(feature = "sqlite", target_arch = "wasm32"))]
+compile_error!("the `sqlite` feature is native-only and cannot be enabled on wasm32");
+
 #[cfg(feature = "_online")]
 pub(crate) mod api;
+#[cfg(test)]
+#[macro_use]
+mod test_macros;
 #[cfg(feature = "wallet")]
 pub(crate) mod database;
 // without the wallet only the database enums are needed, as some are shared with inspection
@@ -159,6 +173,8 @@ pub use rgbstd::{
     vm::WitnessOrd,
 };
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub use crate::utils::block_on;
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TypeOfTransition},
     error::Error,
@@ -166,9 +182,11 @@ pub use crate::{
 #[cfg(feature = "wallet")]
 pub use crate::{
     database::enums::{Encryption, TransferStatus, TransportType, WalletTransactionType},
-    utils::{BitcoinNetwork, block_on},
+    utils::BitcoinNetwork,
 };
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use std::sync::LazyLock;
 #[cfg(feature = "_online")]
 use std::{
     cmp::{Ordering, max, min},
@@ -182,10 +200,8 @@ use std::{
     fs,
     hash::Hash,
     io::{self, Read, Write},
-    panic,
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -193,6 +209,8 @@ use std::{
     path::Path,
     str::FromStr,
 };
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use std::{panic, time::Duration};
 
 use amplify::{ByteArray, Wrapper};
 #[cfg(feature = "wallet")]
@@ -237,14 +255,11 @@ use bdk_wallet::{
         Address as BdkAddress, Amount as BdkAmount, BlockHash, Network as BdkNetwork, NetworkKind,
         OutPoint as BdkOutPoint, ScriptBuf, TxOut,
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
-        consensus::{Decodable, Encodable},
         hashes::Hash as Sha256Hash,
         psbt::{ExtractTxError, Psbt},
         secp256k1::Secp256k1,
     },
-    chain::{
-        BlockId, CanonicalizationParams, ChainPosition, ConfirmationBlockTime, DescriptorId, Merge,
-    },
+    chain::{CanonicalizationParams, ChainPosition, Merge},
     descriptor::{IntoWalletDescriptor, Segwitv0},
     keys::{
         DerivableKey, DescriptorKey,
@@ -252,8 +267,13 @@ use bdk_wallet::{
         ExtendedKey, GeneratableKey,
         bip39::{Language, Mnemonic, WordCount},
     },
-    miniscript::{Descriptor, DescriptorPublicKey},
     signer::SignersContainer,
+};
+#[cfg(all(feature = "wallet", any(test, not(target_arch = "wasm32"))))]
+use bdk_wallet::{
+    bitcoin::consensus::{Decodable, Encodable},
+    chain::{BlockId, ConfirmationBlockTime, DescriptorId},
+    miniscript::{Descriptor, DescriptorPublicKey},
 };
 #[cfg(feature = "_online")]
 use bdk_wallet::{
@@ -286,10 +306,8 @@ use reqwest::{
     blocking::{Client as RestClient, multipart},
     header::CONTENT_TYPE,
 };
-#[cfg(feature = "wallet")]
-use rgb_lib_migration::{
-    ArrayType, ColumnType, Migrator, MigratorTrait, Nullable, Value, ValueTypeErr,
-};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use rgb_lib_migration::{Migrator, MigratorTrait};
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
@@ -299,8 +317,7 @@ use rgbstd::indexers::electrum_blocking::electrum_client::{
 };
 #[cfg(feature = "wallet")]
 use rgbstd::{
-    Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, RevealedData, TokenIndex,
-    Vout,
+    Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, TokenIndex,
     containers::{SealWitness, SpvProof, ValidConsignment},
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, SchemaWrapper,
@@ -309,9 +326,9 @@ use rgbstd::{
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
     persistence::{
-        AllocKind, AllocSeal, AllocationFilter, AllocationRow, AllocationWrite,
-        ContractAssignments, ContractStateSnapshot, GlobalStateRow, GlobalStateWrite, Lib, LibId,
-        RgbStore, Stock, StockError, TxBegin, TxMode, Visibility, decode, encode,
+        AllocationFilter, AllocationRow, AllocationWrite, ContractAssignments,
+        ContractStateSnapshot, GlobalStateRow, GlobalStateWrite, Lib, LibId, RgbStore, Stock,
+        StockError, TxBegin, TxMode, Visibility,
     },
     rgbcore::commit_verify::{
         CommitId, Conceal, TryCommitVerify,
@@ -325,7 +342,6 @@ use rgbstd::{
     validation::{
         ResolveWitness, SchemaDefinition, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
     },
-    vm::WitnessPos,
 };
 use rgbstd::{
     Amount, AssignmentType, Assignments, ChainNet, ExposedSeal, Genesis, GlobalStateType,
@@ -340,6 +356,12 @@ use rgbstd::{
     stl::{AssetSpec, BurnReason, Details, Name},
     txout::TxoSeal,
     validation::DbcProof,
+};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use rgbstd::{
+    RevealedData, Vout,
+    persistence::{AllocKind, AllocSeal, decode, encode},
+    vm::WitnessPos,
 };
 #[cfg(feature = "_online")]
 use rgbstd::{
@@ -366,11 +388,19 @@ use schemata::{
 use scrypt::{Params, phc::Salt, scrypt};
 #[cfg(feature = "wallet")]
 use sea_orm::{
-    ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction,
-    DbErr, DeriveActiveEnum, EntityTrait, EnumIter, Iterable, JoinType, JsonValue, QueryFilter,
-    QueryOrder, QueryResult, QuerySelect, TransactionTrait, TryGetError, TryGetable, TryIntoModel,
-    sea_query::{Alias, Condition, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
+    ActiveValue, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult, TryGetError,
+    TryGetable, TryIntoModel,
 };
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use sea_orm::{ColumnTrait, sea_query::Condition};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use sea_orm::{
+    ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, EntityTrait, Iterable,
+    JoinType, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::{Alias, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
+};
+#[cfg(feature = "wallet")]
+use sea_query::{ArrayType, ColumnType, Nullable, Value, ValueTypeErr};
 #[cfg(feature = "wallet")]
 use serde::Deserializer;
 #[cfg(feature = "wallet")]
@@ -380,19 +410,21 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 #[cfg(feature = "wallet")]
 use sha2::{Digest, Sha256};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use slog::Drain;
 #[cfg(feature = "_online")]
 use slog::warn;
 #[cfg(feature = "wallet")]
-use slog::{Drain, Logger, debug, error, info, o};
-#[cfg(feature = "wallet")]
-use slog_async::AsyncGuard;
-#[cfg(feature = "wallet")]
+use slog::{Logger, debug, error, info, o};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use slog_term::{FullFormat, PlainDecorator};
+#[cfg(feature = "wallet")]
+use strict_encoding::FieldName;
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
 use strict_encoding::StrictSerialize;
 use strict_encoding::{DeserializeError, StrictDeserialize};
-#[cfg(feature = "wallet")]
-use strict_encoding::{FieldName, StrictDecode, StrictEncode};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use strict_encoding::{StrictDecode, StrictEncode};
 #[cfg(feature = "wallet")]
 use strict_types::{TypeLib, TypeLibId};
 #[cfg(feature = "wallet")]
@@ -408,6 +440,31 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 #[cfg(feature = "wallet")]
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+#[cfg(feature = "wallet")]
+use crate::database::entities::{
+    asset::{ActiveModel as DbAssetActMod, Model as DbAsset},
+    asset_transfer::{ActiveModel as DbAssetTransferActMod, Model as DbAssetTransfer},
+    backup_info::{ActiveModel as DbBackupInfoActMod, Model as DbBackupInfo},
+    batch_transfer::{ActiveModel as DbBatchTransferActMod, Model as DbBatchTransfer},
+    coloring::{ActiveModel as DbColoringActMod, Model as DbColoring},
+    media::{ActiveModel as DbMediaActMod, Model as DbMedia},
+    pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod,
+    reserved_txo::Model as DbReservedTxo,
+    token::{ActiveModel as DbTokenActMod, Model as DbToken},
+    token_media::{ActiveModel as DbTokenMediaActMod, Model as DbTokenMedia},
+    transfer::{ActiveModel as DbTransferActMod, Model as DbTransfer},
+    transfer_transport_endpoint::{
+        ActiveModel as DbTransferTransportEndpointActMod, Model as DbTransferTransportEndpoint,
+    },
+    transport_endpoint::{ActiveModel as DbTransportEndpointActMod, Model as DbTransportEndpoint},
+    txo::{ActiveModel as DbTxoActMod, Model as DbTxo},
+    wallet_transaction::Model as DbWalletTransaction,
+};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::database::entities::{
+    rgb_assignment::Model as DbAssignment, rgb_global_state::Model as DbGlobalState,
+    rgb_witness_ord::Model as DbWitnessOrd,
+};
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
 #[cfg(feature = "electrum")]
@@ -468,46 +525,6 @@ use crate::{
     database::rgb::migrate_rgb_fs_to_db,
     database::{
         DbData, DbTxn, RgbLibDatabase, TransportEndpointsByTransfer,
-        entities::{
-            asset::{ActiveModel as DbAssetActMod, Model as DbAsset},
-            asset_transfer::{ActiveModel as DbAssetTransferActMod, Model as DbAssetTransfer},
-            backup_info::{ActiveModel as DbBackupInfoActMod, Model as DbBackupInfo},
-            batch_transfer::{ActiveModel as DbBatchTransferActMod, Model as DbBatchTransfer},
-            coloring::{ActiveModel as DbColoringActMod, Model as DbColoring},
-            media::{ActiveModel as DbMediaActMod, Model as DbMedia},
-            pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod,
-            reserved_txo::Model as DbReservedTxo,
-            rgb_aluvm_lib::ActiveModel as DbAluvmLibActMod,
-            rgb_assignment::{ActiveModel as DbAssignmentActMod, Model as DbAssignment},
-            rgb_bundle::ActiveModel as DbBundleActMod,
-            rgb_bundle_contract::ActiveModel as DbBundleContractActMod,
-            rgb_bundle_witness::ActiveModel as DbBundleWitnessActMod,
-            rgb_genesis::{ActiveModel as DbGenesisActMod, Model as DbGenesis},
-            rgb_global_state::{ActiveModel as DbGlobalStateActMod, Model as DbGlobalState},
-            rgb_invalid_op::ActiveModel as DbInvalidOpActMod,
-            rgb_op_bundle::ActiveModel as DbOpBundleActMod,
-            rgb_op_input::{ActiveModel as DbOpInputActMod, Model as DbOpInput},
-            rgb_outpoint_opout::ActiveModel as DbOutpointOpoutActMod,
-            rgb_schema::{ActiveModel as DbSchemaActMod, Model as DbSchema},
-            rgb_schema_type_lib::ActiveModel as DbSchemaTypeLibActMod,
-            rgb_secret_seal::ActiveModel as DbSecretSealActMod,
-            rgb_secret_seal_opout::ActiveModel as DbSecretSealOpoutActMod,
-            rgb_type_lib::ActiveModel as DbTypeLibActMod,
-            rgb_witness::{ActiveModel as DbWitnessActMod, Model as DbWitness},
-            rgb_witness_ord::{ActiveModel as DbWitnessOrdActMod, Model as DbWitnessOrd},
-            token::{ActiveModel as DbTokenActMod, Model as DbToken},
-            token_media::{ActiveModel as DbTokenMediaActMod, Model as DbTokenMedia},
-            transfer::{ActiveModel as DbTransferActMod, Model as DbTransfer},
-            transfer_transport_endpoint::{
-                ActiveModel as DbTransferTransportEndpointActMod,
-                Model as DbTransferTransportEndpoint,
-            },
-            transport_endpoint::{
-                ActiveModel as DbTransportEndpointActMod, Model as DbTransportEndpoint,
-            },
-            txo::{ActiveModel as DbTxoActMod, Model as DbTxo},
-            wallet_transaction::Model as DbWalletTransaction,
-        },
         enums::{ColoringType, RecipientTypeFull, TransportEndpointKind},
         group_colorings_by_asset_transfer,
     },
@@ -515,18 +532,43 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, PURPOSE,
-        RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, atomic_tmp_path, atomic_write,
-        atomic_write_with, beneficiary_from_script_buf, from_str_or_number_mandatory,
-        from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
-        get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
-        read_fascia, setup_logger, str_to_xpub,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
+        RGB_RUNTIME_DELETING_DIR, RgbStock, atomic_write, atomic_write_with,
+        beneficiary_from_script_buf, from_str_or_number_mandatory, from_str_or_number_optional,
+        get_account_xpubs, get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes,
+        hash_bytes_hex, now, parse_address_str, read_fascia, setup_logger, str_to_xpub,
     },
     wallet::{
         AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
         WalletDescriptors,
     },
 };
+// The SQLite-only tables are not touched by the in-memory backend the wasm build uses.
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::database::entities::{
+    rgb_aluvm_lib::ActiveModel as DbAluvmLibActMod,
+    rgb_assignment::ActiveModel as DbAssignmentActMod,
+    rgb_bundle::ActiveModel as DbBundleActMod,
+    rgb_bundle_contract::ActiveModel as DbBundleContractActMod,
+    rgb_bundle_witness::ActiveModel as DbBundleWitnessActMod,
+    rgb_genesis::{ActiveModel as DbGenesisActMod, Model as DbGenesis},
+    rgb_global_state::ActiveModel as DbGlobalStateActMod,
+    rgb_invalid_op::ActiveModel as DbInvalidOpActMod,
+    rgb_op_bundle::ActiveModel as DbOpBundleActMod,
+    rgb_op_input::{ActiveModel as DbOpInputActMod, Model as DbOpInput},
+    rgb_outpoint_opout::ActiveModel as DbOutpointOpoutActMod,
+    rgb_schema::{ActiveModel as DbSchemaActMod, Model as DbSchema},
+    rgb_schema_type_lib::ActiveModel as DbSchemaTypeLibActMod,
+    rgb_secret_seal::ActiveModel as DbSecretSealActMod,
+    rgb_secret_seal_opout::ActiveModel as DbSecretSealOpoutActMod,
+    rgb_type_lib::ActiveModel as DbTypeLibActMod,
+    rgb_witness::{ActiveModel as DbWitnessActMod, Model as DbWitness},
+    rgb_witness_ord::ActiveModel as DbWitnessOrdActMod,
+};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::utils::adjust_canonicalization;
+#[cfg(all(feature = "wallet", any(test, not(target_arch = "wasm32"))))]
+use crate::utils::atomic_tmp_path;
 #[cfg(all(test, feature = "wallet"))]
 use crate::{
     keys::generate_keys,
