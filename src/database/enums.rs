@@ -132,7 +132,7 @@ impl From<AssetSchema> for SchemaId {
 }
 
 #[cfg(feature = "wallet")]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
 pub enum ColoringType {
     #[sea_orm(num_value = 1)]
