@@ -1,4 +1,8 @@
 //! In-memory wallet DB for wasm32: same API as RgbLibDatabase, backed by Vec/HashMap.
+
+// The in-memory backend mirrors the whole `RgbLibDatabase` API; the wallet-only wasm build uses a
+// subset, so the rest of the mirror looks dead there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #![allow(clippy::derivable_impls)]
 
 use std::cell::RefCell;
@@ -19,17 +23,53 @@ use crate::{
     DbTransferTransportEndpointActMod, DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
     DbTxoActMod, DbWalletTransaction,
 };
-use std::str::FromStr;
 
 use bdk_chain::Merge;
 use bdk_wallet::ChangeSet;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Test-only operation counters proving wallet work reaches this backend.
+#[cfg(test)]
+pub(crate) struct MemoryOpCounters {
+    pub(crate) begin_transactions: AtomicUsize,
+    pub(crate) asset_writes: AtomicUsize,
+    pub(crate) asset_reads: AtomicUsize,
+    pub(crate) bdk_updates: AtomicUsize,
+}
+
+#[cfg(test)]
+impl Default for MemoryOpCounters {
+    fn default() -> Self {
+        Self {
+            begin_transactions: AtomicUsize::new(0),
+            asset_writes: AtomicUsize::new(0),
+            asset_reads: AtomicUsize::new(0),
+            bdk_updates: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl MemoryOpCounters {
+    /// `(begin_transactions, asset_writes, asset_reads, bdk_updates)`
+    pub(crate) fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.begin_transactions.load(Ordering::Relaxed),
+            self.asset_writes.load(Ordering::Relaxed),
+            self.asset_reads.load(Ordering::Relaxed),
+            self.bdk_updates.load(Ordering::Relaxed),
+        )
+    }
+}
 
 use crate::Error;
 #[cfg(feature = "_online")]
 use crate::database::DbBatchTransferData;
 use crate::database::enums::{
     AssetSchema, Assignment, ColoringType, Encryption, RecipientTypeFull, TransferStatus,
-    TransportEndpointKind, TransportType, TypeOfTransition, WalletTransactionType,
+    TransportEndpointKind, TransportType, WalletTransactionType,
 };
 use crate::database::{LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
@@ -97,7 +137,7 @@ impl Default for Assignment {
 
 /// In-memory store: one Vec per entity, next_id per table for insert idx.
 /// RefCell for interior mutability so methods can take &self (Arc<Backend>).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 /// In-memory database replacing SeaORM/SQLite for WASM targets.
 ///
 /// **Design constraint:** All fields use `RefCell` for interior mutability. Methods must NOT
@@ -140,6 +180,10 @@ pub struct InMemoryDb {
     tx_open: RefCell<bool>,
     /// Latest merged BDK changeset; the SQLite backend keeps it in the `bdk_*` tables.
     bdk_changeset: RefCell<Option<ChangeSet>>,
+    /// Test-only operation counters, never serialized into a snapshot.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) counters: std::sync::Arc<MemoryOpCounters>,
 }
 
 impl InMemoryDb {
@@ -177,10 +221,14 @@ impl InMemoryDb {
             next_token_media_idx: RefCell::new(1),
             tx_open: RefCell::new(false),
             bdk_changeset: RefCell::new(None),
+            #[cfg(test)]
+            counters: Default::default(),
         }
     }
 
     pub(crate) fn set_asset(&self, a: DbAssetActMod) -> Result<i32, InternalError> {
+        #[cfg(test)]
+        self.counters.asset_writes.fetch_add(1, Ordering::Relaxed);
         let idx = *self.next_asset_idx.borrow();
         *self.next_asset_idx.borrow_mut() += 1;
         let row = DbAsset {
@@ -803,6 +851,8 @@ impl InMemoryDb {
     }
 
     pub(crate) fn get_asset(&self, asset_id: String) -> Result<Option<DbAsset>, InternalError> {
+        #[cfg(test)]
+        self.counters.asset_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .assets
             .borrow()
@@ -856,6 +906,8 @@ impl InMemoryDb {
     }
 
     pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
+        #[cfg(test)]
+        self.counters.bdk_updates.fetch_add(1, Ordering::Relaxed);
         let mut current = self.bdk_changeset.borrow_mut();
         let mut merged = current.take().unwrap_or_default();
         merged.merge(changeset.clone());
@@ -885,6 +937,8 @@ impl InMemoryDb {
     }
 
     pub(crate) fn iter_assets(&self) -> Result<Vec<DbAsset>, InternalError> {
+        #[cfg(test)]
+        self.counters.asset_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.assets.borrow().clone())
     }
 
@@ -1667,6 +1721,11 @@ impl InMemoryDb {
 
     pub(crate) fn close_tx(&self) {
         *self.tx_open.borrow_mut() = false;
+    }
+
+    /// Whether a transaction is currently open on this store.
+    pub(crate) fn has_open_tx(&self) -> bool {
+        *self.tx_open.borrow()
     }
 
     pub(crate) fn begin_transaction(&self) -> Result<InMemoryTxn<'_>, Error> {

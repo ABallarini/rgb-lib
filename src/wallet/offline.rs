@@ -445,8 +445,16 @@ pub trait WalletOffline: WalletBackup {
     ) -> Result<(String, PathBuf, ValidContract), Error> {
         let valid_contract = builder.issue_contract().expect("issuance should succeed");
         let asset_id = valid_contract.contract_id().to_string();
-        let contract_path = self.get_issue_consignment_path(&asset_id);
-        atomic_write_with(&contract_path, |tmp| Ok(valid_contract.save_file(tmp)?))?;
+        // wasm: no filesystem, so the contract is only imported into the in-memory DB and the
+        // consignment file is not written; the path is unused by every caller
+        #[cfg(target_arch = "wasm32")]
+        let contract_path = PathBuf::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        let contract_path = {
+            let contract_path = self.get_issue_consignment_path(&asset_id);
+            atomic_write_with(&contract_path, |tmp| Ok(valid_contract.save_file(tmp)?))?;
+            contract_path
+        };
         Ok((asset_id, contract_path, valid_contract))
     }
 

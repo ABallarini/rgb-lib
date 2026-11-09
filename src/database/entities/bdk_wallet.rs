@@ -11,7 +11,16 @@ impl EntityName for Entity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, DeriveModel, DeriveActiveModel, Eq)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    DeriveModel,
+    DeriveActiveModel,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Model {
     pub id: i32,
     pub descriptor: Option<String>,

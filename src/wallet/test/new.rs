@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::fs::PermissionsExt;
 
 fn check_wallet(
@@ -122,6 +123,137 @@ fn memory_database_success() {
     assert!(assets.ifa.unwrap_or_default().is_empty());
 }
 
+/// Seed the one unspent colored TXO the offline issuer allocates asset amounts to.
+fn seed_colored_txo(wallet: &Wallet) {
+    use crate::database::entities::txo::ActiveModel as DbTxoActMod;
+    use sea_orm::ActiveValue;
+
+    wallet
+        .database()
+        .memory_backend()
+        .unwrap()
+        .db
+        .set_txo(DbTxoActMod {
+            idx: ActiveValue::NotSet,
+            txid: ActiveValue::Set(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vout: ActiveValue::Set(0),
+            btc_amount: ActiveValue::Set("1000".to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(true),
+            pending_witness: ActiveValue::Set(false),
+        })
+        .unwrap();
+}
+
+fn memory_counts(wallet: &Wallet) -> (usize, usize, usize, usize) {
+    wallet
+        .database()
+        .memory_backend()
+        .unwrap()
+        .counters()
+        .counts()
+}
+
+#[test]
+#[parallel]
+fn memory_database_operations_hit_injected_backend() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let mut wallet = Wallet::new_with_database(
+        data_dir.wallet_data(),
+        SinglesigKeys::from_keys(&keys, None),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+
+    // count only what the wallet operations below do, not construction
+    let before = memory_counts(&wallet);
+
+    let wallet_data = wallet.get_wallet_data();
+    assert_eq!(wallet_data.bitcoin_network, BitcoinNetwork::Regtest);
+    let address = wallet.get_address().unwrap();
+    assert!(address.starts_with("bcrt1"));
+    seed_colored_txo(&wallet);
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .unwrap();
+    let assets = wallet.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+
+    let (begin, writes, reads, bdk) = memory_counts(&wallet);
+    assert!(begin > before.0, "no transaction hit the injected backend");
+    assert!(writes > before.1, "no asset write hit the injected backend");
+    assert!(reads > before.2, "no asset read hit the injected backend");
+    assert!(bdk > before.3, "no BDK update hit the injected backend");
+}
+
+#[test]
+#[parallel]
+fn memory_database_restored_operations_hit_injected_backend() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet_data = data_dir.wallet_data();
+
+    let wallet = Wallet::new_with_database(
+        wallet_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    seed_colored_txo(&wallet);
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+
+    let mut restored = Wallet::from_snapshot(&snapshot, wallet_data, wallet_keys).unwrap();
+    let before = memory_counts(&restored);
+
+    let restored_data = restored.get_wallet_data();
+    assert_eq!(restored_data.bitcoin_network, BitcoinNetwork::Regtest);
+    let address = restored.get_address().unwrap();
+    assert!(address.starts_with("bcrt1"));
+    let assets = restored.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+
+    let (begin, writes, reads, bdk) = memory_counts(&restored);
+    assert!(begin > before.0, "no transaction hit the restored backend");
+    assert!(reads > before.2, "no asset read hit the restored backend");
+    assert!(bdk > before.3, "no BDK update hit the restored backend");
+    // nothing in a read path writes assets
+    assert_eq!(writes, before.1);
+    // the restored wallet can still be snapshotted
+    assert!(restored.snapshot().unwrap().is_some());
+}
+
+#[test]
+#[parallel]
+fn native_constructor_selects_sqlite() {
+    let data_dir = PrivateDataDir::new();
+    let wallet = data_dir.wallet(true, None);
+    assert!(wallet.database().memory_backend().is_none());
+    assert_eq!(
+        wallet.get_wallet_data().bitcoin_network,
+        BitcoinNetwork::Regtest
+    );
+}
+
 #[test]
 #[parallel]
 fn snapshot_and_restore_memory_success() {
@@ -166,6 +298,16 @@ fn snapshot_and_restore_memory_success() {
 
     let snapshot = wallet.snapshot().unwrap().unwrap();
     assert!(!snapshot.is_empty());
+    // the snapshot is the wallet envelope, and the backend keeps the manifest for later flushes
+    assert!(snapshot.starts_with(b"RGBWL"));
+    assert!(
+        wallet
+            .database()
+            .memory_backend()
+            .unwrap()
+            .wallet_manifest()
+            .is_some()
+    );
     // the DB snapshot carries the persisted wallet state, never the mnemonic
     let mnemonic = keys.mnemonic.clone();
     assert!(
@@ -174,6 +316,14 @@ fn snapshot_and_restore_memory_success() {
             .any(|window| window == mnemonic.as_bytes())
     );
     drop(wallet);
+
+    // a restore with settings the snapshot was not created with is rejected
+    let mut wallet_data_bad = wallet_data.clone();
+    wallet_data_bad.max_allocations_per_utxo += 1;
+    assert!(matches!(
+        Wallet::from_snapshot(&snapshot, wallet_data_bad, wallet_keys.clone()),
+        Err(Error::WalletSettingMismatch { .. })
+    ));
 
     // the manifest written by the first construction is in the same wallet dir
     let restored = Wallet::from_snapshot(&snapshot, wallet_data.clone(), wallet_keys).unwrap();
@@ -306,6 +456,8 @@ fn mainnet_success_esplora() {
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }
 
+// uses unix file permissions and a writability check that only exists natively
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 #[parallel]
 fn fail() {
