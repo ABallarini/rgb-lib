@@ -1278,6 +1278,26 @@ impl RgbLibDatabase {
         ))
     }
 
+    /// Rebuild an in-memory database from the bytes of [`MemoryBackend::to_snapshot`].
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn new_memory_from_snapshot(snapshot: &[u8]) -> Result<Self, Error> {
+        Ok(Self::Memory(std::sync::Arc::new(
+            crate::database::memory::MemoryBackend::from_snapshot(snapshot)?,
+        )))
+    }
+
+    /// Snapshot the whole database, when it runs in memory.
+    ///
+    /// Returns `None` for SQLite, which persists itself and has no snapshot format.
+    pub(crate) fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Sqlite(_) => Ok(None),
+            #[cfg(any(test, target_arch = "wasm32"))]
+            Self::Memory(backend) => backend.to_snapshot().map(Some),
+        }
+    }
+
     /// The in-memory backend, when this database runs in memory mode.
     #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn memory_backend(

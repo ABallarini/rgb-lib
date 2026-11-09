@@ -122,6 +122,84 @@ fn memory_database_success() {
     assert!(assets.ifa.unwrap_or_default().is_empty());
 }
 
+#[test]
+#[parallel]
+fn snapshot_and_restore_memory_success() {
+    use crate::database::entities::txo::ActiveModel as DbTxoActMod;
+    use sea_orm::ActiveValue;
+
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet_data = data_dir.wallet_data();
+
+    let wallet = Wallet::new_with_database(
+        wallet_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+
+    // the offline issuer needs one unspent colored TXO to allocate the asset amounts to
+    wallet
+        .database()
+        .memory_backend()
+        .unwrap()
+        .db
+        .set_txo(DbTxoActMod {
+            idx: ActiveValue::NotSet,
+            txid: ActiveValue::Set(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vout: ActiveValue::Set(0),
+            btc_amount: ActiveValue::Set("1000".to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(true),
+            pending_witness: ActiveValue::Set(false),
+        })
+        .unwrap();
+
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .unwrap();
+    let fingerprint = wallet.get_keys().master_fingerprint.clone();
+
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    assert!(!snapshot.is_empty());
+    // the DB snapshot carries the persisted wallet state, never the mnemonic
+    let mnemonic = keys.mnemonic.clone();
+    assert!(
+        !snapshot
+            .windows(mnemonic.len())
+            .any(|window| window == mnemonic.as_bytes())
+    );
+    drop(wallet);
+
+    // the manifest written by the first construction is in the same wallet dir
+    let restored = Wallet::from_snapshot(&snapshot, wallet_data.clone(), wallet_keys).unwrap();
+    assert_eq!(restored.get_keys().master_fingerprint, fingerprint);
+    assert_eq!(
+        restored.get_wallet_data().bitcoin_network,
+        wallet_data.bitcoin_network
+    );
+    let assets = restored.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+}
+
+#[test]
+#[parallel]
+fn sqlite_snapshot_is_none() {
+    let data_dir = PrivateDataDir::new();
+    let wallet = data_dir.wallet(true, None);
+    assert!(wallet.snapshot().unwrap().is_none());
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]

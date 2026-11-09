@@ -226,7 +226,7 @@ impl InMemoryDb {
             idx,
             last_backup_timestamp: av(b.last_backup_timestamp),
             last_operation_timestamp: av(b.last_operation_timestamp),
-            last_processed_operation_idx: av(b.last_processed_operation_idx),
+            last_processed_operation_idx: av_opt(b.last_processed_operation_idx),
         };
         *self.backup_info.borrow_mut() = Some(row);
         Ok(idx)
