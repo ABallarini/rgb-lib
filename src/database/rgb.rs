@@ -11,10 +11,6 @@
 //! The module also holds the one-time migration of the legacy filesystem RGB store,
 //! into the database, and the legacy consignment files, on disk.
 
-// The SQLite `RgbStore` implementation and its row helpers are native-only; the wasm and
-// driver-less native builds keep only the backend dispatcher over `DbTxn`, so the rest looks dead.
-#![cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
-
 #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
 use super::memory::MemoryTxn;
 use super::*;
@@ -28,31 +24,41 @@ use crate::database::entities::{
 };
 
 /// Max number of values bound in a single query.
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const QUERY_CHUNK: usize = 400;
 
 /// Max number of outpoints matched in a single query, as each one binds 2 values.
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const OUTPOINT_CHUNK: usize = QUERY_CHUNK / 2;
 
 // `witness_ords.status` values, mirroring the `WitnessOrd` strict-encoding tag order
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const ORD_MINED: u8 = 0;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const ORD_TENTATIVE: u8 = 1;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const ORD_IGNORED: u8 = 2;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 const ORD_ARCHIVED: u8 = 3;
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 type OrdColumns = (u8, Option<u32>, Option<i64>, Option<u8>);
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn enc(val: &impl StrictEncode) -> Result<Vec<u8>, Error> {
     encode(val).map_err(|e| Error::Internal {
         details: format!("cannot serialize RGB data: {e}"),
     })
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn dec<T: StrictDecode>(blob: &[u8]) -> Result<T, Error> {
     decode(blob).map_err(|e| Error::Internal {
         details: format!("corrupted RGB data: {e}"),
     })
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn collect_decoded<M, T>(
     rows: Result<Vec<M>, Error>,
     decode: impl Fn(M) -> Result<T, Error>,
@@ -63,6 +69,7 @@ fn collect_decoded<M, T>(
     }
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn alloc_kind_str(kind: AllocKind) -> &'static str {
     match kind {
         AllocKind::Fungible => "F",
@@ -71,6 +78,7 @@ fn alloc_kind_str(kind: AllocKind) -> &'static str {
     }
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn alloc_kind_from_str(s: &str) -> Option<AllocKind> {
     match s {
         "F" => Some(AllocKind::Fungible),
@@ -80,6 +88,7 @@ fn alloc_kind_from_str(s: &str) -> Option<AllocKind> {
     }
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn assignment_to_row(m: &DbAssignment) -> Result<AllocationRow, Error> {
     let kind = alloc_kind_from_str(&m.state_type).ok_or_else(|| Error::Internal {
         details: format!("corrupted RGB data: unknown state type {}", m.state_type),
@@ -100,6 +109,7 @@ fn assignment_to_row(m: &DbAssignment) -> Result<AllocationRow, Error> {
     })
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn global_state_to_row(m: &DbGlobalState) -> Result<GlobalStateRow, Error> {
     Ok(GlobalStateRow {
         opid: dec::<OpId>(&m.opid)?,
@@ -111,6 +121,7 @@ fn global_state_to_row(m: &DbGlobalState) -> Result<GlobalStateRow, Error> {
     })
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn ord_columns(ord: WitnessOrd) -> OrdColumns {
     match ord {
         WitnessOrd::Mined(pos) => (
@@ -128,6 +139,7 @@ fn ord_columns(ord: WitnessOrd) -> OrdColumns {
     }
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn ord_from_row(m: &DbWitnessOrd) -> Result<WitnessOrd, Error> {
     let corrupted = |what: &str| Error::Internal {
         details: format!("corrupted RGB data: {what}"),
@@ -157,6 +169,7 @@ fn ord_from_row(m: &DbWitnessOrd) -> Result<WitnessOrd, Error> {
     }
 }
 
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn outpoint_keys(outpoints: &BTreeSet<OutPoint>) -> Result<Vec<(Vec<u8>, u32)>, Error> {
     outpoints
         .iter()
@@ -166,6 +179,7 @@ fn outpoint_keys(outpoints: &BTreeSet<OutPoint>) -> Result<Vec<(Vec<u8>, u32)>, 
 
 // match the wanted outpoints as `(txid = ? AND vout = ?) OR ...`, so that assignments sharing a
 // TXID on other vouts are not returned by the query at all
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 fn outpoint_condition(
     txid_col: impl ColumnTrait,
     vout_col: impl ColumnTrait,

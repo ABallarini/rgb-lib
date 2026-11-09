@@ -317,8 +317,7 @@ use rgbstd::indexers::electrum_blocking::electrum_client::{
 };
 #[cfg(feature = "wallet")]
 use rgbstd::{
-    Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, RevealedData, TokenIndex,
-    Vout,
+    Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, TokenIndex,
     containers::{SealWitness, SpvProof, ValidConsignment},
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, SchemaWrapper,
@@ -327,9 +326,9 @@ use rgbstd::{
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
     persistence::{
-        AllocKind, AllocSeal, AllocationFilter, AllocationRow, AllocationWrite,
-        ContractAssignments, ContractStateSnapshot, GlobalStateRow, GlobalStateWrite, Lib, LibId,
-        RgbStore, Stock, StockError, TxBegin, TxMode, Visibility, decode, encode,
+        AllocationFilter, AllocationRow, AllocationWrite, ContractAssignments,
+        ContractStateSnapshot, GlobalStateRow, GlobalStateWrite, Lib, LibId, RgbStore, Stock,
+        StockError, TxBegin, TxMode, Visibility,
     },
     rgbcore::commit_verify::{
         CommitId, Conceal, TryCommitVerify,
@@ -343,7 +342,6 @@ use rgbstd::{
     validation::{
         ResolveWitness, SchemaDefinition, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
     },
-    vm::WitnessPos,
 };
 use rgbstd::{
     Amount, AssignmentType, Assignments, ChainNet, ExposedSeal, Genesis, GlobalStateType,
@@ -358,6 +356,12 @@ use rgbstd::{
     stl::{AssetSpec, BurnReason, Details, Name},
     txout::TxoSeal,
     validation::DbcProof,
+};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use rgbstd::{
+    RevealedData, Vout,
+    persistence::{AllocKind, AllocSeal, decode, encode},
+    vm::WitnessPos,
 };
 #[cfg(feature = "_online")]
 use rgbstd::{
@@ -384,9 +388,11 @@ use schemata::{
 use scrypt::{Params, phc::Salt, scrypt};
 #[cfg(feature = "wallet")]
 use sea_orm::{
-    ActiveValue, ColumnTrait, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult,
-    TryGetError, TryGetable, TryIntoModel, sea_query::Condition,
+    ActiveValue, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult, TryGetError,
+    TryGetable, TryIntoModel,
 };
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use sea_orm::{ColumnTrait, sea_query::Condition};
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use sea_orm::{
     ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, EntityTrait, Iterable,
@@ -412,11 +418,13 @@ use slog::warn;
 use slog::{Logger, debug, error, info, o};
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use slog_term::{FullFormat, PlainDecorator};
+#[cfg(feature = "wallet")]
+use strict_encoding::FieldName;
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
 use strict_encoding::StrictSerialize;
 use strict_encoding::{DeserializeError, StrictDeserialize};
-#[cfg(feature = "wallet")]
-use strict_encoding::{FieldName, StrictDecode, StrictEncode};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use strict_encoding::{StrictDecode, StrictEncode};
 #[cfg(feature = "wallet")]
 use strict_types::{TypeLib, TypeLibId};
 #[cfg(feature = "wallet")]
@@ -442,9 +450,6 @@ use crate::database::entities::{
     media::{ActiveModel as DbMediaActMod, Model as DbMedia},
     pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod,
     reserved_txo::Model as DbReservedTxo,
-    rgb_assignment::Model as DbAssignment,
-    rgb_global_state::Model as DbGlobalState,
-    rgb_witness_ord::Model as DbWitnessOrd,
     token::{ActiveModel as DbTokenActMod, Model as DbToken},
     token_media::{ActiveModel as DbTokenMediaActMod, Model as DbTokenMedia},
     transfer::{ActiveModel as DbTransferActMod, Model as DbTransfer},
@@ -454,6 +459,11 @@ use crate::database::entities::{
     transport_endpoint::{ActiveModel as DbTransportEndpointActMod, Model as DbTransportEndpoint},
     txo::{ActiveModel as DbTxoActMod, Model as DbTxo},
     wallet_transaction::Model as DbWalletTransaction,
+};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::database::entities::{
+    rgb_assignment::Model as DbAssignment, rgb_global_state::Model as DbGlobalState,
+    rgb_witness_ord::Model as DbWitnessOrd,
 };
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
