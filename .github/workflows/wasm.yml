@@ -1,8 +1,9 @@
 name: WASM
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "feat/**" ]
   pull_request:
     branches: [ "master" ]
 
