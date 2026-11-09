@@ -1300,6 +1300,11 @@ impl MemRgbStore {
         *self.tables.borrow_mut() = savepoint.0;
     }
 
+    /// Whether a read or write transaction is currently open on the store.
+    pub(crate) fn has_open_tx(&self) -> bool {
+        self.tx.borrow().is_some()
+    }
+
     /// Encodes all tables. Call it outside of a transaction.
     pub(crate) fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let t = self.tables.borrow();

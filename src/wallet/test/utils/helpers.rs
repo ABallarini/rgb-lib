@@ -1,5 +1,12 @@
 use super::*;
 
+#[cfg(feature = "electrum")]
+use regex::RegexSet;
+#[cfg(feature = "electrum")]
+use std::io::Write;
+#[cfg(feature = "_online")]
+use std::time::{Duration, Instant};
+
 /// A data dir of its own for a test that doesn't call `initialize()`.
 ///
 /// `initialize()` runs `regtest.sh prepare_tests_environment`, which wipes the shared

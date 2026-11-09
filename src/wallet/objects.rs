@@ -9,7 +9,7 @@ use super::*;
 // ────────────────────────────────────────────────────────────
 
 /// Supported database types.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum DatabaseType {
     /// A SQLite database
     Sqlite,

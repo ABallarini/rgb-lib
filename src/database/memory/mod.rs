@@ -21,6 +21,8 @@ use rgb_store::{MemRgbStore, RgbSavepoint};
 pub(crate) struct MemoryBackend {
     pub(crate) db: InMemoryDb,
     pub(crate) rgb: Mutex<MemRgbStore>,
+    // the wallet manifest rides in the wallet snapshot envelope, not in the inner snapshot
+    manifest_json: Mutex<Option<String>>,
 }
 
 impl MemoryBackend {
@@ -28,13 +30,106 @@ impl MemoryBackend {
         Self {
             db: InMemoryDb::new(),
             rgb: Mutex::new(MemRgbStore::default()),
+            manifest_json: Mutex::new(None),
         }
+    }
+
+    /// Test-only operation counters of the wallet tables.
+    #[cfg(test)]
+    pub(crate) fn counters(&self) -> &db::MemoryOpCounters {
+        &self.db.counters
+    }
+
+    /// Store the wallet manifest JSON that travels in the wallet snapshot envelope.
+    pub(crate) fn set_wallet_manifest(&self, json: String) {
+        *self
+            .manifest_json
+            .lock()
+            .expect("manifest mutex is never poisoned") = Some(json);
+    }
+
+    /// The wallet manifest JSON stored by [`Self::set_wallet_manifest`].
+    pub(crate) fn wallet_manifest(&self) -> Option<String> {
+        self.manifest_json
+            .lock()
+            .expect("manifest mutex is never poisoned")
+            .clone()
+    }
+
+    /// Version byte of the snapshot format written by [`Self::to_snapshot`].
+    const SNAPSHOT_VERSION: u8 = 1;
+
+    /// Serialize the whole backend: one version byte, the little-endian `u32` length of the
+    /// JSON part, the JSON of the wallet tables, then the RGB store bytes.
+    pub(crate) fn to_snapshot(&self) -> Result<Vec<u8>, crate::Error> {
+        if self.db.has_open_tx() {
+            return Err(crate::Error::Internal {
+                details: "cannot snapshot the memory backend with a wallet transaction open"
+                    .to_string(),
+            });
+        }
+        let rgb = self.rgb.lock().expect("rgb store mutex is never poisoned");
+        if rgb.has_open_tx() {
+            return Err(crate::Error::Internal {
+                details: "cannot snapshot the memory backend with an RGB transaction open"
+                    .to_string(),
+            });
+        }
+        let json = serde_json::to_vec(&self.db).map_err(|e| crate::Error::Internal {
+            details: format!("cannot serialize the memory wallet tables: {e}"),
+        })?;
+        // `to_bytes` must be called outside a transaction, checked above.
+        let rgb_bytes = rgb.to_bytes().map_err(|e| crate::Error::Internal {
+            details: format!("cannot serialize the memory RGB store: {e}"),
+        })?;
+        let mut out = Vec::with_capacity(5 + json.len() + rgb_bytes.len());
+        out.push(Self::SNAPSHOT_VERSION);
+        out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&json);
+        out.extend_from_slice(&rgb_bytes);
+        Ok(out)
+    }
+
+    /// Rebuild a backend from the bytes of [`Self::to_snapshot`].
+    pub(crate) fn from_snapshot(bytes: &[u8]) -> Result<Self, crate::Error> {
+        let invalid = |details: String| crate::Error::Internal { details };
+        let header = bytes
+            .get(..5)
+            .ok_or_else(|| invalid("snapshot is shorter than its 5-byte header".to_string()))?;
+        if header[0] != Self::SNAPSHOT_VERSION {
+            return Err(invalid(format!(
+                "unsupported snapshot version {} (expected {})",
+                header[0],
+                Self::SNAPSHOT_VERSION
+            )));
+        }
+        let json_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let json_end = 5usize
+            .checked_add(json_len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                invalid("snapshot JSON length is larger than the snapshot".to_string())
+            })?;
+        let db: InMemoryDb = serde_json::from_slice(&bytes[5..json_end])
+            .map_err(|e| invalid(format!("cannot deserialize the memory wallet tables: {e}")))?;
+        let rgb = MemRgbStore::from_bytes(&bytes[json_end..])
+            .map_err(|e| invalid(format!("cannot deserialize the memory RGB store: {e}")))?;
+        Ok(Self {
+            db,
+            rgb: Mutex::new(rgb),
+            manifest_json: Mutex::new(None),
+        })
     }
 
     /// Open one transaction covering both halves. The returned guard restores
     /// both snapshots on drop and releases both on commit.
     pub(crate) fn begin_transaction(self: &Arc<Self>) -> Result<MemoryTxn, Error> {
         self.db.open_tx()?;
+        #[cfg(test)]
+        self.db
+            .counters
+            .begin_transactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let db_snapshot = Some(self.db.snapshot());
         let (rgb_snapshot, begun) = {
             let rgb = self.rgb.lock().expect("rgb store mutex is never poisoned");
@@ -70,6 +165,7 @@ impl MemoryTxn {
     }
 
     /// Snapshot both halves of the backend for a savepoint of this transaction.
+    #[cfg(feature = "_online")]
     pub(crate) fn savepoint_state(&self) -> (InMemoryDb, RgbSavepoint) {
         let db = self.backend.db.snapshot();
         let rgb = self
@@ -82,6 +178,7 @@ impl MemoryTxn {
     }
 
     /// Restore both halves of the backend to a state taken with [`Self::savepoint_state`].
+    #[cfg(feature = "_online")]
     pub(crate) fn restore_savepoint(&self, db: InMemoryDb, rgb: RgbSavepoint) {
         self.backend.db.restore(db);
         self.backend
@@ -92,11 +189,13 @@ impl MemoryTxn {
     }
 
     /// Number of `on_commit` callbacks registered so far, a savepoint boundary.
+    #[cfg(feature = "_online")]
     pub(crate) fn callbacks_len(&self) -> usize {
         self.on_commit.borrow().len()
     }
 
     /// Drop the callbacks registered after the boundary taken with [`Self::callbacks_len`].
+    #[cfg(feature = "_online")]
     pub(crate) fn truncate_callbacks(&self, len: usize) {
         self.on_commit.borrow_mut().truncate(len);
     }
@@ -140,7 +239,7 @@ impl MemoryTxn {
         self.rgb_snapshot = None;
         self.backend.db.close_tx();
         {
-            let mut rgb = self
+            let rgb = self
                 .backend
                 .rgb
                 .lock()
@@ -501,5 +600,139 @@ mod test {
             txn.commit().unwrap();
             assert_eq!(ran.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn snapshot_round_trip_keeps_every_half() {
+        use super::MemoryBackend;
+        use crate::database::entities::wallet_transaction::ActiveModel as DbWalletTransactionActMod;
+        use crate::database::enums::{SCHEMA_ID_NIA, WalletTransactionType};
+        use crate::{DbAssetActMod, DbMediaActMod, RgbLibDatabase};
+        use bdk_wallet::ChangeSet;
+        use bdk_wallet::bitcoin::Network;
+        use sea_orm::ActiveValue;
+
+        let db = RgbLibDatabase::new_memory();
+        setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+        let backend = db.memory_backend().unwrap().clone();
+
+        {
+            let txn = db.begin_transaction().unwrap();
+            txn.set_asset(DbAssetActMod {
+                id: ActiveValue::Set("asset-1".to_string()),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                added_at: ActiveValue::Set(1),
+                name: ActiveValue::Set("name".to_string()),
+                precision: ActiveValue::Set(8),
+                initial_supply: ActiveValue::Set("1000".to_string()),
+                timestamp: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+            txn.set_media(DbMediaActMod {
+                digest: ActiveValue::Set("digest-1".to_string()),
+                mime: ActiveValue::Set("image/png".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+            backend
+                .db
+                .set_wallet_transaction(DbWalletTransactionActMod {
+                    txid: ActiveValue::Set("wtx-1".to_string()),
+                    r#type: ActiveValue::Set(WalletTransactionType::CreateUtxos),
+                    ..Default::default()
+                })
+                .unwrap();
+            backend
+                .db
+                .update_bdk_changeset(&ChangeSet {
+                    network: Some(Network::Regtest),
+                    ..Default::default()
+                })
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        let bytes = backend.to_snapshot().unwrap();
+        let restored = MemoryBackend::from_snapshot(&bytes).unwrap();
+
+        assert_eq!(
+            restored.db.iter_assets().unwrap(),
+            backend.db.iter_assets().unwrap()
+        );
+        assert_eq!(
+            restored.db.iter_media().unwrap(),
+            backend.db.iter_media().unwrap()
+        );
+        assert_eq!(
+            restored.db.iter_wallet_transactions().unwrap(),
+            backend.db.iter_wallet_transactions().unwrap()
+        );
+        assert_eq!(
+            restored.db.get_bdk_changeset().unwrap().network,
+            Some(Network::Regtest)
+        );
+
+        let schemata: Vec<String> = {
+            let rgb = restored.rgb.lock().unwrap();
+            <MemRgbStore as RgbStore>::schemata(&rgb)
+                .map(|schema| schema.unwrap().schema_id().to_string())
+                .collect()
+        };
+        assert!(schemata.contains(&SCHEMA_ID_NIA.to_string()));
+    }
+
+    #[test]
+    fn snapshot_rejects_corrupt_input() {
+        use super::MemoryBackend;
+        use super::db::InMemoryDb;
+
+        // truncated header
+        assert!(MemoryBackend::from_snapshot(&[]).is_err());
+        assert!(MemoryBackend::from_snapshot(&[1, 0, 0]).is_err());
+
+        // wrong version
+        assert!(MemoryBackend::from_snapshot(&[2, 0, 0, 0, 0]).is_err());
+
+        // length larger than the input
+        assert!(MemoryBackend::from_snapshot(&[1, 255, 255, 255, 255]).is_err());
+
+        // invalid JSON
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"nope");
+        assert!(MemoryBackend::from_snapshot(&bytes).is_err());
+
+        // valid JSON, invalid RGB bytes
+        let json = serde_json::to_vec(&InMemoryDb::new()).unwrap();
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        bytes.extend_from_slice(b"garbage");
+        assert!(MemoryBackend::from_snapshot(&bytes).is_err());
+    }
+
+    #[test]
+    fn snapshot_refuses_open_transactions() {
+        use super::MemoryBackend;
+        use rgbstd::persistence::TxMode;
+        use std::sync::Arc;
+
+        // wallet transaction open
+        let backend = Arc::new(MemoryBackend::new());
+        let txn = backend.begin_transaction().unwrap();
+        assert!(backend.to_snapshot().is_err());
+        drop(txn);
+        assert!(backend.to_snapshot().is_ok());
+
+        // RGB transaction open
+        let backend = MemoryBackend::new();
+        {
+            let rgb = backend.rgb.lock().unwrap();
+            let _ = rgb.begin(TxMode::Read);
+        }
+        assert!(backend.to_snapshot().is_err());
+        backend.rgb.lock().unwrap().rollback();
+        assert!(backend.to_snapshot().is_ok());
     }
 }

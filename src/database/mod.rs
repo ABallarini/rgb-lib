@@ -2521,6 +2521,10 @@ impl DbTxn {
 
 pub(crate) mod enums;
 
+// cross-backend conformance: the same scenarios through SQLite and the memory backend
+#[cfg(all(test, feature = "sqlite"))]
+mod conformance;
+
 // spike: in-memory storage behind the dispatched backend (S06 Option A)
 #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
 mod memory;
