@@ -61,7 +61,7 @@ fn keep_stored_bdk_tx(column: bdk_tx::Column) -> SimpleExpr {
     .into()
 }
 
-impl DbTxn {
+impl SqliteTxn {
     /// Get the aggregate BDK [`ChangeSet`] from the database.
     pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
         block_on(load_changeset(self.inner()))
@@ -70,6 +70,24 @@ impl DbTxn {
     /// Merge the given BDK [`ChangeSet`] delta into what is stored.
     pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
         block_on(persist_changeset(self.inner(), changeset))
+    }
+}
+
+impl DbTxn {
+    pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
+        match self {
+            DbTxn::Sqlite(t) => t.get_bdk_changeset(),
+            #[cfg(any(test, target_arch = "wasm32"))]
+            DbTxn::Memory(m) => m.backend.db.get_bdk_changeset(),
+        }
+    }
+
+    pub(crate) fn update_bdk_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
+        match self {
+            DbTxn::Sqlite(t) => t.update_bdk_changeset(changeset),
+            #[cfg(any(test, target_arch = "wasm32"))]
+            DbTxn::Memory(m) => m.backend.db.update_bdk_changeset(changeset),
+        }
     }
 }
 

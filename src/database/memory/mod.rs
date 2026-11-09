@@ -58,21 +58,19 @@ impl MemoryBackend {
 /// Transaction over [`MemoryBackend`]: both the wallet tables and the RGB
 /// stock are rolled back together, so the two cannot diverge.
 pub(crate) struct MemoryTxn {
-    backend: Arc<MemoryBackend>,
+    pub(crate) backend: Arc<MemoryBackend>,
     db_snapshot: Option<InMemoryDb>,
     rgb_snapshot: Option<RgbSavepoint>,
     on_commit: std::cell::RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
 impl MemoryTxn {
-    pub(crate) fn backend(&self) -> &MemoryBackend {
-        &self.backend
-    }
-
     pub(crate) fn on_commit(&self, f: impl FnOnce() + 'static) {
         self.on_commit.borrow_mut().push(Box::new(f));
     }
 
+    // unused until `DbTxn::with_savepoint` wires savepoints over the memory backend
+    #[allow(dead_code)]
     pub(crate) fn with_savepoint<T>(
         &self,
         f: impl FnOnce(&MemoryTxn) -> Result<T, Error>,
@@ -137,6 +135,13 @@ impl Drop for MemoryTxn {
     }
 }
 
+// the inner snapshot state is not `Debug`
+impl std::fmt::Debug for MemoryTxn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryTxn").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::BTreeSet;
@@ -148,6 +153,26 @@ mod test {
     use crate::database::enums::AssetSchema;
     use crate::utils::BitcoinNetwork;
     use crate::wallet::{setup_db, setup_rgb};
+
+    /// `RgbLibDatabase` in memory mode must run the same `setup_rgb` schema
+    /// import as the SQLite mode, through the whole dispatched stack
+    /// (`DbTxn` -> `&DbTxn: RgbStore` -> `&MemoryTxn: RgbStore`).
+    #[test]
+    fn setup_db_memory_mode_runs_schema_import() {
+        use crate::RgbLibDatabase;
+
+        let db = RgbLibDatabase::new_memory();
+        setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+
+        let txn = db.begin_transaction().unwrap();
+        let stock = RgbStock::new(&txn);
+        assert!(
+            stock.schemata().unwrap().into_iter().next().is_some(),
+            "schema(s) must be readable back from the memory backend"
+        );
+        drop(stock);
+        txn.commit().unwrap();
+    }
 
     /// The schemas imported by `setup_rgb` must be the same whether they are
     /// written through SQLite or through the in-memory store.
