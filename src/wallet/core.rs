@@ -387,21 +387,12 @@ pub(crate) fn setup_rgb(
     Ok(())
 }
 
+/// Open the SQLite database in `wallet_dir`, creating it and running the migrations if needed.
+///
+/// The native connection and migration setup is owned by the `database::sqlite` adapter.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, Error> {
-    let db_path = wallet_dir.as_ref().join(RGB_LIB_DB_NAME);
-    let display_db_path = adjust_canonicalization(db_path);
-    let connection_string = format!("sqlite:{display_db_path}?mode=rwc");
-    let mut opt = ConnectOptions::new(connection_string);
-    opt.max_connections(1)
-        .min_connections(0)
-        .connect_timeout(Duration::from_secs(8))
-        .idle_timeout(Duration::from_secs(8))
-        .max_lifetime(Duration::from_secs(8));
-    let db_cnn = block_on(Database::connect(opt));
-    let connection = db_cnn?;
-    block_on(Migrator::up(&connection, None))?;
-    Ok(RgbLibDatabase::new(connection))
+    crate::database::sqlite::open(wallet_dir)
 }
 
 /// On `wasm32` there is no filesystem to hold the SQLite database: the wallet data lives in the

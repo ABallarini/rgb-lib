@@ -2,6 +2,9 @@
 mod bdk;
 pub(crate) mod entities;
 pub(crate) mod rgb;
+// native adapter boundary: SQLite connection creation and migrations
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod sqlite;
 
 use super::*;
 
