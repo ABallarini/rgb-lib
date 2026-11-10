@@ -9,6 +9,9 @@ pub(crate) mod core;
 pub(crate) mod files;
 #[cfg(feature = "_online")]
 pub(crate) mod indexer;
+// browser Esplora capability: wasm32 only, next to (not inside) the native online indexer paths
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) mod indexer_async;
 pub(crate) mod multisig;
 pub(crate) mod objects;
 pub(crate) mod offline;

@@ -132,6 +132,19 @@ compile_error!(
 #[cfg(all(feature = "sqlite", target_arch = "wasm32"))]
 compile_error!("the `sqlite` feature is native-only and cannot be enabled on wasm32");
 
+// The native indexers need blocking sockets and TLS, which do not build on wasm32: the browser
+// build reaches the network with the async `esplora_async` client instead. Failing here keeps
+// feature unification with a native feature set from pulling `minreq`/`mio`/`rustls` into the wasm
+// graph and turns it into one clear message.
+#[cfg(all(
+    any(feature = "bitcoind", feature = "electrum", feature = "esplora"),
+    target_arch = "wasm32"
+))]
+compile_error!(
+    "the `bitcoind`, `electrum` and `esplora` features are native blocking indexers and cannot be \
+     enabled on wasm32: use `esplora_async` for the browser transport"
+);
+
 #[cfg(feature = "_online")]
 pub(crate) mod api;
 #[cfg(test)]
@@ -150,8 +163,12 @@ pub(crate) mod database {
 pub(crate) mod encryption;
 pub(crate) mod error;
 #[cfg(feature = "wallet")]
+pub(crate) mod executor;
+#[cfg(feature = "wallet")]
 pub mod keys;
 pub mod no_wallet;
+#[cfg(feature = "wallet")]
+pub(crate) mod runtime;
 #[cfg(feature = "wallet")]
 pub mod utils;
 #[cfg(feature = "wallet")]
@@ -185,8 +202,6 @@ pub use crate::{
     utils::BitcoinNetwork,
 };
 
-#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-use std::sync::LazyLock;
 #[cfg(feature = "_online")]
 use std::{
     cmp::{Ordering, max, min},
@@ -238,10 +253,12 @@ use bdk_electrum::{
 #[cfg(feature = "esplora")]
 use bdk_esplora::{
     EsploraExt,
-    esplora_client::{
-        BlockingClient as EsploraClient, Builder as EsploraBuilder, Error as EsploraError,
-    },
+    esplora_client::{BlockingClient as EsploraClient, Builder as EsploraBuilder},
 };
+// the client error type is shared by the blocking and the browser async transports, which map it
+// through the same `IndexerError` variant
+#[cfg(any(feature = "esplora", feature = "esplora_async"))]
+use bdk_esplora::esplora_client::Error as EsploraError;
 #[cfg(feature = "_online")]
 use bdk_wallet::Update;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -385,7 +402,7 @@ use schemata::{
     TS_TRANSFER,
 };
 #[cfg(feature = "wallet")]
-use scrypt::{Params, phc::Salt, scrypt};
+use scrypt::{Params, phc::Salt};
 #[cfg(feature = "wallet")]
 use sea_orm::{
     ActiveValue, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult, TryGetError,
@@ -508,8 +525,8 @@ use crate::{
     },
     encryption::{
         decode_hash_hex, decrypt_blob, decrypt_stream, derive_shared, ed25519_from_seed,
-        encrypt_blob, encrypt_to_tempfile, invoice_id, sign_ed25519, solve_pow, transfer_id,
-        verify_ed25519, verifying_key_from_bytes,
+        encrypt_blob, encrypt_to_tempfile, invoice_id, sign_ed25519, transfer_id, verify_ed25519,
+        verifying_key_from_bytes,
     },
     error::IndexerError,
     utils::{

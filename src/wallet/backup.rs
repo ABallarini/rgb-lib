@@ -1,3 +1,7 @@
+// The native helpers stay compiled on wasm so the backup format code has one definition; the
+// public entry points return before reaching them, so they are unreachable there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 use super::*;
 
 const BACKUP_BUFFER_LEN_ENCRYPT: usize = 239; // 255 max, leaving 16 for the checksum
@@ -5,6 +9,18 @@ const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
 const BACKUP_NONCE_LENGTH: usize = 19;
 const BACKUP_VERSION: u8 = 1;
+
+/// Backups need a filesystem for their absolute paths, ZIP archives and temporary directories,
+/// which the browser build does not have. The public entry points report that explicitly instead
+/// of failing deep inside a `std::fs` call or silently writing nothing.
+fn backup_unsupported(operation: &str) -> Error {
+    Error::Internal {
+        details: format!(
+            "{operation} is not supported on wasm32: backups require a filesystem; persist the \
+             wallet with `Wallet::flush` and let the host own any export storage"
+        ),
+    }
+}
 
 pub(crate) struct BackupPaths {
     encrypted: PathBuf,
@@ -78,6 +94,10 @@ pub trait WalletBackup: WalletCore {
         password: &str,
         scrypt_params: Option<ScryptParams>,
     ) -> Result<(), Error> {
+        if cfg!(target_arch = "wasm32") {
+            let _ = (backup_path, password, scrypt_params);
+            return Err(backup_unsupported("a wallet backup"));
+        }
         let txn = self.database().begin_transaction()?;
         let prev_backup_info = self.update_backup_info(&txn, true)?;
         txn.commit()?;
@@ -104,6 +124,10 @@ pub trait WalletBackup: WalletCore {
         password: &str,
         scrypt_params: Option<ScryptParams>,
     ) -> Result<(), Error> {
+        if cfg!(target_arch = "wasm32") {
+            let _ = (backup_path, password, scrypt_params);
+            return Err(backup_unsupported("a wallet backup"));
+        }
         // setup
         info!(self.logger(), "starting backup...");
         let backup_file = PathBuf::from(&backup_path);
@@ -237,6 +261,10 @@ pub trait WalletBackup: WalletCore {
 
 /// Restore a backup from the given file and password to the provided target directory.
 pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Result<(), Error> {
+    if cfg!(target_arch = "wasm32") {
+        let _ = (backup_path, password, target_dir);
+        return Err(backup_unsupported("restoring a wallet backup"));
+    }
     // setup
     fs::create_dir_all(target_dir)?;
     let log_dir = Path::new(&target_dir);
@@ -436,9 +464,11 @@ fn get_cypher_secrets(password: &str, backup_pub_data: &BackupPubData) -> Result
     let salt = Salt::from_b64(&backup_pub_data.salt).map_err(InternalError::from)?;
     let params = backup_pub_data.scrypt_params.clone().try_into()?;
     let mut hash = [0u8; BACKUP_KEY_LENGTH];
-    scrypt(password_bytes, salt.as_ref(), &params, &mut hash).map_err(|_| Error::Internal {
-        details: s!("failed to derive backup encryption key"),
-    })?;
+    crate::executor::cpu_executor()
+        .scrypt(password_bytes, salt.as_ref(), &params, &mut hash)
+        .map_err(|_| Error::Internal {
+            details: s!("failed to derive backup encryption key"),
+        })?;
 
     // get key from password hash
     let key =

@@ -8,6 +8,12 @@
 //! rejects traversal keys, a pre-browser v2 snapshot restores with an empty adapter and multisig
 //! wallets carry their files too. No indexer or network access is involved.
 //!
+//! The native-only legacy paths are pinned too: a plain load leaves `rgb/` untouched, a legacy
+//! RGB store that somehow reaches the adapter is an explicit error, and backup/restore are refused
+//! at the public entry points. The legacy BDK file store is a path-based native store, so its
+//! import is compile-time absent here rather than a runtime error; the multisig hub download cache
+//! needs a real path too and lives behind the native-only online features.
+//!
 //! `bdk_pending.json` is deliberately not exercised here: on wasm, `setup_bdk` skips the
 //! crash-recovery files because the database is the in-memory backend, so a commit and the
 //! snapshot flush are the only persistence steps and there is no window in which the changeset
@@ -16,7 +22,8 @@
 //! The test lives inside the crate, so it compiles against the public API the way a host would use
 //! it: the wallet flush entry point and the persistence functions.
 
-use wasm_bindgen::JsValue;
+use slog::{debug, info};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 use super::*;
@@ -24,9 +31,10 @@ use crate::wallet::persistence::{
     InjectedFailure, delete_snapshot, load_snapshot, save_snapshot, set_injected_failure,
 };
 use crate::{
-    Error,
+    Error, LoggerGuard,
     database::entities::txo::ActiveModel as DbTxoActMod,
     keys::generate_keys,
+    setup_logger,
     wallet::{core::WalletCore, offline::RgbWalletOpsOffline},
 };
 use sea_orm::ActiveValue;
@@ -69,23 +77,7 @@ async fn wallet_lifecycle_over_indexed_db() {
     );
 
     // the offline issuer needs one unspent colored TXO; no indexer takes part
-    wallet
-        .database()
-        .memory_backend()
-        .expect("the wallet runs over the memory backend")
-        .db
-        .set_txo(DbTxoActMod {
-            idx: ActiveValue::NotSet,
-            txid: ActiveValue::Set(
-                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-            ),
-            vout: ActiveValue::Set(0),
-            btc_amount: ActiveValue::Set("1000".to_string()),
-            spent: ActiveValue::Set(false),
-            exists: ActiveValue::Set(true),
-            pending_witness: ActiveValue::Set(false),
-        })
-        .unwrap();
+    add_unspent_colored_txo(&wallet);
 
     let asset = wallet
         .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
@@ -191,6 +183,27 @@ fn memory_wallet() -> (Wallet, SinglesigKeys) {
     )
     .expect("wallet construction over the in-memory backend");
     (wallet, keys)
+}
+
+/// Give the offline issuer one unspent colored TXO. No indexer takes part.
+fn add_unspent_colored_txo(wallet: &Wallet) {
+    wallet
+        .database()
+        .memory_backend()
+        .expect("the wallet runs over the memory backend")
+        .db
+        .set_txo(DbTxoActMod {
+            idx: ActiveValue::NotSet,
+            txid: ActiveValue::Set(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vout: ActiveValue::Set(0),
+            btc_amount: ActiveValue::Set("1000".to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(true),
+            pending_witness: ActiveValue::Set(false),
+        })
+        .unwrap();
 }
 
 /// Turn a snapshot write into a JS promise so two writes can be in flight at once.
@@ -520,6 +533,46 @@ async fn v2_snapshot_restores_with_an_empty_adapter() {
     delete_snapshot(WALLET_ID).await.unwrap();
 }
 
+#[wasm_bindgen_test]
+fn native_legacy_migrations_and_backups_are_refused() {
+    let (wallet, _keys) = memory_wallet();
+
+    // a plain browser wallet load never reads or creates legacy filesystem keys
+    let legacy_dir = WalletPath::new("rgb").unwrap();
+    assert!(wallet.files().list(&legacy_dir).unwrap().is_empty());
+    assert!(!wallet.files().exists(&legacy_dir).unwrap());
+
+    // legacy RGB data that did reach the adapter cannot be imported on wasm: it is an explicit
+    // error, not a silent skip, and the data is left untouched
+    let legacy = WalletPath::new("rgb/stash.dat").unwrap();
+    wallet.files().atomic_write(&legacy, b"legacy").unwrap();
+    let error = crate::database::rgb::migrate_rgb_fs_to_db(
+        wallet.files(),
+        wallet.wallet_dir(),
+        wallet.database(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Internal { details } if details.contains("rgb_fs_store_migration")
+    ));
+    assert_eq!(wallet.files().read(&legacy).unwrap(), b"legacy");
+
+    // backups need a filesystem and are refused at the public entry points
+    let error = wallet
+        .backup("wallet.rgb-lib_backup", "password")
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Internal { details } if details.contains("not supported on wasm32")
+    ));
+    let error = restore_backup("wallet.rgb-lib_backup", "password", "restore").unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Internal { details } if details.contains("not supported on wasm32")
+    ));
+}
+
 fn multisig_keys() -> MultisigKeys {
     let keys_1 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let keys_2 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
@@ -561,4 +614,249 @@ async fn multisig_browser_files_survive_restore() {
     assert_eq!(restored.files().read(&media).unwrap(), b"multisig media");
 
     delete_snapshot(WALLET_ID).await.unwrap();
+}
+
+/// Wallet construction and offline issuance complete on the browser main thread with no thread and
+/// no worker: `std::thread::spawn` panics on wasm32-unknown-unknown, so reaching the assertions is
+/// part of the proof. `globalThis.Worker` is replaced with a thrower first, so code that tried to
+/// offload the work to a browser worker would fail here instead of passing silently.
+#[wasm_bindgen_test]
+fn wallet_creation_and_issuance_need_no_worker() {
+    let global = js_sys::global();
+    let worker = JsValue::from_str("Worker");
+    let saved = js_sys::Reflect::get(&global, &worker).expect("read globalThis.Worker");
+    assert!(!saved.is_undefined(), "the browser provides Worker");
+
+    let thrower = js_sys::Function::new_no_args(
+        "throw new Error('wallet work constructed a browser Worker')",
+    );
+    assert!(
+        js_sys::Reflect::set(&global, &worker, thrower.as_ref()).expect("poison globalThis.Worker"),
+        "globalThis.Worker is writable"
+    );
+
+    let (mut wallet, _) = memory_wallet();
+    add_unspent_colored_txo(&wallet);
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .expect("offline issuance needs no worker or thread");
+
+    js_sys::Reflect::set(&global, &worker, &saved).expect("restore globalThis.Worker");
+    assert!(!asset.asset_id.is_empty());
+}
+
+/// The default CPU executor runs expensive work inline, on the browser's only thread, and needs no
+/// Worker. A binding may install a worker-backed executor later; until then a poisoned
+/// `globalThis.Worker` must not be touched.
+#[wasm_bindgen_test]
+fn default_cpu_executor_runs_inline_without_a_worker() {
+    use scrypt::Params;
+
+    let global = js_sys::global();
+    let worker = JsValue::from_str("Worker");
+    let saved = js_sys::Reflect::get(&global, &worker).expect("read globalThis.Worker");
+    let thrower =
+        js_sys::Function::new_no_args("throw new Error('CPU work constructed a browser Worker')");
+    assert!(
+        js_sys::Reflect::set(&global, &worker, thrower.as_ref()).expect("poison globalThis.Worker"),
+        "globalThis.Worker is writable"
+    );
+
+    // cheap params keep the test fast; the point is that the call completes inline
+    let params = Params::new(4, 1, 1).expect("valid params");
+    let mut actual = [0u8; 32];
+    crate::executor::cpu_executor()
+        .scrypt(b"password", b"salt", &params, &mut actual)
+        .expect("inline scrypt");
+    let mut expected = [0u8; 32];
+    scrypt::scrypt(b"password", b"salt", &params, &mut expected).expect("reference scrypt");
+
+    js_sys::Reflect::set(&global, &worker, &saved).expect("restore globalThis.Worker");
+    assert_eq!(actual, expected);
+}
+
+/// Pins the wasm logger: a discard drain with a zero-sized guard, so no `slog-async` worker or
+/// any other thread is spawned. `std::thread::spawn` panics on wasm32-unknown-unknown, so
+/// construction succeeding without a directory is the thread-free proof; the guard size pins that
+/// no worker handle is carried. Records are formatted and discarded, so a secret-bearing call
+/// cannot reach a file, the console or the DOM.
+#[wasm_bindgen_test]
+fn wasm_logger_discards_without_a_thread_or_a_file() {
+    let dir = "wasm-logger-must-not-exist";
+    let (logger, guard) = setup_logger(dir, Some("wallet_log")).expect("wasm logger construction");
+    // a `slog_async::AsyncGuard` owns the worker handle; this guard is a unit struct
+    assert_eq!(std::mem::size_of::<LoggerGuard>(), 0);
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    // the secret itself never reaches a log statement; the drain would drop it anyway
+    info!(logger, "wallet created"; "mnemonic_len" => keys.mnemonic.len());
+    debug!(logger, "signing"; "xprv" => "test-only-not-a-key");
+    drop(guard);
+
+    assert!(!std::path::Path::new(dir).exists());
+}
+
+/// Earliest timestamp the tests accept as "a real clock was read": 2023-11-14, well before any
+/// browser running the suite and well after the 1970 epoch a missing clock would fall back to.
+const SANE_EPOCH_SECS: i64 = 1_700_000_000;
+/// Generous allowance between the wallet clock and the browser clock, so a slow CI runner with a
+/// coarse `Date.now` granularity cannot fail the test.
+const CLOCK_TOLERANCE_SECS: i64 = 300;
+
+fn browser_now_secs() -> i64 {
+    (js_sys::Date::now() / 1000.0) as i64
+}
+
+/// Pins the browser clock: `utils::now` reads `time`'s `wasm-bindgen` shim (`js_sys::Date`), so it
+/// must agree with the browser's own clock. The old `SystemTime::now` path panics on
+/// wasm32-unknown-unknown, so reaching the assertions at all is part of the proof.
+#[wasm_bindgen_test]
+fn browser_clock_matches_the_wallet_clock() {
+    let wallet_now = crate::utils::now().unix_timestamp();
+    let browser_now = browser_now_secs();
+
+    assert!(
+        wallet_now > SANE_EPOCH_SECS,
+        "the wallet clock is not set: {wallet_now}"
+    );
+    assert!(
+        (wallet_now - browser_now).abs() <= CLOCK_TOLERANCE_SECS,
+        "the wallet clock {wallet_now} disagrees with the browser clock {browser_now}"
+    );
+
+    // a second read never goes backwards: issuance and transfer timestamps are only compared for
+    // ordering, so monotonic-enough is all the API needs
+    let later = crate::utils::now().unix_timestamp();
+    assert!(later >= wallet_now, "the wallet clock went backwards");
+}
+
+/// Pins the randomness behind key generation: `getrandom`'s `js`/`wasm_js` backends call
+/// `crypto.getRandomValues`, so the browser realm must expose it, and two fresh key sets drawn
+/// through `bip39`/`rand` must differ and round trip through `restore_keys`.
+#[wasm_bindgen_test]
+fn fresh_keys_are_distinct_and_round_trip() {
+    let crypto = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("crypto"))
+        .expect("globalThis.crypto is missing");
+    let get_random_values =
+        js_sys::Reflect::get(&crypto, &JsValue::from_str("getRandomValues")).unwrap_or_default();
+    assert!(
+        get_random_values.is_function(),
+        "the browser CSPRNG behind getrandom is missing"
+    );
+
+    let first = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let second = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+
+    assert_eq!(first.mnemonic.split_whitespace().count(), 12);
+    // no secrets in the assertion messages: a failing run must not print key material
+    assert!(
+        first.mnemonic != second.mnemonic,
+        "two fresh mnemonics are identical"
+    );
+    assert!(
+        first.account_xpub_vanilla != second.account_xpub_vanilla,
+        "two fresh account keys are identical"
+    );
+    assert!(
+        first.account_xpub_colored != first.account_xpub_vanilla,
+        "the vanilla and colored account keys were derived identically"
+    );
+
+    let restored = crate::keys::restore_keys(
+        BitcoinNetwork::Regtest,
+        first.mnemonic.clone(),
+        WitnessVersion::Taproot,
+    )
+    .expect("a freshly generated mnemonic parses back");
+    assert!(restored.mnemonic == first.mnemonic);
+    assert!(restored.account_xpub_vanilla == first.account_xpub_vanilla);
+    assert!(restored.account_xpub_colored == first.account_xpub_colored);
+    assert!(restored.master_fingerprint == first.master_fingerprint);
+
+    // the raw CSPRNG behind the online Ed25519 keys is the same browser source
+    let sk_a = crate::encryption::gen_ed25519();
+    let sk_b = crate::encryption::gen_ed25519();
+    assert!(
+        sk_a.to_bytes() != sk_b.to_bytes(),
+        "two fresh signing keys are identical"
+    );
+}
+
+/// Pins the clock the RGB genesis timestamp comes from: `rgb-ops` stamps
+/// `valid_contract.genesis.timestamp` with `chrono::Utc::now()`, whose `wasmbind` feature (on by
+/// default) routes to `js_sys::Date` in the browser. Issuance therefore has to produce sane,
+/// ordered timestamps, and the wallet snapshot has to carry them through a restore unchanged.
+#[wasm_bindgen_test]
+fn asset_genesis_timestamps_are_sane_and_survive_restore() {
+    let (mut wallet, keys) = memory_wallet();
+
+    // two unspent colored TXOs so both issuances have somewhere to land
+    for vout in 0..2 {
+        wallet
+            .database()
+            .memory_backend()
+            .expect("the wallet runs over the memory backend")
+            .db
+            .set_txo(DbTxoActMod {
+                idx: ActiveValue::NotSet,
+                txid: ActiveValue::Set(
+                    "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                ),
+                vout: ActiveValue::Set(vout),
+                btc_amount: ActiveValue::Set("1000".to_string()),
+                spent: ActiveValue::Set(false),
+                exists: ActiveValue::Set(true),
+                pending_witness: ActiveValue::Set(false),
+            })
+            .unwrap();
+    }
+
+    let first = wallet
+        .issue_asset_nia("AAA".to_string(), "First".to_string(), 0, vec![100])
+        .expect("first offline issuance");
+    let second = wallet
+        .issue_asset_nia("BBB".to_string(), "Second".to_string(), 0, vec![100])
+        .expect("second offline issuance");
+
+    let browser_now = browser_now_secs();
+    for (label, asset) in [("first", &first), ("second", &second)] {
+        assert!(
+            asset.timestamp > SANE_EPOCH_SECS,
+            "the {label} genesis timestamp is not set: {}",
+            asset.timestamp
+        );
+        assert!(
+            (asset.timestamp - browser_now).abs() <= CLOCK_TOLERANCE_SECS,
+            "the {label} genesis timestamp {} disagrees with the browser clock {browser_now}",
+            asset.timestamp
+        );
+        assert!(
+            (asset.added_at - browser_now).abs() <= CLOCK_TOLERANCE_SECS,
+            "the {label} import timestamp {} disagrees with the browser clock {browser_now}",
+            asset.added_at
+        );
+    }
+    assert!(
+        second.timestamp >= first.timestamp,
+        "issuance timestamps went backwards"
+    );
+
+    let snapshot = wallet
+        .snapshot()
+        .unwrap()
+        .expect("the memory wallet snapshots");
+    let restored = Wallet::from_snapshot(&snapshot, wallet_data(), keys).expect("wallet restore");
+    let assets = restored
+        .list_assets(vec![])
+        .unwrap()
+        .nia
+        .unwrap_or_default();
+    for asset in [&first, &second] {
+        let restored_asset = assets
+            .iter()
+            .find(|a| a.asset_id == asset.asset_id)
+            .expect("the issued asset is missing after the restore");
+        assert_eq!(restored_asset.timestamp, asset.timestamp);
+        assert_eq!(restored_asset.added_at, asset.added_at);
+    }
 }
