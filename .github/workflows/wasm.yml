@@ -9,7 +9,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so the packaging job is reproducible; keep it in step with the local gate docs.
+  WASM_PACK_VERSION: "0.15.0"
 
+# Every job here is required: no `continue-on-error`, no default-skipped job. The native jobs live
+# in build.yml, lint.yml, format.yml and test.yml and are unchanged by this workflow.
 jobs:
   wasm_wallet_less:
     timeout-minutes: 30
@@ -23,14 +27,44 @@ jobs:
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - name: Check wallet-less build for wasm32
-        run: cargo check --lib --target wasm32-unknown-unknown --no-default-features
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          cargo check --lib --target wasm32-unknown-unknown --no-default-features 2>&1 \
+            | tee "${RUNNER_TEMP}/wasm-logs/wallet-less-check.log"
+      # The wallet compile is required here: clippy type-checks the full wasm wallet graph and
+      # `-D warnings` makes a warning fail the job.
       - name: Clippy the wasm wallet build
-        run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wallet -- -D warnings
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wallet -- -D warnings 2>&1 \
+            | tee "${RUNNER_TEMP}/wasm-logs/wallet-clippy.log"
+      # Resolved graph and wasm artifact: fails on mio, native SQLite, ring, native TLS,
+      # blocking HTTP, Tokio, hyper or a native socket indexer; the self-test proves detection.
+      - name: Check the wasm dependency graph and binary
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          {
+            bash scripts/wasm_graph_check.sh --self-test
+            bash scripts/wasm_graph_check.sh
+          } 2>&1 | tee "${RUNNER_TEMP}/wasm-logs/graph-check.log"
+      - name: Upload logs and wasm artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-wallet-less-failure
+          path: |
+            ${{ runner.temp }}/wasm-logs
+            target/wasm32-unknown-unknown/release/*.wasm
+          if-no-files-found: warn
 
   # Required browser proof: the wallet lifecycle test creates a wallet over the in-memory backend,
   # snapshots it, persists the snapshot in IndexedDB, restores the wallet from the stored bytes and
   # checks the state survived. It needs a real browser, so it cannot run in the local gate
-  # (`scripts/wasm_gate.sh`), which stops at the compile checks.
+  # (`scripts/wasm_gate.sh`), which stops at the compile checks. The job also compiles the opt-in
+  # regtest Esplora smoke test, which returns early without `RGB_REGTEST_ESPLORA_URL`.
   wasm_browser_lifecycle:
     timeout-minutes: 30
     runs-on: ubuntu-latest
@@ -51,4 +85,72 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           WASM_BINDGEN_TEST_TIMEOUT: 300
-        run: cargo test --lib --target wasm32-unknown-unknown --no-default-features --features wallet
+        # `esplora_async` compiles the opt-in online smoke test; with no regtest URL baked in it
+        # returns early, so this job stays network-free.
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          cargo test --lib --target wasm32-unknown-unknown --no-default-features --features wallet,esplora_async 2>&1 \
+            | tee "${RUNNER_TEMP}/wasm-logs/browser-lifecycle.log"
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-browser-lifecycle-failure
+          path: ${{ runner.temp }}/wasm-logs
+          if-no-files-found: warn
+
+  # Required packaging proof: the in-repository bindings crate must build both generated packages
+  # and pass the Node smoke against the `nodejs` one. A packaging break (Cargo.toml, wasm-bindgen
+  # version, exported API) fails here instead of surfacing in a consumer.
+  #
+  # The `pkg` web package is uploaded on success as the consumable artifact. A headless-Chrome run
+  # of `bindings/wasm/demo` is deliberately not added: the demo needs a browser driver and a static
+  # server, i.e. a new harness, and the IndexedDB `load()`/`flush()` path it exercises is already
+  # proven by `wasm_browser_lifecycle`. See `bindings/wasm/README.md` and S41 in WASM_PROGRESS.md.
+  wasm_bindings:
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Setup rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version "$WASM_PACK_VERSION" --locked
+      - name: Build the browser package
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          wasm-pack build bindings/wasm --target web --out-dir pkg 2>&1 \
+            | tee "${RUNNER_TEMP}/wasm-logs/build-web.log"
+      - name: Build the Node package
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          wasm-pack build bindings/wasm --target nodejs --out-dir pkg-node 2>&1 \
+            | tee "${RUNNER_TEMP}/wasm-logs/build-node.log"
+      - name: Run the Node smoke test
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
+          node bindings/wasm/smoke/smoke.cjs 2>&1 | tee "${RUNNER_TEMP}/wasm-logs/smoke-node.log"
+      - name: Upload the generated browser package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rgb-lib-wasm-web-pkg
+          path: bindings/wasm/pkg
+          if-no-files-found: error
+      - name: Upload logs and generated packages on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-bindings-failure
+          path: |
+            ${{ runner.temp }}/wasm-logs
+            bindings/wasm/pkg
+            bindings/wasm/pkg-node
+          if-no-files-found: warn

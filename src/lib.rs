@@ -145,7 +145,12 @@ compile_error!(
      enabled on wasm32: use `esplora_async` for the browser transport"
 );
 
-#[cfg(feature = "_online")]
+// the proxy protocol definitions and its browser fetch client also compile on wasm32, where the
+// native blocking indexers (and `_online`) are not available
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) mod api;
 #[cfg(test)]
 #[macro_use]

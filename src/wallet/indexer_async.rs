@@ -9,14 +9,19 @@
 //! Nothing here is wired into the wallet yet: the sync path and the resolver come next. Building a
 //! transport only constructs the HTTP client and never contacts the server.
 
-use std::{cmp::Ordering, future::Future, pin::Pin, str::FromStr, time::Duration};
+use std::{cmp::Ordering, future::Future, num::NonZeroU32, pin::Pin, str::FromStr, time::Duration};
 
-use bdk_esplora::esplora_client::{AsyncClient, Builder as EsploraAsyncBuilder, Sleeper};
+use bdk_esplora::esplora_client::{
+    AsyncClient, Builder as EsploraAsyncBuilder, Sleeper, Tx as EsploraTx,
+};
 use js_sys::Promise;
+use rgbstd::bitcoin::constants::ChainHash;
+use rgbstd::vm::WitnessPos;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::{error::IndexerError, utils::INDEXER_RETRIES};
 
+use super::resolver_async::AsyncChainResolver;
 use super::*;
 
 /// Browser timer for the client's retry backoff.
@@ -140,6 +145,34 @@ impl EsploraTransport {
             .map_err(IndexerError::from)?)
     }
 
+    /// TX ID at `index` in the block with `block_hash`, or `None` if the index is out of range.
+    /// Lets a caller name a TX without a separate API lookup.
+    pub(crate) async fn get_txid_at_block_index(
+        &self,
+        block_hash: &crate::bitcoin::BlockHash,
+        index: usize,
+    ) -> Result<Option<Txid>, IndexerError> {
+        Ok(self
+            .client
+            .get_txid_at_block_index(block_hash, index)
+            .await?)
+    }
+
+    /// Transaction info (transaction plus its confirmation status), or `None` if the indexer doesn't
+    /// know it: the async shape of the blocking resolver's `get_tx_info`.
+    pub(crate) async fn get_tx_info(&self, txid: &Txid) -> Result<Option<EsploraTx>, IndexerError> {
+        Ok(self.client.get_tx_info(txid).await?)
+    }
+
+    /// Header of the block with `block_hash`, the second half of the blocking resolver's
+    /// height-to-header lookup.
+    pub(crate) async fn get_header_by_hash(
+        &self,
+        block_hash: &crate::bitcoin::BlockHash,
+    ) -> Result<crate::bitcoin::block::Header, IndexerError> {
+        Ok(self.client.get_header_by_hash(block_hash).await?)
+    }
+
     /// Confirmations of a transaction: `Some(0)` in the mempool, `None` if unknown, `u64::MAX` for
     /// the genesis coinbase, with the same tip consistency check as the blocking path.
     pub(crate) async fn get_tx_confirmations(&self, txid: &str) -> Result<Option<u64>, Error> {
@@ -180,6 +213,99 @@ impl EsploraTransport {
 const _: () = {
     let _: Option<AsyncClient<BrowserSleeper>> = None;
     let _: fn(&str) -> Result<EsploraTransport, IndexerError> = EsploraTransport::new;
+};
+
+/// The browser [`AsyncChainResolver`]: the async counterpart of the blocking Esplora resolver.
+///
+/// It mirrors `rgb-ops`'s blocking Esplora resolver response for response, so validation sees the
+/// same `WitnessStatus` and headers whichever transport fetched them. The HTTP client keeps its
+/// own retry policy (`INDEXER_RETRIES`) for transport failures; [`PrefetchedChain`] itself asks
+/// each question once and does not retry.
+///
+/// Not wired into the online wallet flow yet: building it and calling the methods is all this
+/// step proves, and the wallet sync path moves over in a later step.
+///
+/// [`PrefetchedChain`]: super::resolver_async::PrefetchedChain
+#[allow(dead_code)] // only the compile-time proof below and the next step use it
+pub(crate) struct EsploraResolver {
+    transport: EsploraTransport,
+}
+
+#[allow(dead_code)]
+impl EsploraResolver {
+    /// Wrap a transport; constructing it contacts no server.
+    pub(crate) fn new(transport: EsploraTransport) -> Self {
+        Self { transport }
+    }
+}
+
+#[allow(dead_code)]
+impl AsyncChainResolver for EsploraResolver {
+    async fn resolve_witness(
+        &self,
+        witness_id: RgbTxid,
+    ) -> Result<WitnessStatus, WitnessResolverError> {
+        let Some(tx_info) =
+            self.transport.get_tx_info(&witness_id).await.map_err(|e| {
+                WitnessResolverError::ResolverIssue(Some(witness_id), e.to_string())
+            })?
+        else {
+            return Ok(WitnessStatus::Unresolved);
+        };
+        let ord = match (tx_info.status.block_height, tx_info.status.block_time) {
+            (Some(height), Some(time)) => {
+                let height =
+                    NonZeroU32::new(height).ok_or(WitnessResolverError::InvalidResolverData)?;
+                let time =
+                    i64::try_from(time).map_err(|_| WitnessResolverError::InvalidResolverData)?;
+                WitnessOrd::Mined(
+                    WitnessPos::bitcoin(height, time)
+                        .ok_or(WitnessResolverError::InvalidResolverData)?,
+                )
+            }
+            _ => WitnessOrd::Tentative,
+        };
+        Ok(WitnessStatus::Resolved(tx_info.to_tx(), ord))
+    }
+
+    async fn get_block_header(
+        &self,
+        height: NonZeroU32,
+    ) -> Result<crate::bitcoin::block::Header, WitnessResolverError> {
+        // esplora has no height-keyed header endpoint: resolve the height to the hash of the block
+        // occupying it in the best chain first, exactly like the blocking resolver
+        let block_hash = self
+            .transport
+            .block_hash(height.get() as usize)
+            .await
+            .map_err(|e| WitnessResolverError::ResolverIssue(None, e.to_string()))?;
+        let block_hash = crate::bitcoin::BlockHash::from_str(&block_hash)
+            .map_err(|_| WitnessResolverError::InvalidResolverData)?;
+        self.transport
+            .get_header_by_hash(&block_hash)
+            .await
+            .map_err(|e| WitnessResolverError::ResolverIssue(None, e.to_string()))
+    }
+
+    async fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
+        let block_hash = self
+            .transport
+            .block_hash(0)
+            .await
+            .map_err(|e| WitnessResolverError::ResolverIssue(None, e.to_string()))?;
+        let block_hash = crate::bitcoin::BlockHash::from_str(&block_hash)
+            .map_err(|_| WitnessResolverError::InvalidResolverData)?;
+        if chain_net.chain_hash() != ChainHash::from_genesis_block_hash(block_hash) {
+            return Err(WitnessResolverError::WrongChainNet);
+        }
+        Ok(())
+    }
+}
+
+// Compile-time proof that the browser adapter plugs into the unchanged boundary trait.
+const _: () = {
+    const fn assert_async_resolver<R: AsyncChainResolver>() {}
+    assert_async_resolver::<EsploraResolver>();
 };
 
 #[cfg(test)]

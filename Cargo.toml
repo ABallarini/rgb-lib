@@ -139,6 +139,20 @@ getrandom_03 = { package = "getrandom", version = "=0.3.4", optional = true, def
 getrandom_04 = { package = "getrandom", version = "=0.4.3", optional = true, default-features = false, features = [
     "wasm_js",
 ] }
+# Browser proxy transport: the same `reqwest` 0.12 already in the wasm graph through
+# `esplora-client` (pinned by Cargo.lock), reused for the RGB proxy JSON-RPC client instead of a
+# second HTTP stack. Only the `fetch` backend is compiled, so no TLS or socket crate enters the
+# graph; `multipart` is needed for the consignment/media/ack uploads. The alias keeps it apart from
+# the crate's own native blocking `reqwest` 0.13.
+reqwest_fetch = { package = "reqwest", version = "=0.12.28", optional = true, default-features = false, features = [
+    "json",
+    "multipart",
+] }
+# Same MIME guess the native `multipart::Part::file` performs on the uploaded path, reused on the
+# browser path (which has bytes and a file name, not a path), so a consignment/media upload carries
+# the same part `Content-Type` on both transports. Already a package in Cargo.lock through
+# `reqwest`'s `multipart` feature; this only adds the direct reference.
+mime_guess = { version = "2.0.5", optional = true }
 # IndexedDB persistence for the wasm32 wallet. Optional and enabled by `wallet`, so the native
 # dependency graph stays free of the browser crates and the wallet-less wasm build stays free of
 # them too. Only the web-sys features the snapshot store uses are enabled.
@@ -285,7 +299,7 @@ esplora = [
 # browser Esplora transport: async `esplora-client` over `fetch`, wasm32 only (on other targets it
 # enables no transport, and the blocking `esplora` feature stays the native one). Deliberately not
 # `_online`: the wasm sync path is wired separately from the native online paths.
-esplora_async = ["wallet", "bdk_esplora"]
+esplora_async = ["wallet", "bdk_esplora", "dep:reqwest_fetch", "dep:mime_guess"]
 camel_case = []
 
 [profile.release]
