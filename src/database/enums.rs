@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(feature = "wallet")]
+use rgbstd::validation::SchemaRules;
+
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_UDA: &str =
@@ -96,7 +99,7 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(feature = "wallet")]
     pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),

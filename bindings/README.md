@@ -2,7 +2,7 @@
 
 Bindings for other languages are generated using either [uniffi] or [c-ffi].
 
-See each project's documentation for more details.
+See each project's documentation for more details. For the browser package, see [docs/wasm.md](../docs/wasm.md).
 
 ## Official
 

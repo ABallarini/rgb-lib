@@ -16,7 +16,9 @@ pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 /// Where the legacy filesystem RGB store is moved to be deleted, once migrated into the DB, so
 /// that retiring it is atomic. Only ever on disk between that rename and the delete: a crash in
 /// between leaves this dir, which the next wallet open sweeps up and every backup skips.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) const RGB_RUNTIME_DELETING_DIR: &str = "rgb.deleting";
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) const LOG_FILE: &str = "log";
 
 /// Size cap for a strict-encoded fascia file, matching what rgb-ops uses for its own containers.
@@ -913,6 +915,7 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
 
 /// wasm: there is no filesystem to write a log file to, so callers get a discard logger.
 #[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn setup_logger<P: AsRef<Path>>(
     _log_path: P,
     _log_name: Option<&str>,

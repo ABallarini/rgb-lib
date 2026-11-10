@@ -390,9 +390,7 @@ use rgbstd::{
     contract::FilterIncludeAll,
     daggy::Walker,
     indexers::AnyResolver,
-    validation::{
-        OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Validity, Warning,
-    },
+    validation::{OpoutsDagData, ValidationConfig, ValidationError, Validity, Warning},
 };
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
@@ -449,13 +447,13 @@ use strict_encoding::{DeserializeError, StrictDeserialize};
 use strict_encoding::{StrictDecode, StrictEncode};
 #[cfg(feature = "wallet")]
 use strict_types::{TypeLib, TypeLibId};
-#[cfg(feature = "wallet")]
+#[cfg(all(feature = "wallet", test, not(target_arch = "wasm32")))]
 use tempfile::TempDir;
 #[cfg(feature = "wallet")]
 use time::OffsetDateTime;
 #[cfg(feature = "_online")]
 use url::Url;
-#[cfg(feature = "wallet")]
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use walkdir::WalkDir;
 #[cfg(feature = "_online")]
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
@@ -555,17 +553,22 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
-        RGB_RUNTIME_DELETING_DIR, RgbStock, beneficiary_from_script_buf,
-        from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
-        get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex,
-        now, parse_address_str, read_fascia, setup_logger, str_to_xpub,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LoggerGuard, PURPOSE, RgbStock,
+        beneficiary_from_script_buf, from_str_or_number_mandatory, from_str_or_number_optional,
+        get_account_xpubs, get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes,
+        hash_bytes_hex, now, parse_address_str, read_fascia, str_to_xpub,
     },
     wallet::{
         AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
         WalletDescriptors,
     },
 };
+// native file backups skip the log file and the retired legacy RGB store; wasm has neither
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use crate::utils::{LOG_FILE, RGB_RUNTIME_DELETING_DIR};
+// the wasm logger is a no-op for the wallet, but the browser tests still construct one
+#[cfg(any(not(target_arch = "wasm32"), test))]
+pub(crate) use crate::utils::setup_logger;
 // The SQLite-only tables are not touched by the in-memory backend the wasm build uses.
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::database::entities::{

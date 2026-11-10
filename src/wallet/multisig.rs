@@ -13,6 +13,13 @@ const HUB_OPS_DIR: &str = "hub_ops";
 const NUMS_TPUB_TESTNET: &str = "tpubD6NzVbkrYhZ4WLczPJWReQycCJdd6YVWXubbVUFnJ5KgU5MDQrD998ZJLSmaB7GVcCnJSDWprxmrGkJ6SvgQC6QAffVpqSvonXmeizXcrkN";
 const NUMS_XPUB_MAINNET: &str = "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6QgnecKFpJFPpdzxKrwoaZoV44qAJewsc4kX9vGaCaBExuvJH57";
 
+/// Wallet identity derived from the descriptors: a multisig group has several cosigners and no
+/// single master fingerprint.
+fn wallet_id(descriptors: &WalletDescriptors) -> String {
+    hash_bytes_hex(format!("{}|{}", descriptors.colored, descriptors.vanilla).as_bytes())[..8]
+        .to_string()
+}
+
 /// A cosigner for the multisig wallet setup.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -243,7 +250,20 @@ impl WalletCore for MultisigWallet {
     }
 }
 
-impl WalletBackup for MultisigWallet {}
+impl WalletBackup for MultisigWallet {
+    #[cfg(target_arch = "wasm32")]
+    fn backup_bytes_impl(&self, password: &str) -> Result<Vec<u8>, Error> {
+        let snapshot = self.snapshot()?.ok_or_else(|| Error::Internal {
+            details: "the wallet runs without a snapshot-capable backend".to_string(),
+        })?;
+        crate::wallet::backup::wasm_backup_bytes(
+            &self.get_wallet_id(),
+            snapshot,
+            password,
+            self.logger(),
+        )
+    }
+}
 
 impl WalletOffline for MultisigWallet {
     #[cfg(feature = "_online")]
@@ -1071,9 +1091,7 @@ impl MultisigWallet {
         let descs = keys.build_descriptors(wdata.bitcoin_network)?;
 
         // wallet directory and file logging setup
-        let fingerprint = hash_bytes_hex(format!("{}|{}", descs.colored, descs.vanilla).as_bytes())
-            [..8]
-            .to_string();
+        let fingerprint = wallet_id(&descs);
         let (wallet_dir, logger, _logger_guard) = setup_new_wallet(&wallet_data, &fingerprint)?;
         // one adapter per wallet, rooted exactly at the wallet directory
         let files = default_files(wallet_dir.clone());
@@ -1214,6 +1232,23 @@ impl MultisigWallet {
         self.keys
             .build_descriptors(self.internals.wallet_data.bitcoin_network)
             .expect("already succeeded at wallet creation")
+    }
+
+    /// Return the wallet identity: the descriptor-derived id also used as the wallet directory.
+    pub fn get_wallet_id(&self) -> String {
+        wallet_id(&self.get_descriptors())
+    }
+
+    /// Return the address at `index` of the vanilla receive descriptor.
+    ///
+    /// [`MultisigWallet::get_address`] asks the hub for the next index shared by every cosigner, so
+    /// it only exists natively. A hub-free wallet derives the same address deterministically from
+    /// its descriptors; this neither reveals nor persists the index.
+    pub fn peek_address(&self, index: u32) -> String {
+        self.bdk_wallet()
+            .peek_address(KeychainKind::Internal, index)
+            .address
+            .to_string()
     }
 
     fn get_local_last_processed_operation_idx_impl(&self, txn: &DbTxn) -> Result<i32, Error> {

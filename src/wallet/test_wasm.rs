@@ -12,10 +12,11 @@
 //! wallets carry their files too. No indexer or network access is involved.
 //!
 //! The native-only legacy paths are pinned too: a plain load leaves `rgb/` untouched, a legacy
-//! RGB store that somehow reaches the adapter is an explicit error, and backup/restore are refused
-//! at the public entry points. The legacy BDK file store is a path-based native store, so its
-//! import is compile-time absent here rather than a runtime error; the multisig hub download cache
-//! needs a real path too and lives behind the native-only online features.
+//! RGB store that somehow reaches the adapter is an explicit error, the filesystem backup entry
+//! points still require a path, and the byte backup/restore/info path works without a filesystem.
+//! The legacy BDK file store is a path-based native store, so its import is compile-time absent
+//! here rather than a runtime error; the multisig hub download cache needs a real path too and
+//! lives behind the native-only online features.
 //!
 //! `bdk_pending.json` is deliberately not exercised here: on wasm, `setup_bdk` skips the
 //! crash-recovery files because the database is the in-memory backend, so a commit and the
@@ -616,8 +617,8 @@ async fn v2_snapshot_restores_with_an_empty_adapter() {
 }
 
 #[wasm_bindgen_test]
-fn native_legacy_migrations_and_backups_are_refused() {
-    let (wallet, _keys) = memory_wallet();
+fn native_legacy_migrations_are_refused_and_byte_backups_work() {
+    let (wallet, keys) = memory_wallet();
 
     // a plain browser wallet load never reads or creates legacy filesystem keys
     let legacy_dir = WalletPath::new("rgb").unwrap();
@@ -640,7 +641,7 @@ fn native_legacy_migrations_and_backups_are_refused() {
     ));
     assert_eq!(wallet.files().read(&legacy).unwrap(), b"legacy");
 
-    // backups need a filesystem and are refused at the public entry points
+    // the filesystem entry points take paths and stay native-only
     let error = wallet
         .backup("wallet.rgb-lib_backup", "password")
         .unwrap_err();
@@ -652,6 +653,23 @@ fn native_legacy_migrations_and_backups_are_refused() {
     assert!(matches!(
         &error,
         Error::Internal { details } if details.contains("not supported on wasm32")
+    ));
+
+    // the byte path needs no filesystem: backup, public info and restore through the snapshot
+    let backup = wallet.backup_bytes("password").unwrap();
+    let info = backup_info_bytes(&backup).unwrap();
+    assert_eq!(info.version, 1);
+    let restored = restore_backup_bytes(&backup, "password").unwrap();
+    assert_eq!(restored.fingerprint(), keys.master_fingerprint);
+    let snapshot = restored.wallet_snapshot().unwrap();
+    let rebuilt = Wallet::from_snapshot(&snapshot, wallet.get_wallet_data(), keys).unwrap();
+    assert_eq!(
+        rebuilt.get_keys().master_fingerprint,
+        wallet.get_keys().master_fingerprint
+    );
+    assert!(matches!(
+        restore_backup_bytes(&backup, "wrong password"),
+        Err(Error::WrongPassword)
     ));
 }
 

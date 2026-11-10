@@ -113,7 +113,20 @@ impl WalletCore for Wallet {
     }
 }
 
-impl WalletBackup for Wallet {}
+impl WalletBackup for Wallet {
+    #[cfg(target_arch = "wasm32")]
+    fn backup_bytes_impl(&self, password: &str) -> Result<Vec<u8>, Error> {
+        let snapshot = self.snapshot()?.ok_or_else(|| Error::Internal {
+            details: "the wallet runs without a snapshot-capable backend".to_string(),
+        })?;
+        crate::wallet::backup::wasm_backup_bytes(
+            &self.keys.master_fingerprint,
+            snapshot,
+            password,
+            self.logger(),
+        )
+    }
+}
 
 impl WalletOffline for Wallet {}
 
@@ -314,6 +327,16 @@ impl Wallet {
             keys,
             signers,
         })
+    }
+
+    /// Create an encrypted backup of the wallet and return its bytes.
+    ///
+    /// No filesystem is touched, so this works on every target. The archive and encryption format
+    /// is the one of [`backup`](crate::wallet::RgbWalletOpsOffline::backup): an outer ZIP with the
+    /// public scrypt parameters and nonce next to the XChaCha20Poly1305-encrypted wallet state.
+    /// The password is used only to derive the key and is never stored.
+    pub fn backup_bytes(&self, password: &str) -> Result<Vec<u8>, Error> {
+        <Self as WalletBackup>::backup_bytes(self, password)
     }
 
     /// Serialize the wallet state when the wallet runs over the in-memory backend.
