@@ -33,4 +33,6 @@ _run cargo check --lib --no-default-features --features wallet,sqlite
 _run cargo test --lib --no-default-features --features wallet,sqlite
 _run cargo check --lib --target wasm32-unknown-unknown --no-default-features
 _run_deny_warnings cargo check --lib --target wasm32-unknown-unknown --no-default-features --features wallet
+# browser Esplora capability: async client over fetch, no blocking socket/TLS in the graph
+_run_deny_warnings cargo check --lib --target wasm32-unknown-unknown --no-default-features --features wallet,esplora_async
 _run cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wallet -- -D warnings

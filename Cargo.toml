@@ -30,9 +30,6 @@ bdk_bitcoind_rpc = { version = "0.22.1", optional = true, default-features = fal
 bdk_electrum = { version = "0.24.1", optional = true, default-features = false, features = [
     "use-rustls",
 ] }
-bdk_esplora = { version = "0.22.3", optional = true, default-features = false, features = [
-    "blocking-https-rustls",
-] }
 chacha20poly1305 = { version = "0.11.0", optional = true, default-features = false, features = [
     "alloc",
 ] }
@@ -101,6 +98,9 @@ rgb-strict-types = { version = "1.0.6", default-features = false }
 # in-memory backend, so these cannot appear in its dependency graph (mio, libsqlite3-sys and ring
 # do not build there). The optional flags and the `wallet` feature entries stay the same.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bdk_esplora = { version = "0.22.3", optional = true, default-features = false, features = [
+    "blocking-https-rustls",
+] }
 rgb-lib-migration = { path = "migration", version = "0.3.0-beta.6", optional = true }
 rustls = { version = "0.23.46", optional = true, default-features = false }
 sea-orm = { version = "2.0.4", optional = true, default-features = false, features = [
@@ -113,9 +113,22 @@ tokio = { version = "1", optional = true, default-features = false }
 # wasm32-unknown-unknown, so each version in the lock needs its JS feature. Today those come in
 # transitively (amplify enables 0.2 `js`, rgb-consensus/rgb-ops enable 0.3 `wasm_js`, zip enables
 # 0.4 `wasm_js`); declaring them here keeps the wallet RNG independent of those upstream features
-# staying enabled. Optional and enabled by `wallet`, so the wallet-less wasm build stays free of
-# wasm-bindgen. The target gate keeps the native dependency graph unchanged.
+# staying enabled. Resolved on this graph and pinned by `Cargo.lock`:
+#   getrandom 0.2.17 `js`      <- rand 0.8 (bip39/bdk mnemonics, amplify)
+#   getrandom 0.3.4  `wasm_js` <- rand 0.9 (rgb-consensus, secp256k1)
+#   getrandom 0.4.3  `wasm_js` <- rand 0.10 (this crate's `rand::rng()`/`SysRng`)
+# All three backends end in `globalThis.crypto.getRandomValues`, so every key draw (mnemonic,
+# Ed25519, commitment entropy) comes from the browser CSPRNG. `src/wallet/test_wasm.rs` asserts it.
+# Optional and enabled by `wallet`, so the wallet-less wasm build stays free of wasm-bindgen. The
+# target gate keeps the native dependency graph unchanged.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser Esplora transport: `esplora-client`'s async client over `reqwest`'s fetch backend. Only
+# the `async` feature is enabled, so no TLS stack of our own and no blocking `minreq`/socket code
+# enters the wasm graph; the browser provides HTTPS. `async` alone does not implement
+# `esplora_client::Sleeper`, so the wallet supplies one when it wires the sync path.
+bdk_esplora = { version = "0.22.3", optional = true, default-features = false, features = [
+    "async",
+] }
 getrandom_02 = { package = "getrandom", version = "=0.2.17", optional = true, default-features = false, features = [
     "js",
 ] }
@@ -144,9 +157,13 @@ web-sys = { version = "0.3", optional = true, features = [
 ] }
 
 # Browser clock for the wasm32 wallet: `time` reads the clock with SystemTime::now(), which panics
-# on wasm32-unknown-unknown unless its browser shim is enabled. Same version and features as the
-# native entry above, plus `wasm-bindgen`; optional and enabled by `wallet`, so the native
-# dependency graph and the wallet-less wasm build stay unchanged.
+# on wasm32-unknown-unknown unless its browser shim is enabled. With `wasm-bindgen` (0.3.55,
+# pinned by Cargo.lock) `OffsetDateTime::now_utc()` resolves to `js_sys::Date::new_0()`, which is
+# what `utils::now()` and every wallet timestamp go through. RGB genesis timestamps come from
+# `rgb-ops`, which stamps `chrono::Utc::now()`; chrono reaches the browser through its default
+# `wasmbind` feature, so no chrono entry is needed here. Same version and features as the native
+# entry above, plus `wasm-bindgen`; optional and enabled by `wallet`, so the native dependency
+# graph and the wallet-less wasm build stay unchanged.
 [target.'cfg(target_arch = "wasm32")'.dependencies.time]
 version = "0.3.55"
 optional = true
@@ -281,6 +298,10 @@ esplora_validation = [
     "_validation",
     "rgb-ops/esplora_blocking",
 ]
+# browser Esplora transport: async `esplora-client` over `fetch`, wasm32 only (on other targets it
+# enables no transport, and the blocking `esplora` feature stays the native one). Deliberately not
+# `_online`: the wasm sync path is wired separately from the native online paths.
+esplora_async = ["wallet", "bdk_esplora"]
 camel_case = []
 
 [profile.release]

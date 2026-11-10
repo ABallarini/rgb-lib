@@ -999,7 +999,9 @@ pub(crate) enum IndexerError {
     #[error("Electrum error: {0}")]
     Electrum(#[from] ElectrumError),
 
-    #[cfg(feature = "esplora_validation")]
+    // the blocking and the browser async transports share the client error type, so both map
+    // through the same variant and the same `Error::Indexer` details
+    #[cfg(any(feature = "esplora_async", feature = "esplora_validation"))]
     #[error("Esplora error: {0}")]
     Esplora(#[from] EsploraError),
 }
@@ -1338,11 +1340,12 @@ mod tests {
             let err = Error::from(err);
             assert_matches!(err, Error::Indexer { details } if !details.is_empty());
         }
-        #[cfg(feature = "esplora")]
+        #[cfg(any(feature = "esplora", feature = "esplora_async"))]
         {
             let err = IndexerError::Esplora(EsploraError::InvalidResponse);
             let err = Error::from(err);
-            assert_matches!(err, Error::Indexer { details } if !details.is_empty());
+            // both Esplora transports (blocking native and async browser) go through this shape
+            assert_matches!(err, Error::Indexer { details } if details == "Esplora error: InvalidResponse");
         }
     }
 

@@ -38,7 +38,11 @@
 //! - Logs are append-only native file drains (`utils::setup_logger`); wasm has no log file. The
 //!   interface has no append operation.
 //! - Backups use user-supplied absolute paths, ZIP archives, temporary directories and permission
-//!   bits (`backup.rs`). They stay a native-only feature and are not expressed as wallet keys.
+//!   bits (`backup.rs`). They stay a native-only feature and are not expressed as wallet keys; on
+//!   wasm the public backup and restore entry points return an explicit error.
+//! - The legacy BDK file store is a path-based BDK store, so its import is compiled out on wasm
+//!   rather than routed through this adapter. The legacy RGB store import stays native as well; on
+//!   wasm and in builds without its feature, finding `rgb/` in the adapter is an explicit error.
 //! - Files supplied by the host (media to send, PSBT/consignment paths in the public API) are
 //!   absolute host paths, not wallet-relative data. The portable layer will read/write them as
 //!   bytes at the boundary in S21 rather than adding a host-path operation here.

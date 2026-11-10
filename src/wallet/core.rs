@@ -5,7 +5,7 @@
 use super::*;
 
 // BDK file store of wallets created before the changeset moved into the rgb-lib DB
-#[cfg(feature = "bdk_file_store_migration")]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) const BDK_DB_NAME: &str = "bdk_db";
 // BDK changes that have been applied in memory but whose transaction has not committed yet
 pub(crate) const BDK_PENDING_FILE: &str = "bdk_pending.json";
@@ -618,13 +618,26 @@ fn import_legacy_bdk_store(
     Ok(imported)
 }
 
-/// Without the `bdk_file_store_migration` feature there is nothing to import from.
+/// Without the `bdk_file_store_migration` feature a legacy file store cannot be imported, so
+/// finding one is an explicit error: opening the wallet without it would silently lose the
+/// revealed-address indices the store holds.
 #[cfg(all(not(feature = "bdk_file_store_migration"), not(target_arch = "wasm32")))]
 fn import_legacy_bdk_store(
     _txn: &DbTxn,
-    _wallet_dir: &Path,
+    wallet_dir: &Path,
     _migrated: &mut Vec<PathBuf>,
 ) -> Result<bool, Error> {
+    for name in [BDK_DB_NAME.to_string(), format!("{BDK_DB_NAME}_watch_only")] {
+        let path = wallet_dir.join(name);
+        if path.exists() {
+            return Err(Error::Internal {
+                details: format!(
+                    "found the legacy BDK file store {path:?} but this build cannot import it: \
+                     enable the `bdk_file_store_migration` feature to open this wallet"
+                ),
+            });
+        }
+    }
     Ok(false)
 }
 
@@ -1511,5 +1524,44 @@ mod wasm_snapshot_tests {
             decode_wasm_snapshot(without_body),
             "no database snapshot body",
         );
+    }
+}
+
+#[cfg(all(
+    test,
+    not(feature = "bdk_file_store_migration"),
+    not(target_arch = "wasm32")
+))]
+mod disabled_bdk_migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_bdk_store_without_the_feature_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BDK_DB_NAME);
+        fs::write(&path, b"legacy changeset").unwrap();
+        let database = RgbLibDatabase::new_memory();
+        let txn = database.begin_transaction().unwrap();
+        let mut migrated = Vec::new();
+
+        let error = import_legacy_bdk_store(&txn, dir.path(), &mut migrated).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Internal { details } if details.contains("bdk_file_store_migration")
+        ));
+        assert!(migrated.is_empty());
+        assert!(path.exists(), "the legacy store must not be touched");
+    }
+
+    #[test]
+    fn no_legacy_bdk_store_is_a_noop_without_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = RgbLibDatabase::new_memory();
+        let txn = database.begin_transaction().unwrap();
+        let mut migrated = Vec::new();
+
+        assert!(!import_legacy_bdk_store(&txn, dir.path(), &mut migrated).unwrap());
+        assert!(migrated.is_empty());
     }
 }

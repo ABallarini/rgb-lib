@@ -2020,13 +2020,29 @@ impl RgbStore for &DbTxn {
 #[cfg(all(feature = "rgb_fs_store_migration", not(target_arch = "wasm32")))]
 pub(crate) use legacy::migrate_rgb_fs_to_db;
 
-/// No-op unless the legacy filesystem migration is enabled on a non-wasm target.
+/// Without a native `rgb_fs_store_migration` build a legacy filesystem store cannot be imported.
+///
+/// A wallet with no `rgb/` directory (a new wallet, or any wasm wallet, whose adapter starts empty)
+/// opens normally. Finding one is an explicit error rather than a silent skip: opening the wallet
+/// without the migration would leave its RGB state behind. A leftover `rgb.deleting/` directory is
+/// not an error, since its rename was the migration's completion marker: the DB already holds that
+/// data and the directory is only waiting to be swept up.
 #[cfg(any(not(feature = "rgb_fs_store_migration"), target_arch = "wasm32"))]
 pub(crate) fn migrate_rgb_fs_to_db(
-    _files: &dyn crate::wallet::WalletFiles,
-    _wallet_dir: &Path,
+    files: &dyn crate::wallet::WalletFiles,
+    wallet_dir: &Path,
     _database: &RgbLibDatabase,
 ) -> Result<(), Error> {
+    let rgb_key = crate::wallet::WalletPath::from_segments(&[crate::utils::RGB_RUNTIME_DIR])?;
+    if files.exists(&rgb_key)? {
+        return Err(Error::Internal {
+            details: format!(
+                "found the legacy RGB filesystem store {:?} but this build cannot import it: \
+                 enable the `rgb_fs_store_migration` feature on a native build to open this wallet",
+                wallet_dir.join(crate::utils::RGB_RUNTIME_DIR)
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -2679,5 +2695,117 @@ mod tests {
 
         // genesis has no witness for such a seal to land on
         assert!(store.put_allocation(alloc(2, None)).is_err());
+    }
+}
+
+#[cfg(all(
+    test,
+    not(feature = "rgb_fs_store_migration"),
+    not(target_arch = "wasm32")
+))]
+mod disabled_rgb_migration_tests {
+    use super::*;
+    use crate::utils::RGB_RUNTIME_DIR;
+    use crate::wallet::files::{WalletPath, default_files};
+
+    fn legacy_rgb_key() -> WalletPath {
+        WalletPath::from_segments(&[RGB_RUNTIME_DIR]).unwrap()
+    }
+
+    #[test]
+    fn legacy_rgb_store_without_the_feature_is_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = default_files(dir.path());
+        files.create_dir_all(&legacy_rgb_key()).unwrap();
+        files
+            .atomic_write(
+                &legacy_rgb_key().join("stash.dat").unwrap(),
+                b"legacy state",
+            )
+            .unwrap();
+        let database = RgbLibDatabase::new_memory();
+
+        let error = migrate_rgb_fs_to_db(&*files, dir.path(), &database).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::Internal { details } if details.contains("rgb_fs_store_migration")
+        ));
+        assert!(
+            dir.path().join(RGB_RUNTIME_DIR).exists(),
+            "the legacy store must not be touched"
+        );
+    }
+
+    #[test]
+    fn no_legacy_rgb_store_is_a_noop_without_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = default_files(dir.path());
+        let database = RgbLibDatabase::new_memory();
+
+        migrate_rgb_fs_to_db(&*files, dir.path(), &database).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "rgb_fs_store_migration", not(target_arch = "wasm32")))]
+mod rgb_migration_tests {
+    use super::*;
+    use crate::utils::{RGB_RUNTIME_DELETING_DIR, RGB_RUNTIME_DIR};
+    use crate::wallet::files::default_files;
+
+    fn extract_legacy_fixture(data_dir: &Path) -> PathBuf {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("legacy_nia.zip");
+        let file = fs::File::open(fixture_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        archive.extract(data_dir).unwrap();
+        let wallet_dir = fs::read_dir(data_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(wallet_dir.is_dir());
+        wallet_dir
+    }
+
+    #[test]
+    fn successful_migration_commits_before_removing_the_legacy_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wallet_dir = extract_legacy_fixture(tmp.path());
+        let legacy_dir = wallet_dir.join(RGB_RUNTIME_DIR);
+        assert!(legacy_dir.is_dir());
+        let files = default_files(wallet_dir.clone());
+        let database = RgbLibDatabase::new_memory();
+        let before = database.snapshot().unwrap().expect("memory snapshot");
+
+        migrate_rgb_fs_to_db(&*files, &wallet_dir, &database).unwrap();
+
+        // the snapshot only succeeds once the migration transaction has committed, so a value here
+        // proves the data was durable before the legacy directory disappeared
+        let after = database.snapshot().unwrap().expect("memory snapshot");
+        assert_ne!(before, after, "the migration must have written to the DB");
+        assert!(!legacy_dir.exists());
+        assert!(!wallet_dir.join(RGB_RUNTIME_DELETING_DIR).exists());
+    }
+
+    #[test]
+    fn failed_migration_keeps_the_legacy_store_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = default_files(dir.path());
+        let legacy_key = crate::wallet::WalletPath::from_segments(&[RGB_RUNTIME_DIR]).unwrap();
+        files.create_dir_all(&legacy_key).unwrap();
+        files
+            .write(&legacy_key.join("stash.dat").unwrap(), b"not a stash")
+            .unwrap();
+        let database = RgbLibDatabase::new_memory();
+
+        let error = migrate_rgb_fs_to_db(&*files, dir.path(), &database).unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(dir.path().join(RGB_RUNTIME_DIR).is_dir());
+        assert!(!dir.path().join(RGB_RUNTIME_DELETING_DIR).exists());
     }
 }

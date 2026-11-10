@@ -6043,7 +6043,11 @@ pub trait WalletOnline: WalletOffline {
         let mut difficulty = 0;
         for _ in 0..MAX_POW_ATTEMPTS {
             let pow_timestamp = now().unix_timestamp().to_string();
-            let pow_nonce = solve_pow(&data.transfer_id, &pow_timestamp, difficulty);
+            let pow_nonce = crate::executor::cpu_executor().proof_of_work(
+                &data.transfer_id,
+                &pow_timestamp,
+                difficulty,
+            );
             let res = proxy_client.post_consignment(
                 data,
                 consignment_path,

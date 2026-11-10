@@ -9,7 +9,8 @@ const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
 );
 
-#[cfg(feature = "rgb_fs_store_migration")]
+// The legacy RGB store directory. It stays defined without the migration feature so that a build
+// that finds one can report it instead of silently skipping the import.
 pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 
 /// Where the legacy filesystem RGB store is moved to be deleted, once migrated into the DB, so
@@ -30,6 +31,10 @@ pub(crate) const KEYCHAIN_BTC: u8 = 0;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const INDEXER_STOP_GAP: usize = 20;
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) const INDEXER_TIMEOUT: u64 = 10;
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora_async"))]
+pub(crate) const INDEXER_RETRIES: u8 = 3;
 #[cfg(feature = "electrum")]
 pub(crate) const INDEXER_BATCH_SIZE: usize = 5;
 #[cfg(feature = "esplora")]
@@ -38,29 +43,10 @@ pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 #[cfg(feature = "_online")]
 const PROXY_PROTOCOL_VERSION: &str = "1.0";
 
-// sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
+// The blocking runtime boundary lives in its own module; re-exported here because `utils::block_on`
+// is part of the public API.
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
-    LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
-
-/// Block on a future, spawning a new thread if already inside a Tokio runtime.
-#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-pub fn block_on<F>(future: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // avoid blocking the Tokio runtime thread; spawn a new thread
-        std::thread::scope(|s| {
-            s.spawn(|| TOKIO_RUNTIME.block_on(future))
-                .join()
-                .expect("rgb-lib block_on thread panicked")
-        })
-    } else {
-        TOKIO_RUNTIME.block_on(future)
-    }
-}
+pub use crate::runtime::block_on;
 
 /// Make a newly created file's directory entry durable.
 ///
@@ -780,6 +766,11 @@ pub(crate) type LoggerGuard = slog_async::AsyncGuard;
 #[derive(Debug, Default)]
 pub(crate) struct LoggerGuard;
 
+// Pinned at compile time as well: the wasm build fails here if the async logger's worker handle
+// ever comes back into the guard.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(std::mem::size_of::<LoggerGuard>() == 0);
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_logger<P: AsRef<Path>>(
     log_path: P,
@@ -1460,5 +1451,30 @@ mod tests {
             get_indexer_and_resolver(&IndexerConfig::Electrum { url }, BitcoinNetwork::Regtest);
         // Indexer is not Debug, so the Ok variant cannot be printed by assert_matches
         assert!(matches!(result, Err(Error::InvalidIndexer { .. })));
+    }
+
+    /// Pins the native logger: same drain, level and format as before, and the guard keeps the
+    /// async worker alive until it is dropped, which flushes what was queued.
+    #[test]
+    fn logger_writes_the_native_file_and_flushes_on_guard_drop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (logger, guard) = setup_logger(dir.path(), Some("wallet_log")).expect("setup logger");
+        info!(logger, "wallet opened");
+        // the wallet holds the guard for its lifetime; dropping it joins the async worker
+        drop(guard);
+        let written =
+            fs::read_to_string(dir.path().join("wallet_log")).expect("the log file was written");
+        assert!(written.contains("wallet opened"), "{written}");
+        // the format still carries the UTC timestamp and the source location
+        assert!(written.contains("+00"), "{written}");
+        assert!(written.contains("src/utils.rs"), "{written}");
+
+        // the default file name is still `log`
+        let (logger, guard) = setup_logger(dir.path(), None).expect("setup default logger");
+        info!(logger, "default log file");
+        drop(guard);
+        let written = fs::read_to_string(dir.path().join(LOG_FILE))
+            .expect("the default log file was written");
+        assert!(written.contains("default log file"), "{written}");
     }
 }
