@@ -46,7 +46,9 @@ pub use crate::no_wallet::{
     RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo,
     TransitionGlobal, TransitionMetadata,
 };
-pub use backup::restore_backup;
+pub use backup::{
+    BackupInfo, RestoredBackup, backup_info_bytes, restore_backup, restore_backup_bytes,
+};
 pub use multisig::{Cosigner, MultisigKeys, MultisigWallet};
 #[cfg(feature = "_online")]
 pub use multisig::{

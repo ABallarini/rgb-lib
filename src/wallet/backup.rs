@@ -1,6 +1,14 @@
-// The native helpers stay compiled on wasm so the backup format code has one definition; the
-// public entry points return before reaching them, so they are unreachable there.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+//! Wallet backups: an encrypted, Zstd-compressed ZIP archive of the wallet state.
+//!
+//! The format is fixed: an outer ZIP holds `backup.pub_data` (the JSON scrypt/nonce/version
+//! metadata) and `backup.enc` (the wallet archive encrypted with XChaCha20Poly1305, one chunk per
+//! 239-byte plaintext block). The key is derived from the password with scrypt.
+//!
+//! The archive assembly, encryption and decryption are byte-oriented and shared by every target:
+//! [`create_backup_bytes`] produces the archive, [`restore_backup_bytes`] decrypts and unpacks it,
+//! and [`backup_info_bytes`] reads its public metadata. The native path-writing entry points are
+//! thin wrappers over them. On wasm the same outer format carries the wallet snapshot envelope,
+//! because a browser wallet keeps its database and files in memory instead of a wallet directory.
 
 use super::*;
 
@@ -9,24 +17,23 @@ const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
 const BACKUP_NONCE_LENGTH: usize = 19;
 const BACKUP_VERSION: u8 = 1;
+const BACKUP_PUB_DATA_FILE: &str = "backup.pub_data";
+const BACKUP_ENCRYPTED_FILE: &str = "backup.enc";
+// wasm: the wallet state is its snapshot envelope, stored under the wallet fingerprint so the
+// archive keeps the native layout's leading directory entry
+#[cfg(target_arch = "wasm32")]
+const WASM_BACKUP_SNAPSHOT_FILE: &str = "wallet_snapshot";
 
-/// Backups need a filesystem for their absolute paths, ZIP archives and temporary directories,
-/// which the browser build does not have. The public entry points report that explicitly instead
-/// of failing deep inside a `std::fs` call or silently writing nothing.
+/// Backups on wasm are byte-oriented: these entry points take or return paths and a filesystem, so
+/// they keep reporting that explicitly. Use the byte API instead.
+#[cfg(target_arch = "wasm32")]
 fn backup_unsupported(operation: &str) -> Error {
     Error::Internal {
         details: format!(
-            "{operation} is not supported on wasm32: backups require a filesystem; persist the \
-             wallet with `Wallet::flush` and let the host own any export storage"
+            "{operation} is not supported on wasm32: it takes a filesystem path; use the byte \
+             backup API instead"
         ),
     }
-}
-
-pub(crate) struct BackupPaths {
-    encrypted: PathBuf,
-    pub(crate) backup_pub_data: PathBuf,
-    pub(crate) tempdir: TempDir,
-    zip: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -83,6 +90,74 @@ impl BackupPubData {
     }
 }
 
+/// The public metadata of a backup archive: its format version and the scrypt parameters needed to
+/// derive the key. It holds no password and no secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupInfo {
+    /// Backup format version.
+    pub version: u8,
+    /// scrypt parameters the backup payload was encrypted with.
+    pub scrypt_params: ScryptParams,
+}
+
+/// One entry of a backup archive: a file with its bytes, or a directory when `bytes` is `None`.
+pub(crate) struct BackupEntry {
+    name: String,
+    bytes: Option<Vec<u8>>,
+}
+
+impl BackupEntry {
+    fn file(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: Some(bytes.into()),
+        }
+    }
+
+    fn dir(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: None,
+        }
+    }
+}
+
+/// A decrypted and unpacked backup: the wallet fingerprint from its leading archive entry and the
+/// contained files and directories.
+pub struct RestoredBackup {
+    pub(crate) fingerprint: String,
+    pub(crate) entries: Vec<RestoredEntry>,
+}
+
+pub(crate) struct RestoredEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: Option<Vec<u8>>,
+}
+
+impl RestoredBackup {
+    /// The wallet fingerprint the backup was taken from.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// The wallet snapshot envelope carried by a browser backup, for
+    /// [`Wallet::from_snapshot`](crate::wallet::Wallet::from_snapshot).
+    #[cfg(target_arch = "wasm32")]
+    pub fn wallet_snapshot(&self) -> Result<Vec<u8>, Error> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.bytes.is_some()
+                    && entry.path.file_name().and_then(|name| name.to_str())
+                        == Some(WASM_BACKUP_SNAPSHOT_FILE)
+            })
+            .and_then(|entry| entry.bytes.clone())
+            .ok_or_else(|| Error::Internal {
+                details: "the backup carries no browser wallet snapshot".to_string(),
+            })
+    }
+}
+
 pub trait WalletBackup: WalletCore {
     /// For now setting the scrypt params is done only for testing purposes,
     /// a few details should be refined before allowing to set this in the public API:
@@ -94,15 +169,33 @@ pub trait WalletBackup: WalletCore {
         password: &str,
         scrypt_params: Option<ScryptParams>,
     ) -> Result<(), Error> {
-        if cfg!(target_arch = "wasm32") {
+        #[cfg(target_arch = "wasm32")]
+        {
             let _ = (backup_path, password, scrypt_params);
-            return Err(backup_unsupported("a wallet backup"));
+            Err(backup_unsupported("a wallet backup"))
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.with_backup_info(|| self.backup_raw(backup_path, password, scrypt_params))
+        }
+    }
+
+    /// Create an encrypted backup and return its bytes, without touching the filesystem.
+    ///
+    /// It carries the same archive and encryption format as the native file backup: on native the
+    /// inner archive is the wallet directory, on wasm it is the in-memory wallet snapshot envelope.
+    fn backup_bytes(&self, password: &str) -> Result<Vec<u8>, Error> {
+        self.with_backup_info(|| self.backup_bytes_impl(password))
+    }
+
+    /// Mark the backup as done when the operation succeeds, or restore the previous backup
+    /// bookkeeping when it fails.
+    fn with_backup_info<T>(&self, backup: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         let txn = self.database().begin_transaction()?;
         let prev_backup_info = self.update_backup_info(&txn, true)?;
         txn.commit()?;
-        match self.backup_raw(backup_path, password, scrypt_params) {
-            Ok(()) => Ok(()),
+        match backup() {
+            Ok(value) => Ok(value),
             Err(e) => {
                 error!(self.logger(), "Error during backup: {e:?}");
                 let txn = self.database().begin_transaction()?;
@@ -118,85 +211,55 @@ pub trait WalletBackup: WalletCore {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn backup_raw(
         &self,
         backup_path: &str,
         password: &str,
         scrypt_params: Option<ScryptParams>,
     ) -> Result<(), Error> {
-        if cfg!(target_arch = "wasm32") {
-            let _ = (backup_path, password, scrypt_params);
-            return Err(backup_unsupported("a wallet backup"));
-        }
-        // setup
         info!(self.logger(), "starting backup...");
+        self.write_backup_file(backup_path, password, scrypt_params)?;
+        info!(self.logger(), "backup completed");
+        Ok(())
+    }
+
+    /// Write a file backup and return the exact bytes written, so a caller can prove the file and
+    /// the byte path agree.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_backup_file(
+        &self,
+        backup_path: &str,
+        password: &str,
+        scrypt_params: Option<ScryptParams>,
+    ) -> Result<Vec<u8>, Error> {
         let backup_file = PathBuf::from(&backup_path);
         if backup_file.exists() {
             Err(Error::FileAlreadyExists {
                 path: backup_path.to_string(),
             })?;
         }
-        let tmp_base_path = get_parent_path(&backup_file)?;
-        let files = get_backup_paths(&tmp_base_path)?;
-        let scrypt_params = scrypt_params.unwrap_or_default();
-        let salt: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(24)
-            .map(char::from)
-            .collect();
-        let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
-        debug!(
-            self.logger(),
-            "using generated scrypt params: {}", str_params
-        );
-        let nonce: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(BACKUP_NONCE_LENGTH)
-            .map(char::from)
-            .collect();
-        debug!(self.logger(), "using generated nonce: {}", &nonce);
-        let backup_pub_data = BackupPubData {
-            scrypt_params,
-            salt,
-            nonce,
-            version: BACKUP_VERSION,
-        };
-
-        // create zip archive of wallet data
-        debug!(
-            self.logger(),
-            "\nzipping {:?} to {:?}",
-            &self.wallet_dir(),
-            &files.zip
-        );
-        zip_dir(self.wallet_dir(), &files.zip, true, self.logger())?;
-
-        // encrypt the backup file
-        debug!(
-            self.logger(),
-            "\nencrypting {:?} to {:?}", &files.zip, &files.encrypted
-        );
-        encrypt_file(&files.zip, &files.encrypted, password, &backup_pub_data)?;
-
-        // add backup nonce + salt + version to final zip file
-        fs::write(
-            files.backup_pub_data,
-            serde_json::to_string(&backup_pub_data).unwrap(),
-        )?;
-        debug!(
-            self.logger(),
-            "\nzipping {:?} to {:?}", &files.tempdir, &backup_file
-        );
-        zip_dir(
-            &PathBuf::from(files.tempdir.path()),
-            &backup_file,
-            false,
-            self.logger(),
-        )?;
-
-        info!(self.logger(), "backup completed");
-        Ok(())
+        let parent = get_parent_path(&backup_file)?;
+        // the old tempdir-in-parent setup created a missing parent as a side effect
+        fs::create_dir_all(parent)?;
+        let bytes = wallet_backup_bytes(self.wallet_dir(), password, scrypt_params, self.logger())?;
+        let mut file = fs::File::create(&backup_file)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(bytes)
     }
+
+    /// Native: the inner archive is the wallet directory.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_bytes_impl(&self, password: &str) -> Result<Vec<u8>, Error> {
+        wallet_backup_bytes(self.wallet_dir(), password, None, self.logger())
+    }
+
+    /// wasm: the inner archive is the wallet snapshot envelope, under the wallet fingerprint.
+    /// Implemented per wallet type, where the inherent snapshot method and identity are available.
+    #[cfg(target_arch = "wasm32")]
+    fn backup_bytes_impl(&self, password: &str) -> Result<Vec<u8>, Error>;
 
     fn get_backup_info(&self, txn: &DbTxn) -> Result<bool, Error> {
         Ok(if let Some(backup_info) = txn.get_backup_info()? {
@@ -259,79 +322,300 @@ pub trait WalletBackup: WalletCore {
     }
 }
 
-/// Restore a backup from the given file and password to the provided target directory.
-pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Result<(), Error> {
-    if cfg!(target_arch = "wasm32") {
-        let _ = (backup_path, password, target_dir);
-        return Err(backup_unsupported("restoring a wallet backup"));
-    }
-    // setup
-    fs::create_dir_all(target_dir)?;
-    let log_dir = Path::new(&target_dir);
-    let log_name = format!("restore_{}", now().unix_timestamp());
-    let (logger, _logger_guard) = setup_logger(log_dir, Some(&log_name))?;
-    info!(logger, "starting restore...");
-    let backup_file = PathBuf::from(backup_path);
-    let tmp_base_path = get_parent_path(&backup_file)?;
-    let files = get_backup_paths(&tmp_base_path)?;
-    let target_dir_path = PathBuf::from(&target_dir);
+/// Build a backup archive from `entries` with the fixed backup format.
+///
+/// The result is the complete outer ZIP: `backup.pub_data` with a fresh salt and nonce, and
+/// `backup.enc` holding the Zstd-compressed `entries` archive encrypted for `password`.
+pub(crate) fn create_backup_bytes(
+    entries: &[BackupEntry],
+    password: &str,
+    scrypt_params: Option<ScryptParams>,
+    logger: &Logger,
+) -> Result<Vec<u8>, Error> {
+    let scrypt_params = scrypt_params.unwrap_or_default();
+    let salt: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect();
+    let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
+    debug!(logger, "using generated scrypt params: {}", str_params);
+    let nonce: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(BACKUP_NONCE_LENGTH)
+        .map(char::from)
+        .collect();
+    debug!(logger, "using generated nonce: {}", &nonce);
+    let backup_pub_data = BackupPubData {
+        scrypt_params,
+        salt,
+        nonce,
+        version: BACKUP_VERSION,
+    };
 
-    // unpack given zip file and retrieve backup data
-    info!(logger, "unzipping {:?}", backup_file);
-    unzip(&backup_file, &PathBuf::from(files.tempdir.path()), &logger)?;
-    let json_pub_data = fs::read_to_string(files.backup_pub_data)?;
-    debug!(logger, "using retrieved backup_pub_data: {}", json_pub_data);
-    let backup_pub_data: BackupPubData =
-        serde_json::from_str(json_pub_data.as_str()).map_err(InternalError::from)?;
-    let version = backup_pub_data.version;
-    debug!(logger, "retrieved version: {}", &version);
-    if version != BACKUP_VERSION {
-        return Err(Error::UnsupportedBackupVersion {
-            version: version.to_string(),
-        });
-    }
-
-    // decrypt backup
-    info!(
-        logger.clone(),
-        "decrypting {:?} to {:?}", files.encrypted, files.zip
-    );
-    decrypt_file(&files.encrypted, &files.zip, password, &backup_pub_data)?;
-
-    // check the target wallet directory doesn't already exist
-    let fingerprint = get_fingerprint_from_zip(&files.zip)?;
-    let wallet_dir = target_dir_path.join(fingerprint);
-    if wallet_dir.exists() {
-        return Err(Error::WalletDirAlreadyExists {
-            path: wallet_dir.to_string_lossy().to_string(),
-        });
-    }
-
-    // restore files
-    info!(
-        logger.clone(),
-        "unzipping {:?} to {:?}", &files.zip, &target_dir_path
-    );
-    unzip(&files.zip, &target_dir_path, &logger)?;
-
-    info!(logger, "restore completed");
-    Ok(())
+    debug!(logger, "zipping {} entries", entries.len());
+    let zip = zip_entries(entries, logger)?;
+    let encrypted = encrypt_bytes(&zip, password, &backup_pub_data)?;
+    let pub_data = serde_json::to_vec(&backup_pub_data).map_err(InternalError::from)?;
+    zip_entries(
+        &[
+            BackupEntry::file(BACKUP_ENCRYPTED_FILE, encrypted),
+            BackupEntry::file(BACKUP_PUB_DATA_FILE, pub_data),
+        ],
+        logger,
+    )
 }
 
-pub(crate) fn get_backup_paths(tmp_base_path: &Path) -> Result<BackupPaths, Error> {
-    fs::create_dir_all(tmp_base_path)?;
-    let tempdir = tempfile::tempdir_in(tmp_base_path)?;
-    let encrypted = tempdir.path().join("backup.enc");
-    let backup_pub_data = tempdir.path().join("backup.pub_data");
-    let zip = tempdir.path().join("backup.zip");
-    Ok(BackupPaths {
-        encrypted,
-        backup_pub_data,
-        tempdir,
-        zip,
+/// Native wallet backup: archive the wallet directory and wrap it in the backup format.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn wallet_backup_bytes(
+    wallet_dir: &PathBuf,
+    password: &str,
+    scrypt_params: Option<ScryptParams>,
+    logger: &Logger,
+) -> Result<Vec<u8>, Error> {
+    let entries = wallet_entries(wallet_dir, true, logger)?;
+    create_backup_bytes(&entries, password, scrypt_params, logger)
+}
+
+/// wasm wallet backup: carry the wallet snapshot envelope in the same outer archive format.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn wasm_backup_bytes(
+    fingerprint: &str,
+    snapshot: Vec<u8>,
+    password: &str,
+    logger: &Logger,
+) -> Result<Vec<u8>, Error> {
+    let entries = [
+        BackupEntry::dir(fingerprint),
+        BackupEntry::file(
+            format!("{fingerprint}/{WASM_BACKUP_SNAPSHOT_FILE}"),
+            snapshot,
+        ),
+    ];
+    create_backup_bytes(&entries, password, None, logger)
+}
+
+/// Restore a backup from bytes: decrypt it and unpack the wallet archive.
+///
+/// The wallet fingerprint comes from the archive's leading entry, as in the native restore. The
+/// returned files are not written anywhere; the caller applies them to its storage (a directory on
+/// native, the wallet snapshot on wasm).
+pub fn restore_backup_bytes(bytes: &[u8], password: &str) -> Result<RestoredBackup, Error> {
+    restore_backup_bytes_labeled(bytes, password, None)
+}
+
+fn restore_backup_bytes_labeled(
+    bytes: &[u8],
+    password: &str,
+    path_label: Option<&str>,
+) -> Result<RestoredBackup, Error> {
+    let (backup_pub_data, encrypted) = backup_parts(bytes, path_label)?;
+    if backup_pub_data.version != BACKUP_VERSION {
+        return Err(Error::UnsupportedBackupVersion {
+            version: backup_pub_data.version.to_string(),
+        });
+    }
+    let zip = decrypt_bytes(&encrypted, password, &backup_pub_data)?;
+    unzip_in_memory(&zip, path_label)
+}
+
+/// Read the public metadata of a backup without its password.
+pub fn backup_info_bytes(bytes: &[u8]) -> Result<BackupInfo, Error> {
+    let (backup_pub_data, _) = backup_parts(bytes, None)?;
+    Ok(BackupInfo {
+        version: backup_pub_data.version,
+        scrypt_params: backup_pub_data.scrypt_params,
     })
 }
 
+/// Restore a backup from the given file and password to the provided target directory.
+pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Result<(), Error> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (backup_path, password, target_dir);
+        Err(backup_unsupported("restoring a wallet backup"))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // setup
+        fs::create_dir_all(target_dir)?;
+        let log_dir = Path::new(&target_dir);
+        let log_name = format!("restore_{}", now().unix_timestamp());
+        let (logger, _logger_guard) = setup_logger(log_dir, Some(&log_name))?;
+        info!(logger, "starting restore...");
+        let backup_file = PathBuf::from(backup_path);
+        let bytes = fs::read(&backup_file).map_err(|_| Error::InvalidFilePath {
+            file_path: backup_path.to_string(),
+        })?;
+        let target_dir_path = PathBuf::from(&target_dir);
+
+        // decrypt and unpack the given backup
+        info!(logger, "decrypting and unzipping {:?}", backup_file);
+        let restored = restore_backup_bytes_labeled(&bytes, password, Some(backup_path))?;
+
+        // check the target wallet directory doesn't already exist
+        let fingerprint = restored.fingerprint.clone();
+        let wallet_dir = target_dir_path.join(fingerprint);
+        if wallet_dir.exists() {
+            return Err(Error::WalletDirAlreadyExists {
+                path: wallet_dir.to_string_lossy().to_string(),
+            });
+        }
+
+        // restore files
+        info!(
+            logger,
+            "unzipping the wallet archive to {:?}", &target_dir_path
+        );
+        write_restored_entries(&restored.entries, &target_dir_path, &logger)?;
+
+        info!(logger, "restore completed");
+        Ok(())
+    }
+}
+
+/// Write an archive of `entries` into a ZIP, Zstd-compressing every file.
+fn zip_entries(entries: &[BackupEntry], logger: &Logger) -> Result<Vec<u8>, Error> {
+    let mut zip = ZipWriter::new(io::Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Zstd);
+    for entry in entries {
+        match &entry.bytes {
+            Some(bytes) => {
+                debug!(
+                    logger,
+                    "adding file {:?} ({} bytes)",
+                    entry.name,
+                    bytes.len()
+                );
+                zip.start_file(&entry.name, options)
+                    .map_err(InternalError::from)?;
+                zip.write_all(bytes)?;
+            }
+            None => {
+                debug!(logger, "adding directory {:?}", entry.name);
+                zip.add_directory(&entry.name, options)
+                    .map_err(InternalError::from)?;
+            }
+        }
+    }
+    Ok(zip
+        .finish()
+        .map(|cursor| cursor.into_inner())
+        .map_err(InternalError::from)?)
+}
+
+fn invalid_archive(path_label: Option<&str>, error: impl std::fmt::Display) -> Error {
+    match path_label {
+        Some(path) => Error::InvalidFilePath {
+            file_path: path.to_string(),
+        },
+        None => Error::Internal {
+            details: format!("invalid backup archive: {error}"),
+        },
+    }
+}
+
+/// Split the outer archive into its public metadata and encrypted payload.
+fn backup_parts(bytes: &[u8], path_label: Option<&str>) -> Result<(BackupPubData, Vec<u8>), Error> {
+    let mut archive =
+        ZipArchive::new(io::Cursor::new(bytes)).map_err(|e| invalid_archive(path_label, e))?;
+    let mut pub_data = None;
+    let mut encrypted = None;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(InternalError::from)?;
+        let name = entry.name().map_err(InternalError::from)?;
+        match name.as_ref() {
+            BACKUP_PUB_DATA_FILE => {
+                let mut json = String::new();
+                entry.read_to_string(&mut json)?;
+                pub_data = Some(serde_json::from_str(json.as_str()).map_err(InternalError::from)?);
+            }
+            BACKUP_ENCRYPTED_FILE => {
+                let mut payload = Vec::new();
+                entry.read_to_end(&mut payload)?;
+                encrypted = Some(payload);
+            }
+            _ => {}
+        }
+    }
+    let pub_data = pub_data.ok_or_else(|| Error::Internal {
+        details: "invalid backup archive: no backup metadata".to_string(),
+    })?;
+    let encrypted = encrypted.ok_or_else(|| Error::Internal {
+        details: "invalid backup archive: no encrypted payload".to_string(),
+    })?;
+    Ok((pub_data, encrypted))
+}
+
+/// Unpack a wallet archive from memory, rejecting entries that escape its root.
+fn unzip_in_memory(bytes: &[u8], path_label: Option<&str>) -> Result<RestoredBackup, Error> {
+    let mut archive =
+        ZipArchive::new(io::Cursor::new(bytes)).map_err(|e| invalid_archive(path_label, e))?;
+    let fingerprint = archive
+        .name_for_index(0)
+        .transpose()
+        .map_err(InternalError::from)?
+        .unwrap_or_default()
+        .to_string()
+        .replace("/", "");
+    let mut entries = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(InternalError::from)?;
+        let Some(path) = entry.enclosed_name() else {
+            continue;
+        };
+        let is_dir = entry.is_dir();
+        let bytes = if is_dir {
+            None
+        } else {
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents)?;
+            Some(contents)
+        };
+        entries.push(RestoredEntry { path, bytes });
+    }
+    Ok(RestoredBackup {
+        fingerprint,
+        entries,
+    })
+}
+
+/// Native: write the unpacked archive to a directory, creating parents as the ZIP extractor did.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_restored_entries(
+    entries: &[RestoredEntry],
+    path_out: &Path,
+    logger: &Logger,
+) -> Result<(), Error> {
+    for entry in entries {
+        let outpath = path_out.join(&entry.path);
+        match &entry.bytes {
+            Some(bytes) => {
+                debug!(
+                    logger,
+                    "extracting file to {} ({} bytes)",
+                    outpath.display(),
+                    bytes.len()
+                );
+                if let Some(parent) = outpath.parent()
+                    && !parent.exists()
+                {
+                    debug!(logger, "creating parent dir {}", parent.display());
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&outpath, bytes)?;
+            }
+            None => {
+                debug!(logger, "creating directory {}", outpath.display());
+                fs::create_dir_all(&outpath)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn get_parent_path(file: &Path) -> Result<PathBuf, Error> {
     if let Some(parent) = file.parent() {
         Ok(parent.to_path_buf())
@@ -342,19 +626,16 @@ fn get_parent_path(file: &Path) -> Result<PathBuf, Error> {
     }
 }
 
-pub(crate) fn zip_dir(
+/// Native: collect the wallet directory entries exactly as the archive has always stored them.
+///
+/// The root directory is skipped when `keep_last_path_component` is false; with it true the wallet
+/// directory's own name becomes the leading entry, which is where the fingerprint comes from.
+#[cfg(not(target_arch = "wasm32"))]
+fn wallet_entries(
     path_in: &PathBuf,
-    path_out: &PathBuf,
     keep_last_path_component: bool,
     logger: &Logger,
-) -> Result<(), Error> {
-    // setup
-    let writer = fs::File::create(path_out)?;
-    let mut zip = ZipWriter::new(writer);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Zstd);
-    let mut buffer = [0u8; 4096];
-
-    // archive
+) -> Result<Vec<BackupEntry>, Error> {
     let prefix = if keep_last_path_component {
         if let Some(parent) = path_in.parent() {
             parent
@@ -366,6 +647,7 @@ pub(crate) fn zip_dir(
     } else {
         path_in
     };
+    let mut entries = Vec::new();
     // a legacy RGB store migration that crashed between retiring the legacy store and deleting it
     // can leave the retired copy behind: skip its whole subtree, the DB holds its data
     let entry_iterator = WalkDir::new(path_in)
@@ -375,87 +657,35 @@ pub(crate) fn zip_dir(
         let entry = entry.map_err(std::io::Error::from)?;
         let path = entry.path();
         let name = path.strip_prefix(prefix).map_err(InternalError::from)?;
-        let name_str = name.to_str().ok_or_else(|| InternalError::Unexpected)?;
+        let name_str = name.to_str().ok_or(InternalError::Unexpected)?;
         if path.is_file() {
             if path.ends_with(LOG_FILE) {
                 continue;
             }; // skip log file
             debug!(logger, "adding file {path:?} as {name:?}");
-            zip.start_file(name_str, options)
-                .map_err(InternalError::from)?;
-            let mut f = fs::File::open(path)?;
-            loop {
-                let read_count = f.read(&mut buffer)?;
-                if read_count != 0 {
-                    zip.write_all(&buffer[..read_count])?;
-                } else {
-                    break;
-                }
-            }
+            entries.push(BackupEntry::file(name_str, fs::read(path)?));
         } else if !name.as_os_str().is_empty() {
             debug!(logger, "adding directory {path:?} as {name:?}");
-            zip.add_directory(name_str, options)
-                .map_err(InternalError::from)?;
+            entries.push(BackupEntry::dir(name_str));
         }
     }
-
-    // finalize
-    let mut file = zip.finish().map_err(InternalError::from)?;
-    file.flush()?;
-    file.sync_all()?;
-
-    Ok(())
+    Ok(entries)
 }
 
-fn get_zip_archive(zip_path: &PathBuf) -> Result<ZipArchive<fs::File>, Error> {
-    let file = fs::File::open(zip_path).map_err(|_| Error::InvalidFilePath {
-        file_path: zip_path.to_string_lossy().to_string(),
-    })?;
-    ZipArchive::new(file).map_err(|_| Error::InvalidFilePath {
-        file_path: zip_path.to_string_lossy().to_string(),
-    })
-}
-
-fn get_fingerprint_from_zip(zip_path: &PathBuf) -> Result<String, Error> {
-    let archive = get_zip_archive(zip_path)?;
-    let fingerprint = archive
-        .name_for_index(0)
-        .transpose()
-        .map_err(InternalError::from)?
-        .unwrap_or_default();
-    Ok(fingerprint.to_string().replace("/", ""))
-}
-
-pub(crate) fn unzip(zip_path: &PathBuf, path_out: &Path, logger: &Logger) -> Result<(), Error> {
-    let mut archive = get_zip_archive(zip_path)?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(InternalError::from)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => path_out.join(path),
-            None => continue,
-        };
-        if file.is_dir() {
-            debug!(logger, "creating directory {i} as {}", outpath.display());
-            fs::create_dir_all(&outpath)?;
-        } else {
-            debug!(
-                logger,
-                "extracting file {i} to {} ({} bytes)",
-                outpath.display(),
-                file.size()
-            );
-            if let Some(p) = outpath.parent()
-                && !p.exists()
-            {
-                debug!(logger, "creating parent dir {}", p.display());
-                fs::create_dir_all(p)?;
-            }
-            let mut outfile = fs::File::create(&outpath)?;
-            io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
-    Ok(())
+/// Test-only: replace the version recorded in a backup's public metadata.
+#[cfg(test)]
+pub(crate) fn rewrite_backup_version(bytes: &[u8], version: u8) -> Result<Vec<u8>, Error> {
+    let (mut pub_data, encrypted) = backup_parts(bytes, None)?;
+    pub_data.version = version;
+    let json = serde_json::to_vec(&pub_data).map_err(InternalError::from)?;
+    let logger = slog::Logger::root(slog::Discard, slog::o!());
+    zip_entries(
+        &[
+            BackupEntry::file(BACKUP_ENCRYPTED_FILE, encrypted),
+            BackupEntry::file(BACKUP_PUB_DATA_FILE, json),
+        ],
+        &logger,
+    )
 }
 
 fn get_cypher_secrets(password: &str, backup_pub_data: &BackupPubData) -> Result<Key, Error> {
@@ -489,29 +719,23 @@ fn stream_be32_nonce(
     nonce.into()
 }
 
-fn encrypt_file(
-    path_cleartext: &PathBuf,
-    path_encrypted: &PathBuf,
+fn encrypt_bytes(
+    cleartext: &[u8],
     password: &str,
     backup_pub_data: &BackupPubData,
-) -> Result<(), Error> {
+) -> Result<Vec<u8>, Error> {
     let key = get_cypher_secrets(password, backup_pub_data)?;
 
     // - XChacha20Poly1305 is fast and requires no special hardware
-    // - files are encrypted chunk-by-chunk to avoid buffering large backups in memory
-
-    // setup
+    // - the payload is encrypted chunk-by-chunk to bound the memory each AEAD operation needs
     let aead = XChaCha20Poly1305::new(&key);
     let nonce_prefix = backup_pub_data.nonce()?;
     let mut position: u32 = 0;
-    let mut buffer = [0u8; BACKUP_BUFFER_LEN_ENCRYPT];
-    let mut source_file = fs::File::open(path_cleartext)?;
-    let mut destination_file = fs::File::create(path_encrypted)?;
-
-    // encrypt file
+    let mut chunks = cleartext.chunks(BACKUP_BUFFER_LEN_ENCRYPT);
+    let mut encrypted = Vec::with_capacity(cleartext.len() + cleartext.len() / 128 + 16);
     loop {
-        let read_count = source_file.read(&mut buffer)?;
-        let is_last = read_count != BACKUP_BUFFER_LEN_ENCRYPT;
+        let chunk = chunks.next().unwrap_or(&[]);
+        let is_last = chunk.len() != BACKUP_BUFFER_LEN_ENCRYPT;
         if !is_last && position == u32::MAX {
             return Err(Error::Internal {
                 details: s!("backup file too large"),
@@ -520,9 +744,9 @@ fn encrypt_file(
 
         let nonce = stream_be32_nonce(&nonce_prefix, position, is_last);
         let ciphertext = aead
-            .encrypt(&nonce, &buffer[..read_count])
+            .encrypt(&nonce, chunk)
             .expect("chunk size is within XChaCha20Poly1305 limits");
-        destination_file.write_all(&ciphertext)?;
+        encrypted.extend_from_slice(&ciphertext);
 
         if is_last {
             break;
@@ -530,75 +754,110 @@ fn encrypt_file(
         position += 1;
     }
 
-    // remove cleartext source file
-    fs::remove_file(path_cleartext)?;
-
-    Ok(())
+    Ok(encrypted)
 }
 
-fn decrypt_file(
-    path_encrypted: &PathBuf,
-    path_cleartext: &PathBuf,
+fn decrypt_bytes(
+    ciphertext: &[u8],
     password: &str,
     backup_pub_data: &BackupPubData,
-) -> Result<(), Error> {
+) -> Result<Vec<u8>, Error> {
+    if ciphertext.is_empty() {
+        return Ok(Vec::new());
+    }
     let key = get_cypher_secrets(password, backup_pub_data)?;
 
-    // setup
     let aead = XChaCha20Poly1305::new(&key);
     let nonce_prefix = backup_pub_data.nonce()?;
     let mut position: u32 = 0;
-    let mut buffer = [0u8; BACKUP_BUFFER_LEN_DECRYPT];
-    let mut source_file = fs::File::open(path_encrypted)?;
-    let mut destination_file = fs::File::create(path_cleartext)?;
-
-    // decrypt file
+    let mut cleartext = Vec::with_capacity(ciphertext.len());
+    let mut offset = 0;
     loop {
-        let read_count = source_file.read(&mut buffer)?;
-        if read_count == BACKUP_BUFFER_LEN_DECRYPT {
-            if position == u32::MAX {
-                return Err(Error::Internal {
-                    details: s!("backup file too large"),
-                });
-            }
-            let nonce = stream_be32_nonce(&nonce_prefix, position, false);
-            let cleartext = aead
-                .decrypt(&nonce, buffer.as_slice())
-                .map_err(|_| Error::WrongPassword)?;
-            destination_file.write_all(&cleartext)?;
-        } else if read_count == 0 {
-            break;
-        } else {
-            let nonce = stream_be32_nonce(&nonce_prefix, position, true);
-            let cleartext = aead
-                .decrypt(&nonce, &buffer[..read_count])
-                .map_err(|_| Error::WrongPassword)?;
-            destination_file.write_all(&cleartext)?;
+        let remaining = ciphertext.len() - offset;
+        let chunk_len = remaining.min(BACKUP_BUFFER_LEN_DECRYPT);
+        let is_last = chunk_len != BACKUP_BUFFER_LEN_DECRYPT;
+        if !is_last && position == u32::MAX {
+            return Err(Error::Internal {
+                details: s!("backup file too large"),
+            });
+        }
+        let nonce = stream_be32_nonce(&nonce_prefix, position, is_last);
+        let chunk = &ciphertext[offset..offset + chunk_len];
+        let plain = aead
+            .decrypt(&nonce, chunk)
+            .map_err(|_| Error::WrongPassword)?;
+        cleartext.extend_from_slice(&plain);
+
+        if is_last {
             break;
         }
+        offset += chunk_len;
         position += 1;
     }
 
-    Ok(())
+    Ok(cleartext)
 }
 
-#[cfg(test)]
+// The native ZIP helpers only exist off wasm; the byte path is covered by the browser suite.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
+    fn logger() -> Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    fn fixture() -> Vec<BackupEntry> {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        vec![
+            BackupEntry::dir("wallet-fingerprint"),
+            BackupEntry::dir("wallet-fingerprint/nested"),
+            BackupEntry::dir("wallet-fingerprint/nested/empty"),
+            BackupEntry::file("wallet-fingerprint/nested/payload", payload),
+        ]
+    }
+
     #[test]
-    fn zip_dir_missing_source() {
+    fn byte_backup_round_trip_and_info() {
+        let entries = fixture();
+        // cheap params keep the test fast; the restore reads them from the archive
+        let params = ScryptParams::new(Some(4), Some(1), Some(1));
+        let bytes = create_backup_bytes(&entries, "password", Some(params), &logger()).unwrap();
+
+        let info = backup_info_bytes(&bytes).unwrap();
+        assert_eq!(info.version, BACKUP_VERSION);
+        assert_eq!(info.scrypt_params.log_n, 4);
+
+        let restored = restore_backup_bytes(&bytes, "password").unwrap();
+        assert_eq!(restored.fingerprint(), "wallet-fingerprint");
+        let payload = restored
+            .entries
+            .iter()
+            .find(|e| e.path.to_string_lossy() == "wallet-fingerprint/nested/payload")
+            .and_then(|e| e.bytes.clone())
+            .unwrap();
+        assert_eq!(
+            payload,
+            (0..10_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+        );
+
+        assert!(matches!(
+            restore_backup_bytes(&bytes, "wrong"),
+            Err(Error::WrongPassword)
+        ));
+    }
+
+    #[test]
+    fn zip_entries_missing_source() {
         let tempdir = tempfile::tempdir().unwrap();
         let source = tempdir.path().join("missing");
-        let archive = tempdir.path().join("backup.zip");
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
-        let result = zip_dir(&source, &archive, false, &logger);
+        let result = wallet_entries(&source, false, &logger());
         assert!(matches!(result, Err(Error::IO { details }) if details.contains("missing")));
     }
 
     #[cfg(unix)]
     #[test]
-    fn zip_dir_unreadable_directory() {
+    fn zip_entries_unreadable_directory() {
         // Restore permissions on every exit path so TempDir can clean up, including on panics.
         struct RestorePermissions<'a>(&'a Path, fs::Permissions);
 
@@ -607,6 +866,8 @@ mod tests {
                 let _ = fs::set_permissions(self.0, self.1.clone());
             }
         }
+
+        use std::os::unix::fs::PermissionsExt;
 
         let tempdir = tempfile::tempdir().unwrap();
         let source = tempdir.path().join("source");
@@ -622,8 +883,7 @@ mod tests {
             return;
         }
 
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
-        let result = zip_dir(&source, &tempdir.path().join("backup.zip"), false, &logger);
+        let result = wallet_entries(&source, false, &logger());
         assert!(matches!(result, Err(Error::IO { details }) if details.contains("unreadable")));
     }
 
@@ -632,18 +892,17 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let source = tempdir.path().join("wallet-fingerprint");
         fs::create_dir_all(source.join("nested/empty")).unwrap();
-        // larger than the zip_dir copy buffer, so it gets written in multiple chunks
+        // larger than one encryption chunk, so it gets written in multiple chunks
         let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         fs::write(source.join("nested/payload"), &payload).unwrap();
         fs::write(source.join(LOG_FILE), b"must not be archived").unwrap();
-        let archive_path = tempdir.path().join("backup.zip");
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
 
-        zip_dir(&source, &archive_path, true, &logger).unwrap();
+        let entries = wallet_entries(&source, true, &logger()).unwrap();
+        let archive_bytes = zip_entries(&entries, &logger()).unwrap();
 
         // archive contains the wallet dir (empty dirs included), without the log file
         {
-            let mut archive = ZipArchive::new(fs::File::open(&archive_path).unwrap()).unwrap();
+            let mut archive = ZipArchive::new(io::Cursor::new(&archive_bytes)).unwrap();
             let mut names = archive
                 .file_names()
                 .map(|n| n.unwrap().into_owned())
@@ -663,13 +922,11 @@ mod tests {
                 .unwrap();
             assert_eq!(entry.compression(), zip::CompressionMethod::Zstd);
         }
-        assert_eq!(
-            get_fingerprint_from_zip(&archive_path).unwrap(),
-            "wallet-fingerprint"
-        );
 
+        let restored = unzip_in_memory(&archive_bytes, None).unwrap();
+        assert_eq!(restored.fingerprint, "wallet-fingerprint");
         let output = tempdir.path().join("restored");
-        unzip(&archive_path, &output, &logger).unwrap();
+        write_restored_entries(&restored.entries, &output, &logger()).unwrap();
         assert_eq!(
             fs::read(output.join("wallet-fingerprint/nested/payload")).unwrap(),
             payload
@@ -680,23 +937,18 @@ mod tests {
 
     #[test]
     fn unzip_stays_inside_output_dir() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let archive_path = tempdir.path().join("malicious.zip");
-        let mut zip = ZipWriter::new(fs::File::create(&archive_path).unwrap());
-        for name in [
-            "../escaped",
-            "safe/../../escaped_nested",
-            "/absolute",
-            "safe/file",
-        ] {
-            zip.start_file(name, SimpleFileOptions::default()).unwrap();
-            zip.write_all(name.as_bytes()).unwrap();
-        }
-        zip.finish().unwrap();
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let entries = [
+            BackupEntry::file("../escaped", "../escaped"),
+            BackupEntry::file("safe/../../escaped_nested", "safe/../../escaped_nested"),
+            BackupEntry::file("/absolute", "/absolute"),
+            BackupEntry::file("safe/file", "safe/file"),
+        ];
+        let archive_bytes = zip_entries(&entries, &logger()).unwrap();
 
+        let tempdir = tempfile::tempdir().unwrap();
+        let restored = unzip_in_memory(&archive_bytes, None).unwrap();
         let output = tempdir.path().join("restored");
-        unzip(&archive_path, &output, &logger).unwrap();
+        write_restored_entries(&restored.entries, &output, &logger()).unwrap();
 
         // entries escaping the output dir are skipped
         assert!(!tempdir.path().join("escaped").exists());

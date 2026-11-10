@@ -180,6 +180,21 @@ pub struct ConsignmentInspection {
     pub witnesses: Vec<RgbInspection>,
 }
 
+/// Result of validating an RGB consignment against its own witness data.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ConsignmentValidation {
+    /// Whether the consignment is valid
+    pub valid: bool,
+    /// Warnings reported by the validation of a valid consignment
+    pub warnings: Option<Vec<String>>,
+    /// Category of the failure of an invalid consignment (`invalid`, `resolver`,
+    /// `external_anchors` or `unexpected`)
+    pub error: Option<String>,
+    /// Details of the failure of an invalid consignment
+    pub details: Option<String>,
+}
+
 /// The bundles of a consignment to inspect.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum BundleFilter {
@@ -251,6 +266,117 @@ pub fn inspect_consignment(
         });
     }
     Ok(inspection)
+}
+
+/// Validate a transfer consignment against the witness data bundled in it.
+///
+/// This works before the witness transaction is broadcast. `consignment_bytes` are the raw
+/// strict-encoded consignment bytes (not armored, not base64), `txid` is the witness transaction ID
+/// and `bitcoin_network` the network the consignment is checked against.
+///
+/// Witnesses not bundled in the consignment cannot be resolved offline and give a `resolver`
+/// result. The result distinguishes an invalid consignment from a resolver failure: a valid result
+/// does not prove the witness transaction has been broadcast.
+#[cfg(feature = "wallet")]
+pub fn validate_consignment_offchain(
+    consignment_bytes: &[u8],
+    txid: &str,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<ConsignmentValidation, Error> {
+    use rgbstd::validation::{ValidationConfig, ValidationError};
+
+    let consignment =
+        RgbTransfer::load(consignment_bytes).map_err(|_| Error::InvalidConsignment)?;
+    let witness_id = Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+    let chain_net: ChainNet = bitcoin_network.into();
+    let asset_schema = AssetSchema::from_schema_id(consignment.schema_id())?;
+    let resolver = BundledWitnessResolver {
+        consignment: &consignment,
+        witness_id,
+        chain_net,
+    };
+    let validation_config = ValidationConfig {
+        chain_net,
+        ..Default::default()
+    };
+    let invalid = |error: &str, details: String| ConsignmentValidation {
+        valid: false,
+        warnings: None,
+        error: Some(error.to_string()),
+        details: Some(details),
+    };
+    Ok(
+        match consignment.clone().validate(
+            &asset_schema.schema_rules(),
+            &resolver,
+            &validation_config,
+        ) {
+            Ok(valid_consignment) => ConsignmentValidation {
+                valid: true,
+                warnings: Some(
+                    valid_consignment
+                        .validation_status()
+                        .warnings
+                        .iter()
+                        .map(|w| w.to_string())
+                        .collect(),
+                ),
+                error: None,
+                details: None,
+            },
+            Err(ValidationError::InvalidConsignment(failure)) => {
+                invalid("invalid", failure.to_string())
+            }
+            Err(ValidationError::ResolverError(e)) => invalid("resolver", e.to_string()),
+            Err(ValidationError::ExternalAnchorsPending(count)) => invalid(
+                "external_anchors",
+                format!("{count} external anchor(s) need online confirmation"),
+            ),
+            Err(e) => invalid("unexpected", e.to_string()),
+        },
+    )
+}
+
+/// Resolve the witnesses bundled in a consignment, preferring the given witness TXID.
+///
+/// A consignment validated before its witness transaction is broadcast can only rely on its own
+/// witness data: a witness it does not bundle is reported as a resolver error.
+#[cfg(feature = "wallet")]
+struct BundledWitnessResolver<'a, const TRANSFER: bool> {
+    consignment: &'a Consignment<TRANSFER>,
+    witness_id: Txid,
+    chain_net: ChainNet,
+}
+
+#[cfg(feature = "wallet")]
+impl<const TRANSFER: bool> ResolveWitness for BundledWitnessResolver<'_, TRANSFER> {
+    fn resolve_witness(&self, witness_id: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+        let bundled = |witness_id: Txid| {
+            self.consignment
+                .bundled_witnesses()
+                .find(|bw| bw.witness_id() == witness_id)
+                .map(|bw| WitnessStatus::Resolved(bw.tx.clone(), WitnessOrd::Tentative))
+        };
+        if witness_id == self.witness_id
+            && let Some(status) = bundled(witness_id)
+        {
+            return Ok(status);
+        }
+        bundled(witness_id).ok_or_else(|| {
+            WitnessResolverError::ResolverIssue(
+                Some(witness_id),
+                "witness not bundled in the consignment".to_string(),
+            )
+        })
+    }
+
+    fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
+        if chain_net == self.chain_net {
+            Ok(())
+        } else {
+            Err(WitnessResolverError::WrongChainNet)
+        }
+    }
 }
 
 /// Build the inspection details of a consignment, inspecting the bundles selected by the given
@@ -774,6 +900,17 @@ mod tests {
             BundleFilter::Witness("invalid".to_string()),
         );
         assert_matches!(result, Err(Error::InvalidTxid));
+    }
+
+    #[test]
+    #[cfg(feature = "wallet")]
+    fn validate_consignment_offchain_invalid_bytes() {
+        let result = validate_consignment_offchain(
+            b"not a consignment",
+            &"00".repeat(32),
+            BitcoinNetwork::Regtest,
+        );
+        assert!(matches!(result, Err(Error::InvalidConsignment)));
     }
 
     #[test]

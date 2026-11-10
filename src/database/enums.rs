@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(feature = "wallet")]
+use rgbstd::validation::SchemaRules;
+
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_UDA: &str =

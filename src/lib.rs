@@ -532,13 +532,13 @@ use strict_encoding::{FieldName, StrictDecode, StrictEncode};
 use strict_encoding::{StreamReader, StrictReader};
 #[cfg(feature = "wallet")]
 use strict_types::{TypeLib, TypeLibId};
-#[cfg(feature = "wallet")]
+#[cfg(all(feature = "wallet", test, not(target_arch = "wasm32")))]
 use tempfile::TempDir;
 #[cfg(feature = "wallet")]
 use time::OffsetDateTime;
 #[cfg(feature = "_online")]
 use url::Url;
-#[cfg(feature = "wallet")]
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use walkdir::WalkDir;
 #[cfg(feature = "_online")]
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
