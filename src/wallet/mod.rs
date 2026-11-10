@@ -19,6 +19,10 @@ pub(crate) mod offline;
 pub(crate) mod online;
 #[cfg(target_arch = "wasm32")]
 pub mod persistence;
+// async chain-resolution boundary: the browser fetches before the DB transaction opens, native
+// builds keep the blocking resolver
+#[cfg(feature = "wallet")]
+pub(crate) mod resolver_async;
 pub mod rust_only;
 pub(crate) mod singlesig;
 
@@ -26,6 +30,10 @@ pub(crate) mod singlesig;
 pub(crate) mod test;
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod test_wasm;
+// Opt-in browser smoke test for the async transport/resolver against a controlled regtest
+// Esplora. Compiled only with `esplora_async`; returns early when no regtest URL is baked in.
+#[cfg(all(test, target_arch = "wasm32", feature = "esplora_async"))]
+pub(crate) mod test_wasm_online;
 
 pub use crate::database::enums::TypeOfTransition;
 #[cfg(feature = "_validation")]

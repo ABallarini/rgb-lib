@@ -203,6 +203,26 @@ impl Wallet {
         Self::new_with_database(wallet_data, keys, None)
     }
 
+    /// Create a new RGB singlesig wallet over the in-memory backend.
+    ///
+    /// Unlike [`Wallet::new`], which opens the target's default backend (SQLite natively), this
+    /// always builds the wallet over the in-memory backend, which the host persists itself. It is
+    /// the construction path for a host that has no filesystem or SQLite driver, such as a
+    /// `wasm32` binding: the wallet owns the backend for its whole lifetime, and the host makes the
+    /// state durable with [`Wallet::snapshot`] followed by
+    /// `wallet::persistence::save_snapshot`, or with [`Wallet::flush`] on `wasm32`.
+    /// [`Wallet::from_snapshot`] rebuilds the wallet from those bytes.
+    ///
+    /// `wallet_data` is validated the same way as in [`Wallet::new`]; the in-memory backend has no
+    /// directory to create, so its `data_dir` is unused.
+    ///
+    /// Only available where the in-memory backend exists: on `wasm32`, without the `sqlite`
+    /// feature, and in tests.
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
+    pub fn new_in_memory(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
+        Self::new_with_database(wallet_data, keys, Some(RgbLibDatabase::new_memory()))
+    }
+
     // on wasm the in-memory database is single-threaded, so its `Arc` is intentional
     #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub(crate) fn new_with_database(

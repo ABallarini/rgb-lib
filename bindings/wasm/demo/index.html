@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>rgb-lib wasm demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 48rem; }
+      pre { background: #f4f4f4; padding: 1rem; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>rgb-lib wasm demo</h1>
+    <p>
+      Build the bindings for the web target first:
+      <code>wasm-pack build bindings/wasm --target web --out-dir pkg</code>, then serve
+      <code>bindings/wasm</code> (for example <code>python3 -m http.server 8080</code>) and open
+      <a href="http://localhost:8080/demo/">/demo/</a>.
+    </p>
+    <p>
+      The wallet is loaded from IndexedDB on every page load, so a reload keeps the addresses
+      handed out before it and a flushed asset.
+    </p>
+    <button id="address">New receive address</button>
+    <button id="flush">Flush to IndexedDB</button>
+    <pre id="log"></pre>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

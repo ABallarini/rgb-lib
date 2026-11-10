@@ -124,6 +124,27 @@ fn memory_database_success() {
     assert!(assets.ifa.unwrap_or_default().is_empty());
 }
 
+#[test]
+#[parallel]
+fn new_in_memory_success() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+
+    let wallet = Wallet::new_in_memory(
+        data_dir.wallet_data(),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+
+    // the host-facing constructor always selects the snapshot-capable memory backend
+    assert!(wallet.database().memory_backend().is_some());
+    assert!(wallet.snapshot().unwrap().is_some());
+    assert_eq!(
+        wallet.get_keys().master_fingerprint,
+        keys.master_fingerprint
+    );
+}
+
 /// Seed the one unspent colored TXO the offline issuer allocates asset amounts to.
 fn seed_colored_txo(wallet: &Wallet) {
     use crate::database::entities::txo::ActiveModel as DbTxoActMod;

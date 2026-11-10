@@ -5,389 +5,21 @@
 //! behind it and the expected client behavior are detailed in `v1.0-changes-spec.md`, whose
 //! sections the comments in this crate refer to.
 //!
-//! All timestamps are absolute Unix timestamps in seconds, UTC
+//! All timestamps are absolute Unix timestamps in seconds, UTC.
+//!
+//! This is the native blocking transport. The protocol definitions and the request builders live
+//! in [`super::jsonrpc`] and are shared with the browser `fetch` client, so payloads, signatures
+//! and error mapping are the same on both.
 
 use super::*;
 
-/// Number of transfers an invoice is reserved for: invoices are single-use.
-pub(crate) const INVOICE_QUOTA: u32 = 1;
+// keep the protocol types importable from this module, as they were before the browser transport
+// moved them into `jsonrpc`
+pub(crate) use super::jsonrpc::*;
 
 pub struct ProxyClient {
     client: RestClient,
     base_url: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct JsonRpcError {
-    pub(crate) code: i64,
-    pub(crate) message: String,
-    // -100 (cannot change), -200 (invalid) and -300 (missing) errors list the offending fields
-    // under data.fields
-    #[serde(default)]
-    pub(crate) data: Option<serde_json::Value>,
-}
-
-impl JsonRpcError {
-    /// Whether the error reports `field` among its offending ones (`data.fields`).
-    fn has_field(&self, field: &str) -> bool {
-        self.data
-            .as_ref()
-            .and_then(|d| d.get("fields"))
-            .and_then(|f| f.as_array())
-            .is_some_and(|fields| fields.iter().any(|f| f.as_str() == Some(field)))
-    }
-
-    /// Whether `data.fields` reports exactly `field` as the sole offending one.
-    fn only_field(&self, field: &str) -> bool {
-        self.data
-            .as_ref()
-            .and_then(|d| d.get("fields"))
-            .and_then(|f| f.as_array())
-            .is_some_and(|fields| fields.len() == 1 && fields[0].as_str() == Some(field))
-    }
-
-    /// The error message, followed by the offending fields (`data.fields`) when reported.
-    fn details(&self) -> String {
-        let fields: Vec<&str> = self
-            .data
-            .as_ref()
-            .and_then(|d| d.get("fields"))
-            .and_then(|f| f.as_array())
-            .map(|fields| fields.iter().filter_map(|f| f.as_str()).collect())
-            .unwrap_or_default();
-        if fields.is_empty() {
-            self.message.clone()
-        } else {
-            format!("{}: {}", self.message, fields.join(", "))
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct JsonRpcRequest<P> {
-    method: String,
-    jsonrpc: String,
-    id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<P>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct JsonRpcResponse<R> {
-    jsonrpc: String,
-    id: Option<String>,
-    pub(crate) result: Option<R>,
-    pub(crate) error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct NullRequest;
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ServerInfoResponse {
-    pub(crate) protocol_version: String,
-    pub(crate) version: String,
-    pub(crate) uptime: i64,
-    // optional so the protocol-version check still works against older/non-compliant proxies whose
-    // server.info response lacks v1.0 fields
-    #[serde(default)]
-    pub(crate) current_time: Option<String>,
-    #[serde(default)]
-    pub(crate) max_expiry_secs: Option<String>,
-    #[serde(default)]
-    pub(crate) max_quota: Option<String>,
-    #[serde(default)]
-    pub(crate) max_pow_difficulty: Option<String>,
-    #[serde(default)]
-    pub(crate) retention_grace_secs: Option<String>,
-    #[serde(default)]
-    pub(crate) max_media: Option<String>,
-}
-
-/// Status of an invoice on a recipient proxy, as reported by `invoice.check`.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum InvoiceStatus {
-    /// the invoice is not known to the proxy (not reserved, or its data has been deleted)
-    Unknown,
-    /// the invoice is reserved and can still accept transfers
-    Available,
-    /// the invoice is reserved and its quota is full
-    Full,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct InvoiceCheckResponse {
-    pub(crate) status: InvoiceStatus,
-    pub(crate) pow_difficulty: String,
-}
-
-/// State of a transfer on a recipient proxy, as reported by `transfer.list`.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ProxyTransferState {
-    /// the transfer data (consignment and media) is available
-    Pending,
-    /// the transfer data has been deleted via `transfer.retrieved`
-    Retrieved,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct GetConsignmentResponse {
-    pub(crate) consignment: String,
-    pub(crate) sender_transport_endpoint: String,
-    pub(crate) sender_pk: String,
-    pub(crate) consignment_hash: String,
-    pub(crate) batch: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct PostAckResponse {
-    pub(crate) result: bool,
-    pub(crate) sender_pk: Option<String>,
-    pub(crate) signed_tx: Option<String>,
-    pub(crate) signed_tx_hash: Option<String>,
-    // the operation expiration, which together with the sender proxy retention grace sets the
-    // broadcast deadline; optional so responses from non-compliant proxies are still accepted
-    #[serde(default)]
-    pub(crate) expires_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct GetAckResponse {
-    // transfers that have not been responded to yet (pending) are absent from both maps
-    pub(crate) acks: HashMap<String, bool>,
-    pub(crate) signatures: HashMap<String, String>,
-}
-
-/// Per-transfer data registered with `ack.prepare`, whose signed TX travels in the uploaded file.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct AckTransferData {
-    pub(crate) recipient_pk: String,
-    pub(crate) consignment_hash: String,
-    pub(crate) signed_tx: String,
-}
-
-/// Data of a transfer posted with `consignment.post`, besides the consignment file.
-#[derive(Debug, Clone, Serialize)]
-pub struct PostConsignmentData {
-    pub(crate) invoice_id: String,
-    pub(crate) transfer_id: String,
-    pub(crate) sender_transport_endpoint: String,
-    pub(crate) sender_pk: String,
-    pub(crate) consignment_hash: String,
-    pub(crate) batch: bool,
-    /// signature of `transfer_id ‖ consignment_hash ‖ blob_hash ‖ "consignment"` with the sender
-    /// key
-    pub(crate) signature: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct TransferIDParam {
-    transfer_id: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct InvoiceIDsParam {
-    invoice_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct MediaGetParams {
-    transfer_id: String,
-    media_id: String,
-}
-
-/// Message authenticating an `invoice.prepare` call on a proxy with proxy-level authentication
-/// enabled: `invoice_id ‖ expires_at ‖ recipient_pk ‖ quota`.
-pub(crate) fn prepare_invoice_auth_message(
-    invoice_id: &str,
-    expires_at: &str,
-    recipient_pk: &str,
-) -> String {
-    format!("{invoice_id}{expires_at}{recipient_pk}{INVOICE_QUOTA}")
-}
-
-/// Message authenticating an `ack.prepare` call on a proxy with proxy-level authentication
-/// enabled: `sender_pk ‖ expires_at ‖ signed_tx_hash` followed, for each transfer sorted
-/// lexicographically by transfer ID, by `transfer_id ‖ recipient_pk ‖ consignment_hash`.
-pub(crate) fn prepare_ack_auth_message(
-    sender_pk: &str,
-    expires_at: &str,
-    signed_tx_hash: &str,
-    transfer_data: &HashMap<String, AckTransferData>,
-) -> String {
-    let mut message = format!("{sender_pk}{expires_at}{signed_tx_hash}");
-    let mut transfer_ids: Vec<&String> = transfer_data.keys().collect();
-    transfer_ids.sort();
-    for transfer_id in transfer_ids {
-        let data = &transfer_data[transfer_id];
-        message.push_str(transfer_id);
-        message.push_str(&data.recipient_pk);
-        message.push_str(&data.consignment_hash);
-    }
-    message
-}
-
-/// Message signed by the sender to post a consignment:
-/// `transfer_id ‖ consignment_hash ‖ blob_hash ‖ "consignment"`, the literal keeping it distinct
-/// from the `media.post` one.
-pub(crate) fn post_consignment_message(
-    transfer_id: &str,
-    consignment_hash: &str,
-    blob_hash: &str,
-) -> String {
-    format!("{transfer_id}{consignment_hash}{blob_hash}consignment")
-}
-
-/// Message signed by the sender to post a media: `transfer_id ‖ media_id ‖ blob_hash ‖ "media"`,
-/// the literal keeping it distinct from the `consignment.post` one.
-pub(crate) fn post_media_message(transfer_id: &str, media_id: &str, blob_hash: &str) -> String {
-    format!("{transfer_id}{media_id}{blob_hash}media")
-}
-
-/// Message signed by the recipient to list the transfers of an invoice: `invoice_id ‖ timestamp`.
-pub(crate) fn list_transfers_message(invoice_id: &str, timestamp: &str) -> String {
-    format!("{invoice_id}{timestamp}")
-}
-
-/// Message signed by the sender to get the ACKs of an operation: `sorted transfer_ids ‖ timestamp`.
-pub(crate) fn get_ack_message(transfer_ids: &[String], timestamp: &str) -> String {
-    let mut sorted_ids = transfer_ids.to_vec();
-    sorted_ids.sort();
-    format!("{}{timestamp}", sorted_ids.concat())
-}
-
-/// Message signed by the recipient to mark a transfer as retrieved: `transfer_id ‖ "retrieved"`.
-pub(crate) fn transfer_retrieved_message(transfer_id: &str) -> String {
-    format!("{transfer_id}retrieved")
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct PrepareInvoiceParams {
-    invoice_id: String,
-    expires_at: String,
-    recipient_pk: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signature: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct PostConsignmentParams {
-    #[serde(flatten)]
-    data: PostConsignmentData,
-    file_size: String,
-    pow_timestamp: String,
-    pow_nonce: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PostMediaParams {
-    transfer_id: String,
-    media_id: String,
-    file_size: String,
-    signature: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ListTransfersParams {
-    invoice_id: String,
-    signature: String,
-    timestamp: String,
-}
-
-#[derive(Debug, Serialize)]
-struct TransferRetrievedParams {
-    transfer_id: String,
-    signature: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AckTransferParams<'a> {
-    recipient_pk: &'a str,
-    consignment_hash: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct PrepareAckParams<'a> {
-    transfer_data: HashMap<&'a str, AckTransferParams<'a>>,
-    expires_at: String,
-    signed_tx_hash: String,
-    sender_pk: String,
-    file_size: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signature: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct PostAckParams {
-    transfer_id: String,
-    ack: bool,
-    signature: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GetAckParams {
-    transfer_ids: Vec<String>,
-    signature: String,
-    timestamp: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CleanAckParams {
-    transfer_ids: Vec<String>,
-    signature: String,
-}
-
-/// The proof of work difficulty required by a proxy refusing a `consignment.post` call with an
-/// "invalid proof of work" error, if that is the error.
-pub(crate) fn pow_difficulty_required(err: &JsonRpcError) -> Option<u32> {
-    if err.code != -114 {
-        return None;
-    }
-    err.data
-        .as_ref()
-        .and_then(|d| d.get("pow_difficulty"))
-        .and_then(|d| d.as_str())
-        .and_then(|d| d.parse().ok())
-}
-
-/// Map a proxy JSON-RPC error to a typed [`Error`].
-pub(crate) fn map_proxy_error(err: JsonRpcError) -> Error {
-    match err.code {
-        // ack.clean nulls only signed_tx (rest of the operation is untouched); a later
-        // ack.prepare re-supplying it is a legitimate recovery, not a conflict
-        -100 if err.only_field("signed_tx") => Error::SignedTxCleared,
-        -100 => Error::ProxyCannotChange {
-            details: err.details(),
-        },
-        -101 => Error::InvoiceNotReserved,
-        -102 => Error::TransferIDInUse,
-        -104 => Error::OperationNotFound,
-        -105 => Error::OperationExpired,
-        // all the recipients have ACKed an operation, so its TX was released and can no longer be
-        // revoked
-        -107 => Error::ProxyTxAlreadyReleased,
-        -111 => Error::InvoiceExpired,
-        -112 => Error::InvoiceQuotaExceeded,
-        -113 => Error::TransferIDDeleted,
-        // the proxy refuses calls starting a new transfer
-        -115 => Error::ProxyDraining,
-        // the transfer already has the max number of media the proxy accepts
-        -116 => Error::ProxyTooManyMedia,
-        // the consignment is not (or no longer, after transfer.retrieved) available
-        -400 | -402 | -403 => Error::NoConsignment,
-        -401 => Error::NoMedia,
-        -501 => Error::InvalidProxyAuthSignature,
-        -502 => Error::InvalidEndpointAuthSignature,
-        -503 => Error::InvalidContentSignature,
-        // an expiration in the past or beyond the proxy's max_expiry_secs
-        -200 if err.has_field("expires_at") => Error::ExpirationInvalid,
-        // other -200 (invalid), -300 (missing), -301 (missing file) and anything else
-        _ => Error::Proxy {
-            details: err.details(),
-        },
-    }
 }
 
 impl ProxyClient {
@@ -417,12 +49,7 @@ impl ProxyClient {
         method: &str,
         params: Option<P>,
     ) -> Result<JsonRpcResponse<R>, Error> {
-        let body = JsonRpcRequest {
-            method: method.to_string(),
-            jsonrpc: s!("2.0"),
-            id: None,
-            params,
-        };
+        let body = request_body(method, params);
         self.client
             .post(&self.base_url)
             .header(CONTENT_TYPE, JSON)
@@ -508,13 +135,12 @@ impl ProxyClient {
         pow_nonce: &str,
     ) -> Result<JsonRpcResponse<bool>, Error> {
         let file_size = Self::file_size(consignment_path.as_ref())?;
-        let params = serde_json::to_string(&PostConsignmentParams {
+        let params = params_json(&PostConsignmentParams {
             data: data.clone(),
             file_size: file_size.to_string(),
             pow_timestamp: pow_timestamp.to_string(),
             pow_nonce: pow_nonce.to_string(),
-        })
-        .expect("serializable");
+        });
         self.call_multipart(
             "consignment.post",
             params,
@@ -544,13 +170,12 @@ impl ProxyClient {
         signature: &str,
     ) -> Result<JsonRpcResponse<bool>, Error> {
         let file_size = Self::file_size(media_path.as_ref())?;
-        let params = serde_json::to_string(&PostMediaParams {
+        let params = params_json(&PostMediaParams {
             transfer_id: transfer_id.to_string(),
             media_id: media_id.to_string(),
             file_size: file_size.to_string(),
             signature: signature.to_string(),
-        })
-        .expect("serializable");
+        });
         self.call_multipart("media.post", params, multipart::Part::file(media_path)?)
     }
 
@@ -593,12 +218,8 @@ impl ProxyClient {
         signature: Option<String>,
     ) -> Result<JsonRpcResponse<bool>, Error> {
         // the signed TXs are uploaded as a file mapping each transfer ID to its signed TX
-        let signed_txs: HashMap<&str, &str> = transfer_data
-            .iter()
-            .map(|(tid, data)| (tid.as_str(), data.signed_tx.as_str()))
-            .collect();
-        let file = serde_json::to_vec(&signed_txs).expect("serializable");
-        let params = serde_json::to_string(&PrepareAckParams {
+        let file = ack_file(&transfer_data);
+        let params = params_json(&PrepareAckParams {
             transfer_data: transfer_data
                 .iter()
                 .map(|(tid, data)| {
@@ -616,8 +237,7 @@ impl ProxyClient {
             sender_pk: sender_pk.to_string(),
             file_size: file.len().to_string(),
             signature,
-        })
-        .expect("serializable");
+        });
         let file = multipart::Part::bytes(file)
             .file_name("signed_txs.json")
             .mime_str(JSON)
@@ -889,5 +509,59 @@ mod tests {
     #[test]
     fn prepare_ack_error() {
         assert_proxy_errors(|c| c.prepare_ack(HashMap::new(), "999", "h", "pk", None));
+    }
+
+    // Wire parity with the browser client: both build the JSON-RPC envelope and the multipart
+    // `params` field through `jsonrpc`, so the body the native client puts on the wire is exactly
+    // the body the shared builder produces.
+    #[test]
+    fn native_wire_body_matches_the_shared_builder() {
+        let expected = serde_json::to_string(&request_body(
+            "consignment.get",
+            Some(TransferIDParam {
+                transfer_id: s!("123"),
+            }),
+        ))
+        .unwrap();
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/")
+            .match_header("content-type", JSON)
+            .match_body(mockito::Matcher::Exact(expected.clone()))
+            .with_status(200)
+            .with_header("content-type", JSON)
+            .with_body(r#"{"jsonrpc":"2.0","result":{"consignment":"c","sender_transport_endpoint":"rpc://x","sender_pk":"pk","consignment_hash":"h","batch":false}}"#)
+            .create();
+        let client = ProxyClient::new(&server.url()).unwrap();
+        assert!(client.get_consignment("123").unwrap().result.is_some());
+        mock.assert();
+    }
+
+    #[test]
+    fn native_multipart_params_match_the_shared_builder() {
+        let expected = params_json(&PostMediaParams {
+            transfer_id: s!("123"),
+            media_id: s!("456"),
+            file_size: s!("0"),
+            signature: s!("00"),
+        });
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(regex::escape(&expected)))
+            .with_status(200)
+            .with_header("content-type", JSON)
+            .with_body(r#"{"jsonrpc":"2.0","result":true}"#)
+            .create();
+        let tmp_path = tempfile::NamedTempFile::new().unwrap();
+        let client = ProxyClient::new(&server.url()).unwrap();
+        assert!(
+            client
+                .post_media("123", "456", tmp_path.path(), "00")
+                .unwrap()
+                .result
+                .unwrap()
+        );
+        mock.assert();
     }
 }

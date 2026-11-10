@@ -16,6 +16,7 @@ These are the officially supported languages:
 | Node.js  | c-ffi  | Linux, macOS, Windows | [rgb-lib-nodejs] |
 | Python   | uniffi | Linux, macOS, Windows | [rgb-lib-python] |
 | Swift    | uniffi | iOS, macOS            | [rgb-lib-swift]  |
+| Browser  | wasm   | wasm32                | [wasm]           |
 
 ## Unofficial
 
@@ -37,3 +38,4 @@ These are the unofficially supported languages:
 [rgb-lib-c-sharp]: https://github.com/UTEXO-Protocol/rgb-lib-c-sharp
 [c-ffi]: c-ffi/
 [uniffi]: uniffi/
+[wasm]: wasm/

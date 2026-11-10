@@ -3,8 +3,11 @@
 //! Runs under `wasm-bindgen-test` in a real browser (see the `wasm_browser_lifecycle` job). It
 //! builds a wallet over the in-memory backend, issues an asset offline, flushes it through the
 //! wallet twice, rebuilds the wallet from the loaded bytes and checks the newest state survived. It
-//! also covers the browser blob adapter: media/consignment-shaped files written through the wallet
-//! travel in the snapshot and come back on restore, overwrites keep the last bytes, the namespace
+//! also covers watch-only and multisig lifecycle round trips: watched keys derive and persist
+//! addresses without a mnemonic, and a multisig wallet keeps its descriptors and database state
+//! across a hub-free flush/restore. It also covers the browser blob adapter: media/consignment-shaped
+//! files written through the wallet travel in the snapshot and come back on restore, overwrites keep
+//! the last bytes, the namespace
 //! rejects traversal keys, a pre-browser v2 snapshot restores with an empty adapter and multisig
 //! wallets carry their files too. No indexer or network access is involved.
 //!
@@ -166,6 +169,85 @@ async fn wallet_lifecycle_over_indexed_db() {
     assert!(load_snapshot(WALLET_ID).await.unwrap().is_none());
 }
 
+/// A watched key set signs nothing: the wallet derives addresses from the account xpubs and the
+/// mnemonic never reaches the snapshot. Generate the keys, restore them from the mnemonic, then
+/// drop the mnemonic before construction.
+#[wasm_bindgen_test]
+async fn watch_only_wallet_lifecycle_over_indexed_db() {
+    const WALLET_ID: &str = "watch-only-lifecycle-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+    assert!(load_snapshot(WALLET_ID).await.unwrap().is_none());
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let restored_keys = crate::keys::restore_keys(
+        BitcoinNetwork::Regtest,
+        keys.mnemonic.clone(),
+        WitnessVersion::Taproot,
+    )
+    .expect("the generated mnemonic restores");
+    assert_eq!(restored_keys.master_fingerprint, keys.master_fingerprint);
+
+    let watch_only_keys = SinglesigKeys::from_keys_no_mnemonic(&restored_keys, None);
+    assert!(watch_only_keys.mnemonic.is_none());
+    let mut wallet = Wallet::new_with_database(
+        wallet_data(),
+        watch_only_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .expect("watch-only wallet construction");
+    assert!(wallet.get_keys().mnemonic.is_none());
+
+    // the watch-only wallet still hands out addresses; capture the next index without revealing it
+    let first = wallet.get_address().unwrap();
+    let second = wallet.get_address().unwrap();
+    assert_ne!(first, second);
+    let index = wallet
+        .bdk_wallet()
+        .spk_index()
+        .last_revealed_index(KeychainKind::Internal)
+        .expect("two addresses were revealed");
+    let next = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::Internal, index + 1)
+        .address
+        .to_string();
+    let descriptors = wallet.get_descriptors();
+    let fingerprint = wallet.get_keys().master_fingerprint.clone();
+
+    wallet.flush(WALLET_ID).await.unwrap();
+    let stored = load_snapshot(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the watch-only snapshot");
+    assert!(
+        !stored
+            .windows(keys.mnemonic.len())
+            .any(|window| window == keys.mnemonic.as_bytes()),
+        "the watch-only snapshot carries the watched mnemonic"
+    );
+    drop(wallet);
+
+    let mut restored =
+        Wallet::from_snapshot(&stored, wallet_data(), watch_only_keys).expect("watch-only restore");
+    assert!(restored.get_keys().mnemonic.is_none());
+    assert_eq!(restored.get_keys().master_fingerprint, fingerprint);
+    assert_eq!(restored.get_descriptors(), descriptors);
+    assert_eq!(
+        restored.get_address().unwrap(),
+        next,
+        "the restored watch-only wallet did not resume at the stored address index"
+    );
+    assert_eq!(
+        restored
+            .bdk_wallet()
+            .spk_index()
+            .last_revealed_index(KeychainKind::Internal),
+        Some(index + 1)
+    );
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+}
+
 fn singlesig_keys() -> SinglesigKeys {
     let wallet_data = wallet_data();
     SinglesigKeys::from_keys(
@@ -186,7 +268,7 @@ fn memory_wallet() -> (Wallet, SinglesigKeys) {
 }
 
 /// Give the offline issuer one unspent colored TXO. No indexer takes part.
-fn add_unspent_colored_txo(wallet: &Wallet) {
+fn add_unspent_colored_txo(wallet: &impl WalletCore) {
     wallet
         .database()
         .memory_backend()
@@ -612,6 +694,74 @@ async fn multisig_browser_files_survive_restore() {
 
     let restored = MultisigWallet::from_snapshot(&stored, wallet_data(), keys).expect("restore");
     assert_eq!(restored.files().read(&media).unwrap(), b"multisig media");
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+}
+
+/// Hub-coordinated multisig operations are outside the wasm wallet-only scope: `get_address` and
+/// the rest of the online APIs only compile with the native `_online` features. The hub-free subset
+/// is pinned here: construction, descriptors, a descriptor-derived address and a database mutation
+/// all survive a flush/restore.
+#[wasm_bindgen_test]
+async fn multisig_wallet_lifecycle_over_indexed_db() {
+    const WALLET_ID: &str = "multisig-lifecycle-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+    assert!(load_snapshot(WALLET_ID).await.unwrap().is_none());
+
+    let keys = multisig_keys();
+    let wallet = MultisigWallet::new_with_database(
+        wallet_data(),
+        keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .expect("multisig construction over the in-memory backend");
+    assert_eq!(
+        wallet.get_wallet_data().bitcoin_network,
+        wallet_data().bitcoin_network
+    );
+    let descriptors = wallet.get_descriptors();
+    // identity without a hub: the descriptor-derived address and the stored cosigner set
+    let address = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::Internal, 0)
+        .address
+        .to_string();
+    assert_eq!(wallet.get_local_last_processed_operation_idx().unwrap(), 0);
+
+    // a representative database mutation that needs no native hub
+    add_unspent_colored_txo(&wallet);
+    wallet.flush(WALLET_ID).await.unwrap();
+    let stored = load_snapshot(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the flushed multisig snapshot");
+    drop(wallet);
+
+    let restored =
+        MultisigWallet::from_snapshot(&stored, wallet_data(), keys.clone()).expect("restore");
+    assert_eq!(restored.get_keys(), keys);
+    assert_eq!(restored.get_descriptors(), descriptors);
+    assert_eq!(
+        restored
+            .bdk_wallet()
+            .peek_address(KeychainKind::Internal, 0)
+            .address
+            .to_string(),
+        address
+    );
+    assert_eq!(
+        restored.get_local_last_processed_operation_idx().unwrap(),
+        0
+    );
+    let txn = restored.database().begin_transaction().unwrap();
+    let txos = txn.iter_txos().unwrap();
+    txn.commit().unwrap();
+    assert_eq!(txos.len(), 1, "the mutated TXO did not survive the restore");
+    assert_eq!(
+        txos[0].txid,
+        "0000000000000000000000000000000000000000000000000000000000000001"
+    );
+    assert_eq!(txos[0].vout, 0);
 
     delete_snapshot(WALLET_ID).await.unwrap();
 }

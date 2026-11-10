@@ -36,3 +36,6 @@ _run_deny_warnings cargo check --lib --target wasm32-unknown-unknown --no-defaul
 # browser Esplora capability: async client over fetch, no blocking socket/TLS in the graph
 _run_deny_warnings cargo check --lib --target wasm32-unknown-unknown --no-default-features --features wallet,esplora_async
 _run cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wallet -- -D warnings
+# resolved graph and wasm artifact: no mio/SQLite C/ring/native TLS/blocking HTTP/Tokio/hyper
+_run bash scripts/wasm_graph_check.sh --self-test
+_run bash scripts/wasm_graph_check.sh
