@@ -292,16 +292,10 @@ impl WalletOffline for MultisigWallet {
     }
 }
 
+// the overrides reach the multisig hub, which is a native online capability, so this impl is
+// native-only: on the browser the receive wallet is the singlesig one.
 #[cfg(feature = "_online")]
-impl WalletOnline for MultisigWallet {
-    fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn supports_out_of_band_exchange(&self) -> bool {
-        false
-    }
-
+impl ReceiveWallet for MultisigWallet {
     // every cosigner downloads the consignment from the recipient proxy
     fn releases_received_transfer_data(&self) -> bool {
         false
@@ -348,6 +342,17 @@ impl WalletOnline for MultisigWallet {
                 .set_transfer_status(batch_transfer_idx, false)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "_online")]
+impl WalletOnline for MultisigWallet {
+    fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn supports_out_of_band_exchange(&self) -> bool {
+        false
     }
 }
 

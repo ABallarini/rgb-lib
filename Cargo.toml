@@ -226,6 +226,7 @@ all = ["wallet", "sqlite", "bitcoind", "electrum", "esplora", "bdk_file_store_mi
 # native persistent storage: owns the SQLite driver, the Tokio runtime and the migration crate.
 # `wallet` alone compiles the entity layer without a driver, which is what the wasm32 build uses.
 sqlite = [
+    "wallet",
     "dep:rgb-lib-migration",
     "dep:tokio",
     "sea-orm/sqlx-sqlite",
@@ -274,7 +275,7 @@ bdk_file_store_migration = ["wallet", "bdk_wallet/file_store"]
 # import the RGB data (and convert the consignment/fascia files) of wallets created before the RGB
 # data moved into the rgb-lib DB; only needed to upgrade such wallets, so it can be turned off to
 # drop the legacy formats support of rgb-ops
-rgb_fs_store_migration = ["wallet", "rgb-ops/legacy"]
+rgb_fs_store_migration = ["wallet", "sqlite", "rgb-ops/legacy"]
 # implied by each indexer feature, marking a build whose wallet can reach the network; it exists
 # only to avoid repeating the list of indexer features in cfgs and must not be enabled on its own
 _online = ["wallet", "dep:x25519-dalek"]
@@ -282,7 +283,6 @@ _online = ["wallet", "dep:x25519-dalek"]
 # reaching the network; it exists only to avoid repeating the list of indexer validation features
 # in cfgs and must not be enabled on its own
 _validation = ["reqwest"]
-# support for an indexer, to use it with an online wallet (enabling the wallet functionality)
 bitcoind = [
     "_online",
     "bitcoind_validation",

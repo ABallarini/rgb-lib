@@ -135,6 +135,14 @@ pub trait WalletOffline: WalletBackup {
         WalletPath::from_segments(&[MEDIA_DIR])?.join(digest)
     }
 
+    /// Remove media blobs saved earlier in the same receive, after one of them could not be saved.
+    fn cleanup_media_files(&self, keys: &[WalletPath]) -> Result<(), Error> {
+        for key in keys {
+            self.files().remove(key)?;
+        }
+        Ok(())
+    }
+
     /// Read a fascia through the wallet adapter.
     fn read_fascia_at(&self, key: &WalletPath) -> Result<Fascia, Error> {
         crate::utils::fascia_from_bytes(self.files().read(key)?, key.as_str())

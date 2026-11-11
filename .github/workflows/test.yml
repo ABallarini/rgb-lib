@@ -2,9 +2,9 @@ name: Run tests
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -96,9 +96,12 @@ jobs:
       - name: Test with indexer validation features
         run: |
           cargo test --profile reldebug --no-default-features --features bitcoind_validation,electrum_validation,esplora_validation
-      - name: Test with wallet feature
+      - name: Check the native wallet-only build
         run: |
-          cargo test --profile reldebug --no-default-features --features wallet
+          cargo check --lib --no-default-features --features wallet
+      - name: Test with wallet and sqlite features
+        run: |
+          cargo test --profile reldebug --no-default-features --features wallet,sqlite
 
   test_doc:
     timeout-minutes: 30

@@ -34,7 +34,10 @@ fn select_in_chunks<T>(
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) struct DbAssetTransferData {
     pub(crate) asset_transfer: DbAssetTransfer,
     pub(crate) transfers: Vec<DbTransfer>,
@@ -52,7 +55,10 @@ impl DbBatchTransfer {
             .collect()
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_transfers(
         &self,
         asset_transfers: &[DbAssetTransfer],
@@ -76,7 +82,10 @@ impl DbBatchTransfer {
         })
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_incoming_transfer(
         &self,
         asset_transfers: &[DbAssetTransfer],
@@ -138,7 +147,10 @@ impl DbBatchTransfer {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) struct DbBatchTransferData {
     pub(crate) asset_transfers_data: Vec<DbAssetTransferData>,
 }
@@ -196,7 +208,10 @@ impl DbTransfer {
         (asset_transfer.clone(), batch_transfer.clone())
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn uses_out_of_band_exchange(&self) -> bool {
         self.invoice_string
             .as_deref()
@@ -1792,7 +1807,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn set_txo(&self, txo: DbTxoActMod) -> Result<i32, Error> {
         match self {
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
@@ -1819,7 +1837,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn update_transfer(
         &self,
         transfer: &mut DbTransferActMod,
@@ -1842,7 +1863,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn update_asset_transfer(
         &self,
         asset_transfer: &mut DbAssetTransferActMod,
@@ -1875,7 +1899,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn update_batch_transfer(
         &self,
         batch_transfer: &mut DbBatchTransferActMod,
@@ -1892,7 +1919,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn update_transfer_transport_endpoint(
         &self,
         transfer_transport_endpoint: &mut DbTransferTransportEndpointActMod,
@@ -1909,7 +1939,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn update_txo(&self, txo: DbTxoActMod) -> Result<(), Error> {
         match self {
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
@@ -1999,7 +2032,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn del_reserved_txos_for_batch_transfer(
         &self,
         batch_transfer_idx: i32,
@@ -2077,7 +2113,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_batch_transfer_transfers(
         &self,
         batch_transfer_idx: i32,
@@ -2260,7 +2299,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn iter_pending_witness_txos(&self) -> Result<Vec<DbTxo>, Error> {
         match self {
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
@@ -2346,7 +2388,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_transfer_transport_endpoints_data(
         &self,
         transfer_idx: i32,

@@ -542,11 +542,19 @@ pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, 
     crate::database::sqlite::open(wallet_dir)
 }
 
-/// Without SQLite (wasm32, or a native build without the `sqlite` feature) the wallet data lives
-/// in the in-memory backend, which the host persists as a snapshot.
-#[cfg(any(target_arch = "wasm32", not(feature = "sqlite")))]
+/// On wasm32 the wallet data lives in the in-memory backend, which the host persists as a snapshot.
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn setup_db<P: AsRef<Path>>(_wallet_dir: P) -> Result<RgbLibDatabase, Error> {
     Ok(RgbLibDatabase::new_memory())
+}
+
+/// Native builds without SQLite have no durable backend and no snapshot envelope, so refuse to
+/// construct a wallet that would silently keep its state in RAM.
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sqlite")))]
+pub(crate) fn setup_db<P: AsRef<Path>>(_wallet_dir: P) -> Result<RgbLibDatabase, Error> {
+    Err(Error::Internal {
+        details: "the native wallet requires the `sqlite` feature".to_string(),
+    })
 }
 
 /// Select the database the wallet will use for its whole lifecycle: the injected backend when one

@@ -461,8 +461,8 @@ impl RgbLibWallet {
     ///
     /// Runs a full scan of both wallet keychains and applies the result to the shared wallet. The
     /// change is in the in-memory database when this resolves; call `flush()` to make it durable.
-    /// `stop_gap` is the unused script count per keychain (default 20). Nothing is broadcast and
-    /// no RGB state is touched: RGB consignment reception, transfers and send stay native-only.
+    /// `stop_gap` is the unused script count per keychain (default 20). No RGB state is touched
+    /// here: use [`RgbLibWallet::sync_online`] to also receive pending RGB transfers.
     #[cfg(target_arch = "wasm32")]
     pub async fn sync(
         &mut self,
@@ -473,6 +473,59 @@ impl RgbLibWallet {
             .sync_async(&indexer_url, stop_gap.map(|gap| gap as usize))
             .await
             .map_err(|e| failure("cannot sync the wallet", e))
+    }
+
+    /// Receive one RGB transfer from a proxy and ACK it, then leave persistence to `flush()`.
+    ///
+    /// `proxy_url` is the recipient proxy holding the consignment, `indexer_url` the Esplora
+    /// endpoint used for the chain answers the validation needs and for broadcasting a released
+    /// signed TX, and `transfer_id` the proxy transfer ID. The transfer must belong to a pending
+    /// incoming invoice of this wallet: a repeated call on an already handled transfer is a no-op
+    /// and a transfer not addressed to this wallet throws. The whole receive, including the ACK
+    /// and `transfer.retrieved`, happens in one wallet transaction; a failure rolls it back. Call
+    /// `flush()` afterwards to persist the new state.
+    ///
+    /// Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already
+    /// handled before this call.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = receiveTransfer)]
+    pub async fn receive_transfer(
+        &mut self,
+        proxy_url: String,
+        indexer_url: String,
+        transfer_id: String,
+    ) -> Result<String, JsValue> {
+        let idx = self
+            .wallet
+            .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id)
+            .await
+            .map_err(|e| failure("cannot receive the transfer", e))?;
+        json_result("cannot serialize the receive result", &idx)
+    }
+
+    /// Sync the BDK wallet and receive every pending RGB transfer from a proxy.
+    ///
+    /// Runs the read-only BDK full scan, then lists the transfers of each pending incoming invoice
+    /// on `proxy_url`, receiving and ACKing each one through the same shared driver as
+    /// [`RgbLibWallet::receive_transfer`]. Only `Pending` transfers addressed to this wallet are
+    /// considered and an already handled one is skipped, so a repeated call is idempotent. Call
+    /// `flush()` afterwards to persist the new state.
+    ///
+    /// Returns JSON: the array of `batch_transfer_idx` handled by this call, in processing order.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = syncOnline)]
+    pub async fn sync_online(
+        &mut self,
+        proxy_url: String,
+        indexer_url: String,
+        stop_gap: Option<u32>,
+    ) -> Result<String, JsValue> {
+        let handled = self
+            .wallet
+            .sync_online_async(&proxy_url, &indexer_url, stop_gap.map(|gap| gap as usize))
+            .await
+            .map_err(|e| failure("cannot sync the wallet online", e))?;
+        json_result("cannot serialize the online sync result", &handled)
     }
 
     /// Fee estimate for confirmation within `blocks`, in sat/vB, from an Esplora endpoint.

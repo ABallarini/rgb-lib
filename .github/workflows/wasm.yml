@@ -3,9 +3,9 @@ name: WASM
 on:
   workflow_dispatch:
   push:
-    branches: [ "master", "feat/**" ]
+    branches: [ "master", "next", "feat/**" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
 
 env:
   CARGO_TERM_COLOR: always

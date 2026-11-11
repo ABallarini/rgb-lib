@@ -7,17 +7,24 @@
 #
 # What is proven: the async `EsploraTransport` and `EsploraResolver` reach a real Esplora over the
 # browser `fetch` backend (tip height, tip/block-1 hash, header, block-1 coinbase TX, confirmations,
-# fee-estimate mapping, witness/chain-net resolution). The wallet's read-only online step is proven
-# too: `Wallet::sync_async` full-scans both BDK keychains through the transport, persists the update
-# in the wallet database (a snapshot restore sees it), and answers `tip_height_async` and
+# fee-estimate mapping, witness/chain-net resolution). The wallet's online steps are proven too:
+# `Wallet::sync_async` full-scans both BDK keychains through the transport, persists the update in
+# the wallet database (a snapshot restore sees it), and answers `tip_height_async` and
 # `fee_estimation_async`. When `RGB_REGTEST_PROXY_URL` is set, one read-only proxy call
 # (`server.info`) is proven too. When `RGB_REGTEST_MNEMONIC` is set, the scan must see funding of
 # that mnemonic's first internal receive address.
 #
-# What is NOT proven: the RGB online flow. On wasm, `go_online`, `OnlineOptions`, consignment
-# reception, transfers, send and broadcast still live behind the native-only `_online` feature;
-# `esplora_async` does not enable it. The test asserts that gate instead of faking an end-to-end
-# flow.
+# `regtest_proxy_receive_smoke` additionally runs when `RGB_REGTEST_PROXY_URL`,
+# `RGB_REGTEST_MNEMONIC` and `RGB_REGTEST_TRANSFER_ID` are set: it runs `sync_online_async` and
+# `receive_transfer_async` against a real pending proxy transfer prepared by the harness, asserts
+# the second receive is idempotent, and checks the recorded ACK and the transfer status. Preparing
+# the transfer needs the native sender flow (the browser cannot reserve a proxy invoice yet):
+# create a proxy receive on a native wallet with these keys and send to it. Without that setup the
+# test returns early.
+#
+# What is NOT proven: transfers, send, proxy invoice reservation, media upload and hub
+# coordination. Those still live behind the native-only `_online` feature; `esplora_async` does not
+# enable it, and the regression test still asserts that gate.
 #
 # Controlled environment (a fresh regtest chain has only genesis, so mine first):
 #
@@ -30,12 +37,15 @@
 #   export RGB_REGTEST_ESPLORA_URL=http://127.0.0.1:3002
 #   export RGB_REGTEST_PROXY_URL=http://127.0.0.1:3000   # optional
 #   export RGB_REGTEST_MNEMONIC="..."                    # optional: fund its first internal address
+#   export RGB_REGTEST_TRANSFER_ID="..."                 # optional: a pending proxy transfer for it
 #   bash scripts/wasm_online_smoke.sh
 #
 # `RGB_REGTEST_MNEMONIC` makes the funded-balance assertion real. Create a wallet from it, take the
 # first address from `getAddress()` (the vanilla/internal receive address) and send regtest BTC to
 # it before running. Without the variable that assertion is skipped, so the smoke still proves the
-# scan, the persisted state, the tip and the fee estimate on an unfunded wallet.
+# scan, the persisted state, the tip and the fee estimate on an unfunded wallet. The same mnemonic
+# plus `RGB_REGTEST_TRANSFER_ID` makes the receive smoke real: the named proxy transfer must be
+# pending for an invoice of that wallet.
 #
 # Requirements: rust with the wasm32-unknown-unknown target, `wasm-bindgen-test-runner` matching
 # the wasm-bindgen version in Cargo.lock, and a Chrome/chromedriver pair. CI adds these in the
@@ -74,6 +84,10 @@ fi
 if [[ -n "${FUNDED_MNEMONIC}" ]]; then
     export RGB_REGTEST_MNEMONIC="${FUNDED_MNEMONIC}"
 fi
+TRANSFER_ID="${RGB_REGTEST_TRANSFER_ID:-}"
+if [[ -n "${TRANSFER_ID}" ]]; then
+    export RGB_REGTEST_TRANSFER_ID="${TRANSFER_ID}"
+fi
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
 export WASM_BINDGEN_TEST_TIMEOUT=300
 
@@ -81,4 +95,4 @@ export WASM_BINDGEN_TEST_TIMEOUT=300
 touch src/wallet/test_wasm_online.rs
 
 cargo test --lib --target wasm32-unknown-unknown --no-default-features \
-    --features wallet,esplora_async -- regtest_esplora_online_smoke
+    --features wallet,esplora_async -- regtest_
