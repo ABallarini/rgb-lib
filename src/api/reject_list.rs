@@ -24,12 +24,27 @@ impl RejectListClient {
     }
 
     pub(crate) fn get_reject_list(&self) -> Result<String, Error> {
-        self.client
+        const MAX_BODY_BYTES: u64 = 1024 * 1024;
+        let response = self
+            .client
             .get(&self.base_url)
             .send()
-            .map_err(Self::req_err)?
-            .text()
-            .map_err(Self::req_err)
+            .map_err(Self::req_err)?;
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_BODY_BYTES)
+        {
+            return Err(Self::req_err("response body exceeds the size limit"));
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::req_err(format!("HTTP status {status}")));
+        }
+        let text = response.text().map_err(Self::req_err)?;
+        if text.len() as u64 > MAX_BODY_BYTES {
+            return Err(Self::req_err("response body exceeds the size limit"));
+        }
+        Ok(text)
     }
 }
 

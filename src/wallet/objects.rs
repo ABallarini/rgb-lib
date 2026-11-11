@@ -2160,7 +2160,10 @@ pub enum PrepareTransferPsbtResult {
     Success(Box<BeginOperationData>),
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ReceivedConsignmentMeta {
     #[serde(default)]
@@ -2202,7 +2205,14 @@ pub struct FailTransfersOutcome {
     pub cannot_fail: bool,
 }
 
-#[cfg(feature = "_online")]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub enum ReceiveMode {
     Proxy(ProxyReceiveData),
     OutOfBand { media_file_paths: Vec<String> },
@@ -2215,7 +2225,14 @@ pub enum ReceiveMode {
 /// the sender proxy endpoint + consignment hash are needed to sign and post the ACK. Out-of-band
 /// exchange bypasses the proxy entirely (no key exchange, integrity covered by the plaintext hash),
 /// so it carries none of this.
-#[cfg(feature = "_online")]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 #[derive(Clone)]
 pub struct ProxyReceiveData {
     /// endpoint the consignment was downloaded from
@@ -2234,7 +2251,14 @@ pub struct ProxyReceiveData {
     pub(crate) batch: bool,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)] // the browser receive loop that uses it is not wired yet
 pub enum ReceiveMatcher {
     Blind(SecretSeal),
     /// the script paid and, when known (proxy exchange), the blinding of the seal
@@ -2243,7 +2267,14 @@ pub enum ReceiveMatcher {
 }
 
 impl DbTransfer {
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )]
     pub(crate) fn receive_matcher(&self, blinding: Option<u64>) -> Result<ReceiveMatcher, Error> {
         let recipient_id = self
             .recipient_id
@@ -2263,7 +2294,7 @@ impl DbTransfer {
                 }
             }
             RecipientTypeFull::Witness { .. } => {
-                let script_pubkey = script_buf_from_recipient_id(recipient_id)?
+                let script_pubkey = crate::utils::script_buf_from_recipient_id(recipient_id)?
                     .expect("witness recipient ID should yield a script");
                 Ok(ReceiveMatcher::Witness(script_pubkey, blinding))
             }

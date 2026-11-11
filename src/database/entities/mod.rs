@@ -9,59 +9,59 @@ pub mod asset;
 pub mod asset_transfer;
 pub mod backup_info;
 pub mod batch_transfer;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_anchor;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_block;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_descriptor_last_revealed;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_tx;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_txout;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_wallet;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod bdk_wallet_locked_outpoint;
 pub mod coloring;
 pub mod media;
 pub mod pending_witness_script;
 pub mod reserved_txo;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_aluvm_lib;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_assignment;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_bundle;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_bundle_contract;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_bundle_witness;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_genesis;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_global_state;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_invalid_op;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_op_bundle;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_op_input;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_outpoint_opout;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_schema;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_schema_type_lib;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_secret_seal;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_secret_seal_opout;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_type_lib;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_witness;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(any(target_arch = "wasm32", not(feature = "sqlite")), allow(dead_code))]
 pub mod rgb_witness_ord;
 pub mod token;
 pub mod token_media;

@@ -36,6 +36,8 @@ FORBIDDEN=(
     minreq
     tokio
     hyper
+    tokio-util
+    hyper-util
     bdk_electrum
     bdk_bitcoind_rpc
 )
@@ -58,12 +60,14 @@ echo
 
 # assert_clean <label>: reads a `cargo tree` graph on stdin, fails on a forbidden crate.
 assert_clean() {
-    local label=$1 line name failed=0
+    local label=$1 line name crate failed=0
     while IFS= read -r line; do
+        crate=${line%% *}
         for name in "${FORBIDDEN[@]}"; do
-            case "${line}" in
-                "${name} v"*) echo "FAIL: forbidden crate '${name}' in the wasm graph for ${label}"; failed=1 ;;
-            esac
+            if [[ "${crate}" == "${name}" ]]; then
+                echo "FAIL: forbidden crate '${name}' in the wasm graph for ${label}"
+                failed=1
+            fi
         done
     done
     ((failed == 0)) || return 1
@@ -112,7 +116,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
         echo "FAIL: checker accepted a synthetic forbidden line"
         exit 1
     fi
-    echo "ok: checker rejects a synthetic forbidden line"
+    if ! printf 'hyperx v0.1.0\n' | assert_clean "self-test (near-miss name)"; then
+        echo "FAIL: checker rejected a crate whose name merely starts like a forbidden one"
+        exit 1
+    fi
+    echo "ok: checker rejects exact forbidden names and accepts near-misses"
     exit 0
 fi
 

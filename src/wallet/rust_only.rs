@@ -351,7 +351,7 @@ impl Wallet {
         let resolver = OffchainResolver {
             witness_id,
             consignment: &consignment,
-            fallback: self.blockchain_resolver(),
+            fallback: &self.blockchain_resolver(),
         };
 
         debug!(self.logger(), "Validating consignment...");
@@ -502,7 +502,7 @@ impl Wallet {
         let resolver = OffchainResolver {
             witness_id,
             consignment: &consignment,
-            fallback: self.blockchain_resolver(),
+            fallback: &self.blockchain_resolver(),
         };
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
         let validation_config = ValidationConfig {

@@ -19,8 +19,13 @@ pub(crate) mod offline;
 pub(crate) mod online;
 #[cfg(target_arch = "wasm32")]
 pub mod persistence;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) mod receive;
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) mod receive_wasm;
 #[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
 pub(crate) mod wasm_online;
 // async chain-resolution boundary: the browser fetches before the DB transaction opens, native
@@ -87,12 +92,31 @@ pub(crate) use files::{WalletFiles, WalletPath, WasmFilesState, default_files};
 pub(crate) use indexer::BitcoindClient;
 #[cfg(feature = "_online")]
 pub(crate) use indexer::Indexer;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ProxyReceiveData;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ReceiveMatcher;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ReceiveMode;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ReceivedConsignmentMeta;
 #[cfg(feature = "_online")]
 pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, FailTransfersOutcome,
     LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData, PrepareRgbPsbtResult,
-    PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher, ReceiveMode,
-    ReceivedConsignmentMeta, RefreshResultTrait, TryFailBatchTransferOutcome,
+    PrepareTransferPsbtResult, RefreshResultTrait, TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     AssetTransferColoringInfo, InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails,
@@ -106,6 +130,11 @@ pub(crate) use offline::TRANSFERS_DIR;
 pub(crate) use offline::WalletOffline;
 #[cfg(feature = "_online")]
 pub(crate) use online::WalletOnline;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use receive::ReceiveWallet;
 
 use super::*;
 
@@ -130,7 +159,10 @@ pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARG
 /// (`retention_grace_secs`) to ACK a transfer: it's the time a released signed TX can still be
 /// retrieved after the operation expiration, so a recipient offline for longer might miss it. A
 /// transfer whose sender proxy grants less is NACKed (see `v1.0-changes-spec.md` 6.4).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const MIN_SENDER_RETENTION_GRACE_SECS: u32 = 86400;
 
 /// Time, in seconds, a recipient waits after the broadcast deadline (the operation expiration plus

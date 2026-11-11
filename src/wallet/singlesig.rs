@@ -130,6 +130,12 @@ impl WalletBackup for Wallet {
 
 impl WalletOffline for Wallet {}
 
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+impl ReceiveWallet for Wallet {}
+
 #[cfg(feature = "_online")]
 impl WalletOnline for Wallet {
     fn wallet_specific_consistency_checks(&mut self, txn: &DbTxn) -> Result<(), Error> {

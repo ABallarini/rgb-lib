@@ -4,11 +4,12 @@
 
 use super::*;
 
-use super::receive::{NativeReceiveTransport, ReceiveDriver, drive_native};
+use super::receive::{
+    NativeReceiveTransport, ReceiveDriver, broadcast_error, drive_native, parse_reject_list,
+    transfer_retrieved_signature,
+};
 
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
-/// Signed TX released to a recipient, saved to broadcast it again until the broadcast deadline
-const RECEIVED_SIGNED_TX_FILE: &str = "rcv_signed.tx";
 
 const MIN_FEE_RATE: u64 = 1;
 
@@ -213,14 +214,7 @@ pub(super) fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error
     if let Some(grace) = mock_retention_grace() {
         return Ok(grace);
     }
-    let res = ProxyClient::new(proxy_url)?.get_info()?;
-    if let Some(err) = res.error {
-        return Err(map_proxy_error(err));
-    }
-    let info = res.result.ok_or_else(|| Error::Proxy {
-        details: s!("missing server.info result"),
-    })?;
-    Ok(proxy_retention_grace(&info))
+    retention_grace_from_info(ProxyClient::new(proxy_url)?.get_info())
 }
 
 /// The minimum sender proxy retention grace a recipient requires to ACK a transfer.
@@ -237,7 +231,7 @@ pub(super) fn min_sender_retention_grace() -> u32 {
 pub(super) fn broadcast_deadline(expires_at: Option<&str>, retention_grace: u32) -> Option<i64> {
     expires_at
         .and_then(|exp| exp.parse::<i64>().ok())
-        .map(|exp| exp + i64::from(retention_grace))
+        .and_then(|exp| exp.checked_add(i64::from(retention_grace)))
 }
 
 /// Minimum time between the expiration of an outgoing operation and the earliest invoice
@@ -265,7 +259,7 @@ fn check_get_ack_error(err: JsonRpcError) -> Result<(), Error> {
     }
 }
 
-pub trait WalletOnline: WalletOffline {
+pub trait WalletOnline: WalletOffline + ReceiveWallet {
     fn blockchain_resolver(&self) -> ChainResolver<'_> {
         ChainResolver {
             inner: &self.online_data().as_ref().unwrap().resolver,
@@ -303,41 +297,8 @@ pub trait WalletOnline: WalletOffline {
                 Ok(tx)
             }
             Err(e) => {
-                match e {
-                    #[cfg(feature = "bitcoind")]
-                    IndexerError::Bitcoind(ref e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("min relay fee not met")
-                            || err_str.contains("mempool min fee not met")
-                        {
-                            return Err(Error::MinFeeNotMet { txid: txid.clone() });
-                        } else if err_str.contains("Fee exceeds maximum configured")
-                            || err_str.contains("max-fee-exceeded")
-                        {
-                            return Err(Error::MaxFeeExceeded { txid: txid.clone() });
-                        }
-                    }
-                    #[cfg(feature = "electrum")]
-                    IndexerError::Electrum(ref e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("min relay fee not met")
-                            || err_str.contains("mempool min fee not met")
-                        {
-                            return Err(Error::MinFeeNotMet { txid: txid.clone() });
-                        } else if err_str.contains("Fee exceeds maximum configured") {
-                            return Err(Error::MaxFeeExceeded { txid: txid.clone() });
-                        }
-                    }
-                    #[cfg(feature = "esplora")]
-                    IndexerError::Esplora(ref e) => {
-                        if let EsploraError::HttpResponse { message, .. } = e {
-                            if message.contains("min relay fee not met") {
-                                return Err(Error::MinFeeNotMet { txid: txid.clone() });
-                            } else if message.contains("Fee exceeds maximum configured") {
-                                return Err(Error::MaxFeeExceeded { txid: txid.clone() });
-                            }
-                        }
-                    }
+                if let Some(err) = broadcast_error(&txid, &e) {
+                    return Err(err);
                 }
                 if indexer.get_tx_confirmations(&txid)?.is_none() {
                     return Err(Error::FailedBroadcast {
@@ -726,103 +687,6 @@ pub trait WalletOnline: WalletOffline {
 
     fn supports_out_of_band_exchange(&self) -> bool {
         true
-    }
-
-    /// Whether the data of a handled incoming transfer can be deleted from the recipient proxy
-    /// (`transfer.retrieved`), which is not the case when other wallets sharing the invoice (e.g.
-    /// multisig cosigners) still need to download it.
-    fn releases_received_transfer_data(&self) -> bool {
-        true
-    }
-
-    fn get_hub_fail_status(&self, _batch_transfer_idx: i32) -> Result<bool, Error> {
-        Ok(false)
-    }
-
-    fn set_hub_accept_status(&self, _batch_transfer_idx: i32) -> Result<Option<bool>, Error> {
-        Ok(Some(true))
-    }
-
-    fn set_hub_fail_status(&self, _batch_transfer_idx: i32) -> Result<(), Error> {
-        Ok(())
-    }
-
-    /// Clear the pending witness flag of the TXOs flagged for witness receives that are not pending
-    /// anymore, as they would otherwise never become spendable. The TXOs are identified by their
-    /// outpoint (the one registered when accepting the consignment) or by the script they pay (one
-    /// detected by a sync, e.g. when the counterparty broadcasts before its consignment gets
-    /// refused). Pending witness scripts are left to [`WalletCore::reconcile_pending_witness`],
-    /// which keeps watching them for a grace time in case the counterparty broadcasts anyway.
-    fn unflag_pending_witness_txos(
-        &self,
-        txn: &DbTxn,
-        outpoints: &HashSet<Outpoint>,
-        scripts: &HashSet<ScriptBuf>,
-    ) -> Result<(), Error> {
-        for txo in txn.iter_pending_witness_txos()? {
-            let outpoint = txo.outpoint();
-            let pays_script = || {
-                self.bdk_wallet()
-                    .tx_graph()
-                    .get_txout(outpoint.clone().into())
-                    .is_some_and(|txout| scripts.contains(&txout.script_pubkey))
-            };
-            if !outpoints.contains(&outpoint) && !pays_script() {
-                continue;
-            }
-            let mut txo: DbTxoActMod = txo.into();
-            txo.pending_witness = ActiveValue::Set(false);
-            txn.update_txo(txo)?;
-        }
-        Ok(())
-    }
-
-    /// Clear the pending witness flag of the TXOs flagged for the witness receives of a batch
-    /// transfer being failed.
-    fn clean_failed_witness_receives(
-        &self,
-        txn: &DbTxn,
-        batch_transfer: &DbBatchTransfer,
-    ) -> Result<(), Error> {
-        if !batch_transfer.incoming {
-            return Ok(());
-        }
-        let mut outpoints = HashSet::new();
-        let mut scripts = HashSet::new();
-        for transfer in txn.get_batch_transfer_transfers(batch_transfer.idx)? {
-            let vout = match transfer.recipient_type {
-                Some(RecipientTypeFull::Witness { vout }) => vout,
-                _ => continue,
-            };
-            if let (Some(txid), Some(vout)) = (&batch_transfer.txid, vout) {
-                outpoints.insert(Outpoint {
-                    txid: txid.clone(),
-                    vout,
-                });
-            }
-            if let Some(recipient_id) = transfer.recipient_id
-                && let Some(script) = script_buf_from_recipient_id(recipient_id)?
-            {
-                scripts.insert(script);
-            }
-        }
-        if outpoints.is_empty() && scripts.is_empty() {
-            return Ok(());
-        }
-        self.unflag_pending_witness_txos(txn, &outpoints, &scripts)
-    }
-
-    fn fail_batch_transfer(
-        &self,
-        txn: &DbTxn,
-        batch_transfer: &DbBatchTransfer,
-    ) -> Result<DbBatchTransfer, Error> {
-        self.set_hub_fail_status(batch_transfer.idx)?;
-        self.clean_failed_witness_receives(txn, batch_transfer)?;
-        txn.del_reserved_txos_for_batch_transfer(batch_transfer.idx)?;
-        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
-        updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
-        txn.update_batch_transfer(&mut updated_batch_transfer)
     }
 
     /// Revoke the stored signed TXs for an outgoing operation on the sender proxy (`ack.clean`).
@@ -1246,39 +1110,6 @@ pub trait WalletOnline: WalletOffline {
         Ok(Psbt::from_str(&psbt_str)?)
     }
 
-    /// Verify a downloaded blob against its expected plaintext hash, first decrypting it with the
-    /// key shared with the counterparty as dictated by `encryption`, the mode the payload is
-    /// expected in: the recipient's invoice preference for consignments and media, always
-    /// `Required` for the signed TX. For `Optional` the encrypted form is tried first, falling back
-    /// to cleartext; for `Unsupported` the blob is taken as cleartext. Anything that doesn't match
-    /// the hash afterwards (e.g. a blob encrypted despite `Unsupported`) is rejected.
-    fn decrypt_blob_with_shared_key(
-        &self,
-        raw: Vec<u8>,
-        encryption: Encryption,
-        own_seed: &[u8],
-        counterparty_pubkey_hex: &str,
-        hash_hex: &str,
-    ) -> Result<Vec<u8>, Error> {
-        let (sym_key, hash_raw) =
-            Self::shared_key_and_hash(own_seed, counterparty_pubkey_hex, hash_hex)?;
-
-        // When `raw` is returned unmodified it might still be encrypted.
-        // The plaintext hash check below catches these cases as well.
-        let plaintext = match encryption {
-            Encryption::Unsupported => raw,
-            Encryption::Required => decrypt_blob(&raw, &sym_key, &hash_raw)?,
-            Encryption::Optional => match decrypt_blob(&raw, &sym_key, &hash_raw) {
-                Ok(p) => p,
-                Err(_) => raw,
-            },
-        };
-        if hex::encode(sha256_digest(&plaintext)) != hash_hex {
-            return Err(Error::HashMismatch);
-        }
-        Ok(plaintext)
-    }
-
     /// Symmetric key shared with the counterparty (from the own operation seed and the
     /// counterparty's hex-encoded Ed25519 pubkey) and the raw bytes of the expected plaintext hash,
     /// as the encryption primitives take them.
@@ -1287,19 +1118,7 @@ pub trait WalletOnline: WalletOffline {
         counterparty_pubkey_hex: &str,
         hash_hex: &str,
     ) -> Result<([u8; 32], [u8; 32]), Error> {
-        let seed: [u8; 32] = own_seed.try_into().map_err(|_| Error::Internal {
-            details: s!("invalid own secret key"),
-        })?;
-        let own_sk = ed25519_from_seed(&seed);
-        let counterparty_vk =
-            verifying_key_from_bytes(&hex::decode(counterparty_pubkey_hex).map_err(|_| {
-                Error::Internal {
-                    details: s!("invalid counterparty pubkey"),
-                }
-            })?)?;
-        let derived = derive_shared(&own_sk, &counterparty_vk)?;
-        let hash_raw = decode_hash_hex(hash_hex)?;
-        Ok((derived.sym_key, hash_raw))
+        crate::encryption::shared_key_and_hash(own_seed, counterparty_pubkey_hex, hash_hex)
     }
 
     /// File counterpart of [`decrypt_blob_with_shared_key`](Self::decrypt_blob_with_shared_key)
@@ -1380,11 +1199,6 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
-    fn get_received_signed_tx_path(&self, recipient_id: &str) -> PathBuf {
-        self.get_receive_consignment_path(recipient_id)
-            .with_file_name(RECEIVED_SIGNED_TX_FILE)
-    }
-
     /// Decrypt the released signed TX, verify it, save it so it can be broadcast again until the
     /// broadcast deadline (v1.0-changes-spec.md 6.4) and broadcast it.
     fn broadcast_received_tx(
@@ -1395,23 +1209,12 @@ pub trait WalletOnline: WalletOffline {
         sender_pubkey_hex: &str,
         recipient_seed: &[u8],
     ) -> Result<(), Error> {
-        let enc = general_purpose::STANDARD
-            .decode(signed_tx_b64)
-            .map_err(InternalError::from)?;
-        let tx_bytes = self.decrypt_blob_with_shared_key(
-            enc,
-            Encryption::Required,
-            recipient_seed,
-            sender_pubkey_hex,
+        let tx = self.decrypt_save_received_tx(
+            recipient_id,
+            signed_tx_b64,
             signed_tx_hash,
-        )?;
-        let tx: BdkTransaction = bdk_wallet::bitcoin::consensus::encode::deserialize(&tx_bytes)
-            .map_err(|e| Error::Internal {
-                details: e.to_string(),
-            })?;
-        self.files().atomic_write(
-            &self.wallet_key(&self.get_received_signed_tx_path(recipient_id))?,
-            &tx_bytes,
+            sender_pubkey_hex,
+            recipient_seed,
         )?;
         self.broadcast_tx(tx)?;
         Ok(())
@@ -1483,17 +1286,10 @@ pub trait WalletOnline: WalletOffline {
         // for the proxy exchange the media is stored under an id derived from the shared secret (not
         // the plaintext digest); derive the secret once so we can locate each attachment
         let proxy_derived = if let ReceiveMode::Proxy(data) = mode {
-            let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
-                details: s!("invalid recipient secret key"),
-            })?;
-            let recipient_sk = ed25519_from_seed(&seed);
-            let sender_vk =
-                verifying_key_from_bytes(&hex::decode(&data.sender_pubkey).map_err(|_| {
-                    Error::Internal {
-                        details: s!("invalid sender pubkey"),
-                    }
-                })?)?;
-            Some(derive_shared(&recipient_sk, &sender_vk)?)
+            Some(crate::encryption::shared_keys(
+                recipient_seed,
+                &data.sender_pubkey,
+            )?)
         } else {
             None
         };
@@ -1563,13 +1359,6 @@ pub trait WalletOnline: WalletOffline {
         Ok(true)
     }
 
-    fn cleanup_media_files(&self, keys: &[WalletPath]) -> Result<(), Error> {
-        for key in keys {
-            self.files().remove(key)?;
-        }
-        Ok(())
-    }
-
     fn get_consignment(
         &self,
         proxy_url: &str,
@@ -1612,271 +1401,20 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
-    /// Locate the consignment terminal paying this recipient.
-    ///
-    /// Returns the terminal witness bundle and, for witness receives, the vout being paid.
-    ///
-    /// The bundle and vout returned here together identify the one payment destination the transfer
-    /// waits on and credits from. A consignment declaring more than one such destination for this
-    /// recipient - a different witness TXID (so a different bundle), or a different vout of the
-    /// same TXID - is refused instead of resolved arbitrarily: `terminals` is counterparty-supplied
-    /// data, it is read before validation, and its iteration order (by bundle ID) carries no
-    /// meaning, so picking one of several genuinely different destinations would credit an
-    /// unpredictable one of them. Several terminal seals defined on the same vout of the same
-    /// bundle are a different matter (see the dedup in `push_match` below): that is one
-    /// destination described more than once, not several to choose between.
-    fn find_terminal_bundle<'c>(
-        &self,
-        consignment: &'c RgbTransfer,
-        matcher: &ReceiveMatcher,
-    ) -> Option<(&'c WitnessBundle, Option<u32>)> {
-        let mut matches: Vec<(&'c WitnessBundle, Option<u32>)> = vec![];
-        let mut push_match = |witness_bundle: &'c WitnessBundle, vout: Option<u32>| {
-            // several revealed seals of one bundle can be defined on the same witness output - one
-            // per assignment, e.g. two assignment types paying this recipient, differing only by
-            // blinding - so keying on bundle + vout counts them as the single payment they are,
-            // instead of tripping the ambiguity check below
-            //
-            // a no-op for concealed seals, which are matched on presence alone and push `None` once
-            // per bundle
-            if !matches.iter().any(|(wb, v)| {
-                wb.bundle.bundle_id() == witness_bundle.bundle.bundle_id() && *v == vout
-            }) {
-                matches.push((witness_bundle, vout));
-            }
-        };
-
-        for (bundle_id, seals) in consignment.terminals.iter() {
-            // this lookup happens before validation, so a bundle a terminal references is not
-            // yet guaranteed to be present and is simply skipped here: validation later refuses
-            // the consignment over it
-            let Some(witness_bundle) = consignment
-                .bundles
-                .iter()
-                .find(|wb| wb.bundle.bundle_id() == *bundle_id)
-            else {
-                continue;
-            };
-            match matcher {
-                ReceiveMatcher::Blind(secret_seal) => {
-                    if seals
-                        .into_iter()
-                        .any(|seal| seal == BuilderSeal::Concealed(*secret_seal))
-                    {
-                        push_match(witness_bundle, None);
-                    }
-                }
-                ReceiveMatcher::Witness(script_pubkey, blinding) => {
-                    let tx = &witness_bundle.tx;
-                    for seal in seals {
-                        // a witness receive is matched by the scriptPubKey at the vout the seal
-                        // names, which a concealed seal does not expose - it belongs to the blind
-                        // arm above
-                        let BuilderSeal::Revealed(seal) = seal else {
-                            continue;
-                        };
-                        // only a seal closed by this bundle's own witness TX is a payment made by
-                        // it: one naming an explicit TXID points at another transaction, so its
-                        // vout would be looked up against the wrong `tx` below
-                        if seal.txid != TxPtr::WitnessTx {
-                            continue;
-                        }
-                        // with the proxy exchange the blinding is derived from the keys of both
-                        // parties, so a seal with a different one doesn't pay this transfer
-                        if blinding.is_some_and(|b| b != seal.blinding) {
-                            continue;
-                        }
-                        let vout = seal.vout.into_u32();
-                        if tx
-                            .output
-                            .get(vout as usize)
-                            .is_some_and(|out| out.script_pubkey == *script_pubkey)
-                        {
-                            push_match(witness_bundle, Some(vout));
-                        }
-                    }
-                }
-            }
-        }
-
-        if matches.len() > 1 {
-            error!(
-                self.logger(),
-                "Consignment declares {} terminal payments to this recipient, refusing it as \
-                 ambiguous",
-                matches.len()
-            );
-            return None;
-        }
-        matches.into_iter().next()
-    }
-
-    // extract the assignments in a single bundle that pay the recipient identified by
-    // `known_concealed` (blind receives) or by the witness `vout` (witness receives)
-    fn assignments_for_bundle(
-        &self,
-        bundle: &WitnessBundle,
-        vout: Option<u32>,
-        known_concealed: Option<SecretSeal>,
-    ) -> HashMap<Opout, Assignment> {
-        let mut received = HashMap::new();
-        for KnownTransition { transition, opid } in bundle.bundle.known_transitions.iter() {
-            for (ass_type, typed_assigns) in transition.assignments.iter() {
-                for (no, fungible_assignment) in typed_assigns.as_fungible().iter().enumerate() {
-                    let opout = Opout::new(*opid, *ass_type, no as u16);
-                    if let BuilderSeal::Concealed(seal) = fungible_assignment.seal
-                        && Some(seal) == known_concealed
-                    {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(
-                                    opout,
-                                    Assignment::Fungible(fungible_assignment.state.as_u64()),
-                                );
-                            }
-                            OS_INFLATION => {
-                                received.insert(
-                                    opout,
-                                    Assignment::InflationRight(fungible_assignment.state.as_u64()),
-                                );
-                            }
-                            _ => {}
-                        }
-                    };
-                    if let BuilderSeal::Revealed(seal) = fungible_assignment.seal
-                        && seal.txid == TxPtr::WitnessTx
-                        && Some(seal.vout.into_u32()) == vout
-                    {
-                        match *ass_type {
-                            OS_ASSET => {
-                                received.insert(
-                                    opout,
-                                    Assignment::Fungible(fungible_assignment.state.as_u64()),
-                                );
-                            }
-                            OS_INFLATION => {
-                                received.insert(
-                                    opout,
-                                    Assignment::InflationRight(fungible_assignment.state.as_u64()),
-                                );
-                            }
-                            _ => {}
-                        }
-                    };
-                }
-                for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()
-                {
-                    let opout = Opout::new(*opid, *ass_type, no as u16);
-                    if let BuilderSeal::Concealed(seal) = structured_assignment.seal
-                        && Some(seal) == known_concealed
-                    {
-                        received.insert(opout, Assignment::NonFungible);
-                    }
-                    if let BuilderSeal::Revealed(seal) = structured_assignment.seal
-                        && seal.txid == TxPtr::WitnessTx
-                        && Some(seal.vout.into_u32()) == vout
-                    {
-                        received.insert(opout, Assignment::NonFungible);
-                    };
-                }
-            }
-        }
-
-        received
-    }
-
     fn get_reject_list(
         &self,
         reject_list_url: &str,
     ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
         let reject_list_client = RejectListClient::new(reject_list_url)?;
         let list = reject_list_client.get_reject_list()?;
-        let reject_list = list.trim();
-        let mut opout_map = HashMap::with_capacity(reject_list.lines().count());
-        for line in reject_list.lines() {
-            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
-            let opout = match Opout::from_str(opout_str) {
-                Ok(o) => o,
-                Err(_) => {
-                    warn!(
-                        self.logger(),
-                        "Ignoring invalid opout in reject list: {line}"
-                    );
-                    continue;
-                }
-            };
-            opout_map.insert(opout, is_allow);
-        }
-        let (allow_opouts, reject_opouts) = opout_map.into_iter().fold(
-            (HashSet::new(), HashSet::new()),
-            |(mut allow, mut reject), (o, allowed)| {
-                if allowed {
-                    allow.insert(o);
-                } else {
-                    reject.insert(o);
-                }
-                (allow, reject)
-            },
-        );
-
-        Ok((reject_opouts, allow_opouts))
-    }
-
-    fn extract_attachments(
-        &self,
-        stock: &RgbStock<'_>,
-        valid_contract: &ValidContract,
-        asset_schema: AssetSchema,
-    ) -> Result<Vec<Attachment>, Error> {
-        let mut attachments = vec![];
-        let contract_data = stock.consignment_data(valid_contract)?;
-        match asset_schema {
-            AssetSchema::Nia => {
-                let contract = NiaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-            AssetSchema::Uda => {
-                let contract = UdaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-                let token_data = contract.token_data();
-                if let Some(media) = token_data.media {
-                    attachments.push(media)
-                }
-                attachments.extend(
-                    token_data
-                        .attachments
-                        .to_unconfined()
-                        .values()
-                        .cloned()
-                        .collect::<Vec<Attachment>>(),
-                )
-            }
-            AssetSchema::Cfa => {
-                let contract = CfaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-            AssetSchema::Ifa => {
-                let contract = IfaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-        };
-        Ok(attachments)
+        parse_reject_list(&list, self.logger())
     }
 
     fn safe_height(&self, min_confirmations: u8) -> Result<u32, Error> {
-        Ok(self
-            .indexer()
-            .get_latest_block_height()?
-            .saturating_sub(min_confirmations as u32)
-            + 1)
+        Ok(super::receive::safe_height(
+            self.indexer().get_latest_block_height()?,
+            min_confirmations,
+        ))
     }
 
     /// Load the validated consignment of a received transfer.
@@ -1922,10 +1460,11 @@ pub trait WalletOnline: WalletOffline {
             build_opouts_dag: false,
             safe_height,
         };
+        let chain = self.blockchain_resolver();
         let resolver = OffchainResolver {
             witness_id,
             consignment: &consignment,
-            fallback: self.blockchain_resolver(),
+            fallback: &chain,
         };
         let valid_consignment = consignment
             .clone()
@@ -1943,13 +1482,6 @@ pub trait WalletOnline: WalletOffline {
             Ok(valid_consignment.save_file(tmp)?)
         })?;
         Ok(valid_consignment)
-    }
-
-    /// Delete the validated copy of a received consignment
-    fn delete_valid_consignment(&self, recipient_id: &str) -> Result<(), Error> {
-        let consignment_path = self.get_receive_consignment_path(recipient_id);
-        let key = self.wallet_key(&self.get_receive_valid_consignment_path(&consignment_path))?;
-        self.files().remove(&key)
     }
 
     // the `RecipientProxy` transport endpoint marked used, if any
@@ -2304,12 +1836,9 @@ pub trait WalletOnline: WalletOffline {
     /// Let the recipient proxy delete the data of a transfer that has been handled. Failures are
     /// only logged, as the proxy deletes the data anyway once the invoice expires.
     fn mark_transfer_retrieved(&self, proxy_url: &str, transfer_id: &str, recipient_seed: &[u8]) {
-        let Ok(seed) = <[u8; 32]>::try_from(recipient_seed) else {
+        let Some(signature) = transfer_retrieved_signature(transfer_id, recipient_seed) else {
             return;
         };
-        let sk = ed25519_from_seed(&seed);
-        let digest = sha256_digest(transfer_retrieved_message(transfer_id).as_bytes());
-        let signature = hex::encode(sign_ed25519(&sk, &digest));
         let res = ProxyClient::new(proxy_url)
             .and_then(|client| client.transfer_retrieved(transfer_id, &signature));
         match res {
@@ -2319,31 +1848,6 @@ pub trait WalletOnline: WalletOffline {
                 "Failed to mark transfer as retrieved: {:?}", r.error
             ),
             Err(e) => warn!(self.logger(), "Failed to mark transfer as retrieved: {e}"),
-        }
-    }
-
-    /// Whether a `schema` can carry a reject list.
-    fn schema_supports_reject_list(schema: AssetSchema) -> bool {
-        match schema {
-            AssetSchema::Ifa => true,
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => false,
-        }
-    }
-
-    /// The reject list URL a contract declares, read off it the way its `schema` requires.
-    ///
-    /// Only for the schemas `schema_supports_reject_list` accepts.
-    fn reject_list_url_for_schema(
-        schema: AssetSchema,
-        contract_data: ContractData<FilteredContractState>,
-    ) -> Option<String> {
-        match schema {
-            AssetSchema::Ifa => IfaWrapper::with(contract_data)
-                .reject_list_url()
-                .map(|u| u.to_string()),
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => {
-                unreachable!("{schema} does not support a reject list")
-            }
         }
     }
 
@@ -2361,8 +1865,10 @@ pub trait WalletOnline: WalletOffline {
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         let transport = NativeReceiveTransport::new(self);
+        let chain = self.blockchain_resolver();
         drive_native(self.drive_receive(
             &transport,
+            &chain,
             txn,
             batch_transfer,
             asset_transfer,
@@ -3726,47 +3232,6 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
-    fn check_dag(
-        &self,
-        dag_data: &OpoutsDagData,
-        reject_opouts: &HashSet<Opout>,
-        allow_opouts: &HashSet<Opout>,
-        check_opouts: &HashSet<Opout>,
-    ) -> Result<HashSet<Opout>, Error> {
-        let (dag, index) = dag_data;
-        let mut to_reject = HashSet::new();
-
-        // for each opout we are checking, traverse its ancestor chain
-        for check_opout in check_opouts {
-            let &opout_node = index.get(check_opout).ok_or(Error::Internal {
-                details: s!("opout not found in DAG"),
-            })?;
-
-            // traverse from this node to its ancestors, depth first
-            let mut stack = vec![opout_node];
-            let mut visited = HashSet::new();
-            while let Some(node) = stack.pop() {
-                if !visited.insert(node) {
-                    continue;
-                }
-                let node_opout = &dag[node];
-                // allow shields this path upward: do not traverse this branch further
-                if allow_opouts.contains(node_opout) {
-                    continue;
-                }
-                // encountering a reject node on an unshielded path: reject
-                if reject_opouts.contains(node_opout) {
-                    to_reject.insert(*check_opout);
-                    break;
-                }
-                for (_edge, parent) in dag.parents(node).iter(dag) {
-                    stack.push(parent);
-                }
-            }
-        }
-        Ok(to_reject)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn prepare_rgb_psbt(
         &self,
@@ -4341,11 +3806,8 @@ pub trait WalletOnline: WalletOffline {
         let mut difficulty = 0;
         for _ in 0..MAX_POW_ATTEMPTS {
             let pow_timestamp = now().unix_timestamp().to_string();
-            let pow_nonce = crate::executor::cpu_executor().proof_of_work(
-                &data.transfer_id,
-                &pow_timestamp,
-                difficulty,
-            );
+            let pow_nonce =
+                crate::encryption::solve_pow(&data.transfer_id, &pow_timestamp, difficulty);
             let res = proxy_client.post_consignment(
                 data,
                 consignment_path,

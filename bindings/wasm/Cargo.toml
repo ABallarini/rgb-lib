@@ -33,3 +33,6 @@ serde_json = "1"
 # Separate crate, like `c-ffi` and `uniffi`: its own lockfile and no membership in the rgb-lib
 # workspace, so the root lockfile and default build stay untouched.
 [workspace]
+
+[profile.release]
+overflow-checks = true

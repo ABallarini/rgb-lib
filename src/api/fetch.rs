@@ -5,8 +5,8 @@
 //! graph. Request construction, signing messages and error mapping come from `super::jsonrpc`,
 //! the same code the native client uses, so the payloads and the validation are identical.
 //!
-//! The client is built and proven to compile here but is not wired into the wallet yet: the online
-//! flow is still the blocking native one. What is deliberately different from native:
+//! The client serves the browser health check and the proxy receive path. What is deliberately
+//! different from native:
 //!
 //! - files are uploaded from memory (the browser has no filesystem path), with the same guessed
 //!   part `Content-Type` the native `multipart::Part::file` derives from the path;
@@ -29,6 +29,10 @@ use super::*;
 /// Per-request deadline. `fetch` has no separate connect timeout, so this is the native read/write
 /// timeout applied to the whole request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(READ_WRITE_TIMEOUT);
+/// Control-plane JSON (consignment/media payloads included) is capped before decoding.
+const MAX_CONTROL_BODY_BYTES: u64 = 128 * 1024 * 1024;
+/// Reject-list text is small; a larger response is not a valid list.
+const MAX_REJECT_LIST_BODY_BYTES: u64 = 1024 * 1024;
 
 /// Proxy client over the browser `fetch` API, the async counterpart of the blocking one.
 #[allow(dead_code)] // only the read-only health check (`new` + `get_info`) uses it until the online flow is wired
@@ -55,6 +59,12 @@ impl ProxyFetchClient {
         }
     }
 
+    fn reject_list_err(e: impl std::fmt::Display) -> Error {
+        Error::RejectListService {
+            details: e.to_string(),
+        }
+    }
+
     /// File part for an in-memory upload, with the same guessed `Content-Type` the native
     /// `multipart::Part::file` derives from the path's extension.
     fn upload_part(bytes: Vec<u8>, file_name: &str) -> Result<multipart::Part, Error> {
@@ -65,23 +75,38 @@ impl ProxyFetchClient {
             .map_err(Self::req_err)
     }
 
+    async fn read_body(response: reqwest_fetch::Response, limit: u64) -> Result<Vec<u8>, Error> {
+        if response.content_length().is_some_and(|len| len > limit) {
+            return Err(Self::req_err("response body exceeds the size limit"));
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::req_err(format!("HTTP status {status}")));
+        }
+        let bytes = response.bytes().await.map_err(Self::req_err)?;
+        if bytes.len() as u64 > limit {
+            return Err(Self::req_err("response body exceeds the size limit"));
+        }
+        Ok(bytes.to_vec())
+    }
+
     async fn call<P: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
         params: Option<P>,
     ) -> Result<JsonRpcResponse<R>, Error> {
         let body = request_body(method, params);
-        self.client
+        let response = self
+            .client
             .post(&self.base_url)
             .header(CONTENT_TYPE, JSON)
             .timeout(REQUEST_TIMEOUT)
             .json(&body)
             .send()
             .await
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<R>>()
-            .await
-            .map_err(Self::req_err)
+            .map_err(Self::req_err)?;
+        let bytes = Self::read_body(response, MAX_CONTROL_BODY_BYTES).await?;
+        serde_json::from_slice(&bytes).map_err(Self::req_err)
     }
 
     async fn call_multipart<R: DeserializeOwned>(
@@ -96,20 +121,50 @@ impl ProxyFetchClient {
             .text("id", "null")
             .text("params", params_json)
             .part("file", file);
-        self.client
+        let response = self
+            .client
             .post(&self.base_url)
             .timeout(REQUEST_TIMEOUT)
             .multipart(form)
             .send()
             .await
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<R>>()
-            .await
-            .map_err(Self::req_err)
+            .map_err(Self::req_err)?;
+        let bytes = Self::read_body(response, MAX_CONTROL_BODY_BYTES).await?;
+        serde_json::from_slice(&bytes).map_err(Self::req_err)
     }
 
     pub(crate) async fn get_info(&self) -> Result<JsonRpcResponse<ServerInfoResponse>, Error> {
         self.call("server.info", None::<NullRequest>).await
+    }
+
+    /// Read the reject list served at this client's URL, as the native `RejectListClient` does.
+    pub(crate) async fn get_reject_list(&self) -> Result<String, Error> {
+        let response = self
+            .client
+            .get(&self.base_url)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(Self::reject_list_err)?;
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_REJECT_LIST_BODY_BYTES)
+        {
+            return Err(Self::reject_list_err(
+                "response body exceeds the size limit",
+            ));
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::reject_list_err(format!("HTTP status {status}")));
+        }
+        let bytes = response.bytes().await.map_err(Self::reject_list_err)?;
+        if bytes.len() as u64 > MAX_REJECT_LIST_BODY_BYTES {
+            return Err(Self::reject_list_err(
+                "response body exceeds the size limit",
+            ));
+        }
+        String::from_utf8(bytes.to_vec()).map_err(Self::reject_list_err)
     }
 
     pub(crate) async fn check_invoices(

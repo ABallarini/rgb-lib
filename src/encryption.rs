@@ -21,41 +21,75 @@
 use super::*;
 
 /// Current encryption-format version, also bound into the HKDF `info` label.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) const ENC_VERSION: u8 = 0x01;
 /// Plaintext chunk size (64 KiB, binary).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) const CHUNK: usize = 65536;
 /// XChaCha20-Poly1305 authentication tag length (bytes).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const TAG: usize = 16;
 /// Ciphertext chunk size for a full plaintext chunk.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const ENC_CHUNK: usize = CHUNK + TAG;
 /// HKDF `info` label for the symmetric encryption key.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const INFO_ENC: &[u8] = b"rgb-proxy-server/enc/v1";
 /// HKDF `info` label for the media-id keying material.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const INFO_MEDIA_ID: &[u8] = b"rgb-proxy-server/enc/v1/media-id";
 /// HKDF `info` label for the witness seal blinding factor.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const INFO_SEAL_BLINDING: &[u8] = b"rgb-proxy-server/enc/v1/seal-blinding";
 /// Domain separation prefix of the invoice ID.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const INVOICE_ID_PREFIX: &str = "rgb-proxy-server/invoice/v1";
 /// Domain separation prefix of the transfer ID.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 const TRANSFER_ID_PREFIX: &str = "rgb-proxy-server/transfer/v1";
 
 /// Symmetric key material derived from a shared secret.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) struct DerivedKeys {
     /// XChaCha20-Poly1305 key for consignment / media / signed TX.
     pub(crate) sym_key: [u8; 32],
     /// HMAC key used to derive per-media identifiers.
     kmid: [u8; 32],
     /// Blinding factor of the recipient witness seal (see `v1.0-changes-spec.md` A.11).
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )]
     pub(crate) seal_blinding: u64,
 }
 
@@ -77,13 +111,19 @@ pub(crate) fn gen_ed25519() -> SigningKey {
 /// input).
 ///
 /// Used by multisig so all cosigners derive the same key from a hub-shared seed.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn ed25519_from_seed(seed: &[u8; 32]) -> SigningKey {
     SigningKey::from_bytes(seed)
 }
 
 /// Parse a raw 32-byte Ed25519 public key.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn verifying_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey, Error> {
     let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::InvalidPubkey {
         details: String::from("invalid Ed25519 public key length"),
@@ -94,7 +134,10 @@ pub(crate) fn verifying_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey, Err
 }
 
 /// Convert an Ed25519 verifying key to the corresponding X25519 public key.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 fn ed25519_pub_to_x25519(pk: &VerifyingKey) -> X25519Public {
     X25519Public::from(pk.to_montgomery().to_bytes())
 }
@@ -103,7 +146,10 @@ fn ed25519_pub_to_x25519(pk: &VerifyingKey) -> X25519Public {
 ///
 /// The X25519 scalar is `SHA-512(seed)[0..32]`; X25519 applies the standard Curve25519 clamping when
 /// computing the Diffie-Hellman, so feeding the unclamped bytes yields the correct result.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 fn ed25519_secret_to_x25519(sk: &SigningKey) -> X25519Secret {
     let hash = Sha512::digest(sk.to_bytes());
     let mut scalar = [0u8; 32];
@@ -112,7 +158,10 @@ fn ed25519_secret_to_x25519(sk: &SigningKey) -> X25519Secret {
 }
 
 /// Derive the symmetric key material shared between the two parties.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn derive_shared(
     own_sk: &SigningKey,
     their_pk: &VerifyingKey,
@@ -139,7 +188,10 @@ pub(crate) fn derive_shared(
     })
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 impl DerivedKeys {
     /// Derive the per-media identifier for a given plaintext media digest (hex-encoded SHA-256).
     pub(crate) fn media_id(&self, media_digest_hex: &str) -> String {
@@ -152,7 +204,10 @@ impl DerivedKeys {
 
 /// Compute the ID of an invoice on the proxy from its beneficiary (as encoded in the invoice) and
 /// its hex-encoded pubkey.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn invoice_id(beneficiary: &str, recipient_pk_hex: &str) -> String {
     hex::encode(sha256_digest(
         format!("{INVOICE_ID_PREFIX}{beneficiary}{recipient_pk_hex}").as_bytes(),
@@ -161,7 +216,10 @@ pub(crate) fn invoice_id(beneficiary: &str, recipient_pk_hex: &str) -> String {
 
 /// Compute the ID of a transfer on the proxy from the ID of the invoice it pays and the
 /// hex-encoded pubkey of the sender operation.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn transfer_id(invoice_id: &str, sender_pk_hex: &str) -> String {
     hex::encode(sha256_digest(
         format!("{TRANSFER_ID_PREFIX}{invoice_id}{sender_pk_hex}").as_bytes(),
@@ -199,7 +257,10 @@ pub(crate) fn solve_pow(transfer_id: &str, pow_timestamp: &str, difficulty: u32)
 }
 
 /// Build the 24-byte per-chunk nonce.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 fn chunk_nonce(base: &[u8], counter: u32, is_final: bool) -> [u8; 24] {
     let mut nonce = [0u8; 24];
     nonce[..19].copy_from_slice(base);
@@ -210,7 +271,10 @@ fn chunk_nonce(base: &[u8], counter: u32, is_final: bool) -> [u8; 24] {
 
 /// Read into `buf` until it is full or `reader` is exhausted. Fewer bytes than `buf.len()` are
 /// returned only at EOF, never because of a single short read.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 fn fill_upto(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, Error> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -277,7 +341,10 @@ pub(crate) fn encrypt_stream(
 /// one. Each chunk is authenticated and written out before the next is read, so on failure
 /// `writer` may already hold the plaintext chunks preceding the error: the caller must discard its
 /// output in that case.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn decrypt_stream(
     mut reader: impl Read,
     mut writer: impl Write,
@@ -342,7 +409,10 @@ pub(crate) fn encrypt_blob(
 }
 
 /// In-memory counterpart of [`decrypt_stream`], for small payloads such as the signed TX.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn decrypt_blob(
     blob: &[u8],
     sym_key: &[u8; 32],
@@ -351,6 +421,105 @@ pub(crate) fn decrypt_blob(
     let mut out = Vec::with_capacity(blob.len());
     decrypt_stream(blob, &mut out, sym_key, plaintext_sha256)?;
     Ok(out)
+}
+
+/// The symmetric key shared with the counterparty, derived from an operation seed and the
+/// counterparty's hex-encoded Ed25519 pubkey.
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+pub(crate) fn shared_keys(
+    own_seed: &[u8],
+    counterparty_pubkey_hex: &str,
+) -> Result<DerivedKeys, Error> {
+    let seed: [u8; 32] = own_seed.try_into().map_err(|_| Error::Internal {
+        details: s!("invalid own secret key"),
+    })?;
+    let own_sk = ed25519_from_seed(&seed);
+    let counterparty_vk =
+        verifying_key_from_bytes(&hex::decode(counterparty_pubkey_hex).map_err(|_| {
+            Error::Internal {
+                details: s!("invalid counterparty pubkey"),
+            }
+        })?)?;
+    derive_shared(&own_sk, &counterparty_vk)
+}
+
+/// The symmetric key shared with the counterparty and the raw bytes of the expected plaintext
+/// hash, as the encryption primitives take them.
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+pub(crate) fn shared_key_and_hash(
+    own_seed: &[u8],
+    counterparty_pubkey_hex: &str,
+    hash_hex: &str,
+) -> Result<([u8; 32], [u8; 32]), Error> {
+    let derived = shared_keys(own_seed, counterparty_pubkey_hex)?;
+    let hash_raw = decode_hash_hex(hash_hex)?;
+    Ok((derived.sym_key, hash_raw))
+}
+
+/// Verify a downloaded blob against its expected plaintext hash, first decrypting it with the key
+/// shared with the counterparty as dictated by `encryption`, the mode the payload is expected in:
+/// the recipient's invoice preference for consignments and media, always `Required` for the signed
+/// TX. For `Optional` the encrypted form is tried first, falling back to cleartext; for
+/// `Unsupported` the blob is taken as cleartext. Anything that doesn't match the hash afterwards
+/// (e.g. a blob encrypted despite `Unsupported`) is rejected.
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+pub(crate) fn decrypt_blob_with_shared_key(
+    raw: Vec<u8>,
+    encryption: Encryption,
+    own_seed: &[u8],
+    counterparty_pubkey_hex: &str,
+    hash_hex: &str,
+) -> Result<Vec<u8>, Error> {
+    let (sym_key, hash_raw) = shared_key_and_hash(own_seed, counterparty_pubkey_hex, hash_hex)?;
+
+    // When `raw` is returned unmodified it might still be encrypted.
+    // The plaintext hash check below catches these cases as well.
+    let plaintext = match encryption {
+        Encryption::Unsupported => raw,
+        Encryption::Required => decrypt_blob(&raw, &sym_key, &hash_raw)?,
+        Encryption::Optional => match decrypt_blob(&raw, &sym_key, &hash_raw) {
+            Ok(p) => p,
+            Err(_) => raw,
+        },
+    };
+    if hex::encode(sha256_digest(&plaintext)) != hash_hex {
+        return Err(Error::HashMismatch);
+    }
+    Ok(plaintext)
+}
+
+/// In-memory counterpart of the streaming media decryption: the base64 payload a proxy delivers is
+/// decoded, decrypted and verified against the expected plaintext hash, all in memory.
+#[cfg_attr(feature = "_online", allow(dead_code))]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+pub(crate) fn decrypt_b64_blob_with_shared_key(
+    payload_b64: &str,
+    encryption: Encryption,
+    own_seed: &[u8],
+    counterparty_pubkey_hex: &str,
+    hash_hex: &str,
+) -> Result<Vec<u8>, Error> {
+    use base64::{Engine as _, engine::general_purpose};
+
+    let raw =
+        general_purpose::STANDARD
+            .decode(payload_b64)
+            .map_err(|e| Error::InvalidEncryptedBlob {
+                details: e.to_string(),
+            })?;
+    decrypt_blob_with_shared_key(raw, encryption, own_seed, counterparty_pubkey_hex, hash_hex)
 }
 
 /// Encrypt the file at `plaintext_path` for `sym_key` into a fresh temp file and return it (kept
@@ -370,7 +539,10 @@ pub(crate) fn encrypt_to_tempfile(
 }
 
 /// Sign a message with an Ed25519 signing key, returning the raw 64-byte signature.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn sign_ed25519(sk: &SigningKey, msg: &[u8]) -> [u8; 64] {
     sk.sign(msg).to_bytes()
 }
@@ -392,7 +564,10 @@ pub(crate) fn sha256_digest(data: &[u8]) -> [u8; 32] {
 
 /// Decode a hex-encoded SHA-256 digest, as hashes are stored and exchanged with the proxy, into
 /// the bytes the encryption primitives work on.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn decode_hash_hex(hash_hex: &str) -> Result<[u8; 32], Error> {
     hex::decode(hash_hex)
         .ok()
@@ -493,6 +668,53 @@ mod tests {
             let dec = decrypt_blob(&blob, &k.sym_key, &hash).unwrap();
             assert_eq!(dec, pt);
         }
+    }
+
+    #[test]
+    fn base64_blob_decrypts_against_the_contract_digest() {
+        use base64::{Engine as _, engine::general_purpose};
+
+        let (a, b) = keys();
+        let pt = b"media payload";
+        let hash = sha256_digest(pt);
+        let k = derive_shared(&a, &b.verifying_key()).unwrap();
+        let blob = encrypt_blob(pt, &k.sym_key, &hash).unwrap();
+        let b64 = general_purpose::STANDARD.encode(&blob);
+        let seed = a.to_bytes();
+        let peer = hex::encode(b.verifying_key().to_bytes());
+
+        let dec = decrypt_b64_blob_with_shared_key(
+            &b64,
+            Encryption::Required,
+            &seed,
+            &peer,
+            &hex::encode(hash),
+        )
+        .unwrap();
+        assert_eq!(dec, pt);
+
+        // malformed base64 is a malformed payload
+        assert!(matches!(
+            decrypt_b64_blob_with_shared_key(
+                "not base64!",
+                Encryption::Required,
+                &seed,
+                &peer,
+                &hex::encode(hash)
+            ),
+            Err(Error::InvalidEncryptedBlob { .. })
+        ));
+        // a payload treated as cleartext that does not match the contract digest is refused
+        assert!(matches!(
+            decrypt_b64_blob_with_shared_key(
+                &b64,
+                Encryption::Unsupported,
+                &seed,
+                &peer,
+                &hex::encode([0u8; 32])
+            ),
+            Err(Error::HashMismatch)
+        ));
     }
 
     #[test]

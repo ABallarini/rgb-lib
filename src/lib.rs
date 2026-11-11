@@ -7,6 +7,16 @@
     all(test, target_arch = "wasm32"),
     allow(dead_code, unused_imports, unused_mut)
 )]
+// A native build without the SQLite driver keeps the shared entity and receive code compiled but
+// has no durable wallet backend; the dead-code lints would otherwise fail the feature matrix.
+#![cfg_attr(
+    all(
+        not(target_arch = "wasm32"),
+        not(feature = "sqlite"),
+        feature = "wallet"
+    ),
+    allow(dead_code, unused_imports, clippy::arc_with_non_send_sync)
+)]
 
 //! A library to manage wallets for RGB assets.
 //!
@@ -168,7 +178,6 @@ pub(crate) mod database {
 pub(crate) mod encryption;
 pub(crate) mod error;
 #[cfg(feature = "wallet")]
-pub(crate) mod executor;
 #[cfg(feature = "wallet")]
 pub mod keys;
 pub mod no_wallet;
@@ -207,6 +216,12 @@ pub use crate::{
     utils::BitcoinNetwork,
 };
 
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "esplora_async",
+    not(feature = "_online")
+))]
+use std::num::NonZeroU32;
 #[cfg(feature = "_online")]
 use std::{
     cmp::{Ordering, max, min},
@@ -300,7 +315,6 @@ use bdk_wallet::{
 #[cfg(feature = "_online")]
 use bdk_wallet::{
     bitcoin::{
-        block::Header as BlockHeader,
         blockdata::fee_rate::FeeRate,
         hashes::{HashEngine, sha256},
     },
@@ -312,12 +326,23 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 #[cfg(feature = "wallet")]
 use ed25519_dalek::SigningKey;
 #[cfg(feature = "_online")]
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier};
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use ed25519_dalek::{Signer, VerifyingKey};
 #[cfg(feature = "wallet")]
 use file_format::FileFormat;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use hkdf::Hkdf;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use hmac::{Mac, SimpleHmac};
 #[cfg(feature = "wallet")]
 use psrgbt::{RgbOutExt, RgbPsbtExt};
@@ -333,10 +358,20 @@ use rgb_lib_migration::{Migrator, MigratorTrait};
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use rgbstd::daggy::Walker;
 #[cfg(feature = "electrum")]
 use rgbstd::indexers::electrum_blocking::electrum_client::{
     Config as ElectrumConfig, ConfigBuilder,
 };
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use rgbstd::validation::{OpoutsDagData, ValidationConfig, ValidationError, Validity, Warning};
 #[cfg(feature = "wallet")]
 use rgbstd::{
     Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, TokenIndex,
@@ -386,15 +421,13 @@ use rgbstd::{
     vm::WitnessPos,
 };
 #[cfg(feature = "_online")]
-use rgbstd::{
-    contract::FilterIncludeAll,
-    daggy::Walker,
-    indexers::AnyResolver,
-    validation::{OpoutsDagData, ValidationConfig, ValidationError, Validity, Warning},
-};
+use rgbstd::{contract::FilterIncludeAll, indexers::AnyResolver};
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use schemata::{CfaWrapper, NiaWrapper, UdaWrapper};
 use schemata::{
     CollectibleFungibleAsset, InflatableFungibleAsset, NonInflatableAsset, UniqueDigitalAsset,
@@ -426,13 +459,19 @@ use serde::Deserializer;
 #[cfg(feature = "wallet")]
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use sha2::Sha512;
 #[cfg(feature = "wallet")]
 use sha2::{Digest, Sha256};
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use slog::Drain;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use slog::warn;
 #[cfg(feature = "wallet")]
 use slog::{Logger, debug, error, info, o};
@@ -455,7 +494,10 @@ use time::OffsetDateTime;
 use url::Url;
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use walkdir::WalkDir;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 #[cfg(feature = "wallet")]
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -485,6 +527,11 @@ use crate::database::entities::{
     rgb_assignment::Model as DbAssignment, rgb_global_state::Model as DbGlobalState,
     rgb_witness_ord::Model as DbWitnessOrd,
 };
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use crate::encryption::{derive_shared, verifying_key_from_bytes};
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
 #[cfg(feature = "electrum")]
@@ -493,6 +540,12 @@ use crate::utils::INDEXER_BATCH_SIZE;
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::utils::INDEXER_STOP_GAP;
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "esplora_async",
+    not(feature = "_online")
+))]
+use crate::utils::{OffchainResolver, script_buf_from_recipient_id};
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use crate::utils::{atomic_write, atomic_write_with};
 #[cfg(feature = "bitcoind")]
@@ -504,6 +557,18 @@ use crate::wallet::test::{
     mock_local_version, mock_min_retention_grace, mock_retention_grace, mock_send_end_crash,
     skip_build_dag, skip_check_fee_rate, spv_only, strip_terminals,
 };
+/// Protocol and crypto helpers shared by the native online flow and the browser receive transport.
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use crate::{
+    api::jsonrpc::{
+        JsonRpcResponse, PostAckResponse, ServerInfoResponse, map_proxy_error,
+        transfer_retrieved_message,
+    },
+    encryption::{ed25519_from_seed, sign_ed25519},
+};
 #[cfg(feature = "_online")]
 use crate::{
     api::{
@@ -514,10 +579,9 @@ use crate::{
         },
         proxy::{
             AckTransferData, GetAckResponse, GetConsignmentResponse, InvoiceStatus, JsonRpcError,
-            JsonRpcResponse, PostAckResponse, PostConsignmentData, ProxyClient, ProxyTransferState,
-            ServerInfoResponse, get_ack_message, list_transfers_message, map_proxy_error,
-            post_consignment_message, post_media_message, pow_difficulty_required,
-            prepare_ack_auth_message, prepare_invoice_auth_message, transfer_retrieved_message,
+            PostConsignmentData, ProxyClient, ProxyTransferState, get_ack_message,
+            list_transfers_message, post_consignment_message, post_media_message,
+            pow_difficulty_required, prepare_ack_auth_message, prepare_invoice_auth_message,
         },
         reject_list::RejectListClient,
     },
@@ -527,15 +591,13 @@ use crate::{
         wallet_transaction::ActiveModel as DbWalletTransactionActMod,
     },
     encryption::{
-        decode_hash_hex, decrypt_blob, decrypt_stream, derive_shared, ed25519_from_seed,
-        encrypt_blob, encrypt_to_tempfile, invoice_id, sign_ed25519, transfer_id, verify_ed25519,
-        verifying_key_from_bytes,
+        decrypt_stream, encrypt_blob, encrypt_to_tempfile, invoice_id, transfer_id, verify_ed25519,
     },
     error::IndexerError,
     utils::{
         ChainResolver, OffchainResolver, check_proxy, detect_indexer, get_indexer_and_resolver,
         hash_file, hash_file_bytes, proxy_max_media, proxy_retention_grace,
-        script_buf_from_recipient_id,
+        retention_grace_from_info, script_buf_from_recipient_id,
     },
     wallet::{
         AssignmentsCollection, BitcoindAuth, Indexer, IndexerConfig, multisig::RespondToOperation,
@@ -564,10 +626,10 @@ use crate::{
     },
 };
 // native file backups skip the log file and the retired legacy RGB store; wasm has neither
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 pub(crate) use crate::utils::{LOG_FILE, RGB_RUNTIME_DELETING_DIR};
 // the wasm logger is a no-op for the wallet, but the browser tests still construct one
-#[cfg(any(not(target_arch = "wasm32"), test))]
+#[cfg(all(feature = "wallet", any(not(target_arch = "wasm32"), test)))]
 pub(crate) use crate::utils::setup_logger;
 // The SQLite-only tables are not touched by the in-memory backend the wasm build uses.
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]

@@ -4,6 +4,19 @@
 
 use super::*;
 
+// the off-chain resolver compiles for the native driver and for the browser receive path, neither
+// of which enables `_online`/`wallet` for these imports at the crate root
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use bdk_wallet::bitcoin::block::Header as BlockHeader;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use std::num::NonZeroU32;
+
 #[cfg(not(target_arch = "wasm32"))]
 const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
@@ -529,9 +542,12 @@ pub(crate) fn calculate_descriptor_from_xpub(
 /// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
 /// expiration it keeps the data awaiting retrieval. A proxy not advertising it is considered to
 /// grant none.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "_online"))]
     if let Some(grace) = mock_retention_grace() {
         return grace;
     }
@@ -539,6 +555,31 @@ pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
         .as_ref()
         .and_then(|grace| grace.parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+/// The retention grace advertised by a proxy, mapped from its `server.info` response.
+///
+/// Shared by the blocking native client and the browser `fetch` one, so a response the native
+/// transport rejects is rejected the same way on wasm.
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+pub(crate) fn retention_grace_from_info(
+    res: Result<JsonRpcResponse<ServerInfoResponse>, Error>,
+) -> Result<u32, Error> {
+    let res = res?;
+    if let Some(err) = res.error {
+        return Err(map_proxy_error(err));
+    }
+    let info = res.result.ok_or_else(|| Error::Proxy {
+        details: s!("missing server.info result"),
+    })?;
+    Ok(proxy_retention_grace(&info))
 }
 
 /// The max number of media per transfer advertised by a proxy (`max_media`), `None` if it doesn't
@@ -1013,6 +1054,13 @@ impl<'txn> RgbStock<'txn> {
             })
     }
 
+    /// The witness TX IDs the stock knows for a bundle, so a caller prefetching chain answers can
+    /// also cover the alternatives consumption re-resolves after a reorg.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+    pub(crate) fn bundle_witnesses(&self, bundle_id: BundleId) -> Result<BTreeSet<RgbTxid>, Error> {
+        rgbstd::persistence::RgbStore::bundle_witnesses(self.stock.as_store(), bundle_id)
+    }
+
     pub(crate) fn import_contract<R: ResolveWitness>(
         &mut self,
         contract: ValidContract,
@@ -1215,18 +1263,30 @@ impl ResolveWitness for ChainResolver<'_> {
     }
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)] // the browser receive loop that builds it is not wired yet
 pub(crate) struct OffchainResolver<'a, 'cons, const TRANSFER: bool> {
     pub(crate) witness_id: RgbTxid,
     pub(crate) consignment: &'cons Consignment<TRANSFER>,
-    pub(crate) fallback: ChainResolver<'a>,
+    /// chain answers for everything the consignment does not bundle: the native indexer resolver
+    /// or, on the browser, the chain prefetched before the receive transaction opened
+    pub(crate) fallback: &'a dyn ResolveWitness,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl<const TRANSFER: bool> ResolveWitness for OffchainResolver<'_, '_, TRANSFER> {
     fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
         if witness_id != self.witness_id {
-            #[cfg(test)]
+            #[cfg(all(test, not(target_arch = "wasm32")))]
             if spv_only() {
                 return Err(WitnessResolverError::ResolverIssue(
                     Some(witness_id),

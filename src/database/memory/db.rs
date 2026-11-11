@@ -1378,7 +1378,7 @@ impl InMemoryDb {
             .map(|a| a.assignment.main_amount())
             .sum();
 
-        let mut ass_pending_incoming: u64 = ass_allocations
+        let ass_pending_incoming: u64 = ass_allocations
             .iter()
             .filter(|a| !a.txo_spent && a.incoming && a.status.pending())
             .map(|a| a.assignment.main_amount())
@@ -1403,7 +1403,9 @@ impl InMemoryDb {
                 })
             })
             .sum();
-        ass_pending_incoming += witness_pending;
+        let ass_pending_incoming = ass_pending_incoming
+            .checked_add(witness_pending)
+            .expect("total pending incoming amount cannot exceed u64::MAX");
         let ass_pending_outgoing: u64 = ass_allocations
             .iter()
             .filter(|a| !a.incoming && a.status.pending())
@@ -1435,11 +1437,14 @@ impl InMemoryDb {
             })
             .sum();
 
-        let spendable = settled.saturating_sub(unspendable);
+        let spendable = settled
+            .checked_sub(unspendable)
+            .expect("unspendable allocations are a subset of settled ones");
 
         Ok(Balance {
             settled,
-            future: future as u64,
+            future: u64::try_from(future)
+                .expect("pending outgoing cannot exceed available balance"),
             spendable,
         })
     }

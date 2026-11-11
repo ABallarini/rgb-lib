@@ -45,12 +45,17 @@ const PROXY_URL: Option<&str> = option_env!("RGB_REGTEST_PROXY_URL");
 /// Optional mnemonic whose first internal receive address the harness funds, baked in at compile
 /// time. Without it the funded-balance assertion is skipped.
 const FUNDED_MNEMONIC: Option<&str> = option_env!("RGB_REGTEST_MNEMONIC");
+/// Optional proxy transfer ID, baked in at compile time, addressed to a pending proxy receive of
+/// the `RGB_REGTEST_MNEMONIC` wallet. With it, the receive smoke runs for real; without it the
+/// receive smoke returns early.
+const RECEIVE_TRANSFER_ID: Option<&str> = option_env!("RGB_REGTEST_TRANSFER_ID");
 
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.filter(|v| !v.is_empty())
 }
 
 #[wasm_bindgen_test]
+#[ignore]
 async fn regtest_esplora_online_smoke() {
     // The default browser CI job has no regtest service. Returning here keeps it green; the
     // script sets the variable and runs this test for real.
@@ -224,4 +229,87 @@ async fn regtest_esplora_online_smoke() {
         );
         assert!(!info.protocol_version.is_empty());
     }
+}
+
+/// Opt-in real proxy receive and ACK.
+///
+/// Runs only when the Esplora and proxy URLs are set **and** the harness prepared a pending proxy
+/// transfer for the `RGB_REGTEST_MNEMONIC` wallet, named by `RGB_REGTEST_TRANSFER_ID`. Preparing it
+/// needs the native sender flow (the browser cannot reserve a proxy invoice yet): create a
+/// `blindReceive`/`witnessReceive` on a native wallet with these keys, with proxy transport
+/// endpoints, and send to it from another wallet. Without that setup the test returns early, as it
+/// does in the default browser CI job.
+#[wasm_bindgen_test]
+#[ignore]
+async fn regtest_proxy_receive_smoke() {
+    let (Some(esplora_url), Some(proxy_url), Some(transfer_id)) = (
+        non_empty(ESPLORA_URL),
+        non_empty(PROXY_URL),
+        non_empty(RECEIVE_TRANSFER_ID),
+    ) else {
+        return;
+    };
+    let Some(mnemonic) = non_empty(FUNDED_MNEMONIC) else {
+        return;
+    };
+
+    let keys = crate::keys::restore_keys(
+        BitcoinNetwork::Regtest,
+        mnemonic.to_string(),
+        WitnessVersion::Taproot,
+    )
+    .expect("the harness mnemonic is valid");
+    let wallet_data = WalletData {
+        data_dir: String::new(),
+        bitcoin_network: BitcoinNetwork::Regtest,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 5,
+        supported_schemas: AssetSchema::VALUES.to_vec(),
+    };
+    let mut wallet = Wallet::new_in_memory(wallet_data, SinglesigKeys::from_keys(&keys, None))
+        .expect("wallet over the in-memory backend");
+
+    // the online sync lists the pending invoices and receives what the proxy holds for them
+    wallet
+        .sync_online_async(proxy_url, esplora_url, None)
+        .await
+        .expect("online sync with a pending proxy receive");
+
+    // receiving the named transfer again is idempotent: it must return the same batch transfer
+    let first = wallet
+        .receive_transfer_async(proxy_url, esplora_url, transfer_id)
+        .await
+        .expect("receive the prepared proxy transfer")
+        .expect("the prepared transfer belongs to a batch transfer");
+    let second = wallet
+        .receive_transfer_async(proxy_url, esplora_url, transfer_id)
+        .await
+        .expect("re-receive is idempotent");
+    assert_eq!(second, Some(first));
+
+    // the ACK is recorded locally and the transfer moved past WaitingCounterparty
+    let txn = wallet
+        .database()
+        .begin_transaction()
+        .expect("open a read txn");
+    let db_data = txn.get_db_data(false).expect("wallet data");
+    let transfer = db_data
+        .transfers
+        .iter()
+        .find(|t| t.proxy_transfer_id.as_deref() == Some(transfer_id))
+        .expect("the received transfer is in the database");
+    assert_eq!(transfer.ack, Some(true), "the ACK was not recorded");
+    let batch = db_data
+        .batch_transfers
+        .iter()
+        .find(|b| b.idx == first)
+        .expect("the received batch transfer is in the database");
+    assert!(
+        matches!(
+            batch.status,
+            TransferStatus::WaitingBroadcast | TransferStatus::WaitingConfirmations
+        ),
+        "unexpected status after ACK: {:?}",
+        batch.status
+    );
 }

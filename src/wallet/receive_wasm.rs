@@ -1,0 +1,553 @@
+//! Browser receive transport.
+//!
+//! [`WasmReceiveTransport`] implements the shared [`ReceiveTransport`] trait over the async proxy
+//! client, so the same receive driver can run on wasm32 without touching the native blocking
+//! client. Every operation reuses the helpers the native transport uses: the ACK and retrieved
+//! signatures, the reject-list parsing, the retention-grace mapping and the encryption/media
+//! helpers. Only the HTTP call itself differs, and the media blobs are written through
+//! [`WalletFiles`] keys instead of filesystem paths.
+//!
+//! The orchestration around the driver - discover the proxy transfer, decrypt it into the wallet
+//! files, prefetch the chain questions and run the shared driver inside one database transaction -
+//! also lives here. It is the browser counterpart of the native `wait_consignment`, not a second
+//! copy of the receive phases: load, validate, reject list, media, apply and ACK/NACK stay in
+//! `receive.rs`.
+
+use super::indexer_async::{EsploraResolver, EsploraTransport};
+use super::receive::{
+    PrefetchQuestions, ReceiveDriver, ReceiveTransport, ack_signature, already_handled,
+    broadcast_error, parse_reject_list, pending_receives, transfer_retrieved_signature,
+};
+use super::resolver_async::PrefetchedChain;
+use super::*;
+use crate::api::fetch::ProxyFetchClient;
+use crate::api::jsonrpc::{ProxyTransferState, list_transfers_message, map_proxy_error};
+use crate::encryption::sha256_digest;
+use base64::{Engine as _, engine::general_purpose};
+
+/// [`ReceiveTransport`] over the browser's `fetch` client.
+pub(crate) struct WasmReceiveTransport<'a, W: WalletOffline + ?Sized> {
+    wallet: &'a W,
+    /// Esplora endpoint that answers the chain queries (tip height, broadcast).
+    indexer_url: &'a str,
+}
+
+#[allow(dead_code)]
+impl<'a, W: WalletOffline + ?Sized> WasmReceiveTransport<'a, W> {
+    pub(crate) fn new(wallet: &'a W, indexer_url: &'a str) -> Self {
+        Self {
+            wallet,
+            indexer_url,
+        }
+    }
+}
+
+impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W> {
+    async fn get_reject_list(&self, url: &str) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
+        let client = ProxyFetchClient::new(url)?;
+        let list = client.get_reject_list().await?;
+        parse_reject_list(&list, self.wallet.logger())
+    }
+
+    async fn fetch_and_save_attachments(
+        &self,
+        attachments: Vec<Attachment>,
+        mode: &ReceiveMode,
+        recipient_seed: &[u8],
+    ) -> Result<bool, Error> {
+        if attachments.is_empty() {
+            return Ok(true);
+        }
+        // Out-of-band media arrives as host filesystem paths, which a browser wallet cannot read.
+        // The proxy exchange is the browser receive flow; an out-of-band receive with media is not
+        // supported here.
+        let ReceiveMode::Proxy(data) = mode else {
+            return Err(Error::Internal {
+                details: s!("out-of-band media files are not available in the browser"),
+            });
+        };
+
+        // the media are stored under an id derived from the shared secret, not the plaintext digest
+        let derived = crate::encryption::shared_keys(recipient_seed, &data.sender_pubkey)?;
+        let client = ProxyFetchClient::new(&data.proxy_url)?;
+        let mut saved_media = vec![];
+        for attachment in attachments {
+            let digest = hex::encode(attachment.digest);
+            let media_key = self.wallet.media_key(&digest)?;
+            // resolve media only if the blob is not already present
+            if self.wallet.files().exists(&media_key)? {
+                continue;
+            }
+            let media_id = derived.media_id(&digest);
+            let media_res = client.get_media(&data.transfer_id, &media_id).await?;
+            match media_res.result {
+                Some(payload) => {
+                    // also checks the plaintext against the digest in the contract
+                    let bytes = crate::encryption::decrypt_b64_blob_with_shared_key(
+                        &payload,
+                        data.recipient_encryption,
+                        recipient_seed,
+                        &data.sender_pubkey,
+                        &digest,
+                    )?;
+                    self.wallet.files().atomic_write(&media_key, &bytes)?;
+                }
+                None => {
+                    error!(
+                        self.wallet.logger(),
+                        "Cannot find the media file but the contract defines one"
+                    );
+                    self.wallet.cleanup_media_files(&saved_media)?;
+                    return Ok(false);
+                }
+            }
+            saved_media.push(media_key);
+        }
+
+        Ok(true)
+    }
+
+    async fn sender_retention_grace(&self, sender_proxy: &str) -> Result<u32, Error> {
+        let client = ProxyFetchClient::new(sender_proxy)?;
+        crate::utils::retention_grace_from_info(client.get_info().await)
+    }
+
+    async fn post_ack(
+        &self,
+        sender_proxy: &str,
+        transfer_id: &str,
+        ack: bool,
+        consignment_hash: &str,
+        recipient_seed: &[u8],
+    ) -> Result<PostAckResponse, Error> {
+        let sig = ack_signature(transfer_id, ack, consignment_hash, recipient_seed)?;
+        let client = ProxyFetchClient::new(sender_proxy)?;
+        let res = client.post_ack(transfer_id, ack, &sig).await?;
+        if let Some(err) = res.error {
+            return Err(map_proxy_error(err));
+        }
+        res.result.ok_or_else(|| Error::Proxy {
+            details: s!("missing ack.post result"),
+        })
+    }
+
+    async fn mark_transfer_retrieved(
+        &self,
+        proxy_url: &str,
+        transfer_id: &str,
+        recipient_seed: &[u8],
+    ) {
+        let Some(signature) = transfer_retrieved_signature(transfer_id, recipient_seed) else {
+            return;
+        };
+        let res = match ProxyFetchClient::new(proxy_url) {
+            Ok(client) => client.transfer_retrieved(transfer_id, &signature).await,
+            Err(e) => {
+                warn!(
+                    self.wallet.logger(),
+                    "Failed to mark transfer as retrieved: {e}"
+                );
+                return;
+            }
+        };
+        match res {
+            Ok(r) if r.error.is_none() => {}
+            Ok(r) => warn!(
+                self.wallet.logger(),
+                "Failed to mark transfer as retrieved: {:?}", r.error
+            ),
+            Err(e) => warn!(
+                self.wallet.logger(),
+                "Failed to mark transfer as retrieved: {e}"
+            ),
+        }
+    }
+
+    async fn tip_height(&self) -> Result<u32, Error> {
+        EsploraTransport::new(self.indexer_url)?
+            .get_latest_block_height()
+            .await
+    }
+
+    async fn broadcast(&self, tx: BdkTransaction) -> Result<(), Error> {
+        let txid = tx.compute_txid().to_string();
+        let indexer = EsploraTransport::new(self.indexer_url)?;
+        match indexer.broadcast(&tx).await {
+            Ok(()) => {
+                debug!(self.wallet.logger(), "Broadcasted TX with ID '{}'", txid);
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(err) = broadcast_error(&txid, &e) {
+                    return Err(err);
+                }
+                if indexer.get_tx_confirmations(&txid).await?.is_none() {
+                    return Err(Error::FailedBroadcast {
+                        details: e.to_string(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The outcome of handling one proxy transfer, before it is turned into a result for the host.
+enum ReceiveOutcome {
+    /// the shared driver handled it, committing the new state
+    Handled,
+    /// the transfer was already handled by an earlier run: nothing to do
+    AlreadyHandled,
+    /// the transfer was not posted to any pending invoice of this wallet
+    NotOurs,
+}
+
+/// `transfer.list` signed with the recipient's operation key, as the native client does it.
+fn list_transfers_signature(
+    invoice_id: &str,
+    recipient_seed: &[u8],
+) -> Result<(String, String), Error> {
+    let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
+        details: s!("invalid recipient secret key"),
+    })?;
+    let sk = ed25519_from_seed(&seed);
+    let timestamp = now().unix_timestamp().to_string();
+    let digest = sha256_digest(list_transfers_message(invoice_id, &timestamp).as_bytes());
+    Ok((hex::encode(sign_ed25519(&sk, &digest)), timestamp))
+}
+
+/// The chain answers the upcoming validation and consumption may ask for.
+///
+/// Every bundled witness TX is fetched, as validation resolves each one unless a valid SPV proof
+/// answers it, and consumption resolves them again. The alternative witnesses the stock already
+/// knows for the same bundles are included because consumption re-resolves them when a bundle's
+/// witness ord is invalid (e.g. after a reorg). Headers cover every SPV proof the bundles carry.
+async fn prefetch_chain_answers(
+    wallet: &Wallet,
+    indexer_url: &str,
+    consignment: Option<&RgbTransfer>,
+) -> Result<PrefetchedChain, Error> {
+    let mut questions = match consignment {
+        Some(consignment) => PrefetchQuestions::for_consignment(consignment),
+        None => PrefetchQuestions::default(),
+    };
+    let txn = wallet.database().begin_transaction()?;
+    if let Some(consignment) = consignment {
+        let stock = wallet.rgb_stock(&txn)?;
+        questions.add_known_alternatives(&stock, consignment)?;
+    }
+    drop(txn);
+
+    let resolver = EsploraResolver::new(EsploraTransport::new(indexer_url)?);
+    PrefetchedChain::fetch(
+        &resolver,
+        wallet.chain_net(),
+        questions.witness_ids,
+        questions.heights,
+    )
+    .await
+    .map_err(|e| Error::Network {
+        details: e.to_string(),
+    })
+}
+
+impl Wallet {
+    /// Receive one proxy transfer by its ID, decrypting it, validating it and ACKing it.
+    ///
+    /// The caller supplies the recipient proxy URL (where the consignment lives) and the Esplora
+    /// URL (for chain answers and the broadcast of a released signed TX). The transfer must belong
+    /// to a pending incoming invoice of this wallet; a transfer already handled is a no-op, and a
+    /// transfer not addressed to this wallet is an error.
+    ///
+    /// Everything the shared driver changes - transfer status, colorings, asset rows, pending
+    /// witness flags, the ACK flag and the broadcast deadline - is committed in one database
+    /// transaction. A failure drops it and leaves the wallet as it was, while the proxy call and
+    /// the files written before it keep the native contract (the consignment and its metadata are
+    /// reusable on the next attempt).
+    pub async fn receive_transfer_async(
+        &mut self,
+        proxy_url: &str,
+        indexer_url: &str,
+        transfer_id: &str,
+    ) -> Result<Option<i32>, Error> {
+        match self
+            .receive_proxy_transfer(proxy_url, indexer_url, transfer_id)
+            .await?
+        {
+            ReceiveOutcome::Handled | ReceiveOutcome::AlreadyHandled => {
+                let db_data = self.db_data()?;
+                Ok(already_handled(&db_data, transfer_id))
+            }
+            ReceiveOutcome::NotOurs => Err(Error::Internal {
+                details: format!(
+                    "no pending receive transfer of this wallet matches proxy transfer \
+                     '{transfer_id}'"
+                ),
+            }),
+        }
+    }
+
+    /// Sync the BDK wallet and receive every pending proxy transfer of this wallet.
+    ///
+    /// The BDK part is the same read-only full scan [`Self::sync_async`] runs. The receive part
+    /// lists the transfers of each pending incoming invoice on `proxy_url` - the native selection:
+    /// only `Pending` transfers are considered, sorted by ID - and runs the shared driver on each.
+    /// Transfers not addressed to this wallet are skipped, and an already handled one is left
+    /// untouched, so a repeated call is idempotent.
+    ///
+    /// Returns the batch transfer indices handled by this call, in processing order. A failure
+    /// rolls back only the transfer it happened on and stops the loop.
+    pub async fn sync_online_async(
+        &mut self,
+        proxy_url: &str,
+        indexer_url: &str,
+        stop_gap: Option<usize>,
+    ) -> Result<Vec<i32>, Error> {
+        self.sync_async(indexer_url, stop_gap).await?;
+
+        let pending = pending_receives(&self.db_data()?)?;
+        let client = ProxyFetchClient::new(proxy_url)?;
+        let mut handled = vec![];
+        for candidate in pending {
+            let recipient_id = candidate
+                .transfer
+                .recipient_id
+                .clone()
+                .expect("pending receives have a recipient ID");
+            let recipient_pk = hex::encode(
+                candidate
+                    .transfer
+                    .recipient_pubkey
+                    .as_ref()
+                    .expect("pending receives have a recipient pubkey"),
+            );
+            let seed = candidate
+                .batch
+                .operation_secret_key
+                .clone()
+                .expect("pending receives have an operation secret key");
+            let invoice_id = crate::encryption::invoice_id(&recipient_id, &recipient_pk);
+            let (signature, timestamp) = list_transfers_signature(&invoice_id, &seed)?;
+
+            // a proxy that cannot list this invoice has nothing for it: skip it like the native
+            // selection does, instead of failing the whole sync
+            let Ok(response) = client
+                .list_transfers(&invoice_id, &signature, &timestamp)
+                .await
+            else {
+                debug!(
+                    self.logger(),
+                    "Skipping invoice {invoice_id}: transfer list failed"
+                );
+                continue;
+            };
+            if let Some(err) = response.error {
+                debug!(self.logger(), "Skipping invoice {invoice_id}: {err:?}");
+                continue;
+            }
+            let mut transfers: Vec<String> = response
+                .result
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, state)| *state == ProxyTransferState::Pending)
+                .map(|(id, _)| id)
+                .collect();
+            transfers.sort();
+
+            for transfer_id in transfers {
+                match self
+                    .receive_proxy_transfer(proxy_url, indexer_url, &transfer_id)
+                    .await?
+                {
+                    ReceiveOutcome::Handled => {
+                        if let Some(idx) = already_handled(&self.db_data()?, &transfer_id) {
+                            handled.push(idx);
+                        }
+                    }
+                    ReceiveOutcome::AlreadyHandled => {}
+                    ReceiveOutcome::NotOurs => {
+                        debug!(
+                            self.logger(),
+                            "Skipping transfer {transfer_id}, not addressed to this wallet"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(handled)
+    }
+
+    fn db_data(&self) -> Result<DbData, Error> {
+        let txn = self.database().begin_transaction()?;
+        txn.get_db_data(false)
+    }
+
+    /// Fetch, decrypt, prefetch and drive one proxy transfer.
+    async fn receive_proxy_transfer(
+        &mut self,
+        proxy_url: &str,
+        indexer_url: &str,
+        transfer_id: &str,
+    ) -> Result<ReceiveOutcome, Error> {
+        // a re-run after the ACK may find the proxy data already deleted: the local record of the
+        // transfer ID is what makes the call idempotent, so check it before any network access
+        if already_handled(&self.db_data()?, transfer_id).is_some() {
+            return Ok(ReceiveOutcome::AlreadyHandled);
+        }
+
+        let client = ProxyFetchClient::new(proxy_url)?;
+        let response = client.get_consignment(transfer_id).await?;
+        if let Some(err) = response.error {
+            return Err(map_proxy_error(err));
+        }
+        let Some(result) = response.result else {
+            return Err(Error::NoConsignment);
+        };
+
+        let db_data = self.db_data()?;
+        let Some(candidate) = pending_receives(&db_data)?
+            .into_iter()
+            .find(|c| c.expected_transfer_id(&result.sender_pk).as_deref() == Some(transfer_id))
+        else {
+            return Ok(if already_handled(&db_data, transfer_id).is_some() {
+                ReceiveOutcome::AlreadyHandled
+            } else {
+                ReceiveOutcome::NotOurs
+            });
+        };
+
+        let recipient_id = candidate
+            .transfer
+            .recipient_id
+            .clone()
+            .expect("matched receive has a recipient ID");
+        let recipient_seed = candidate
+            .batch
+            .operation_secret_key
+            .clone()
+            .unwrap_or_default();
+        let sender_proxy =
+            self.convert_transport_endpoint_url(&result.sender_transport_endpoint)?;
+        let data = ProxyReceiveData {
+            proxy_url: proxy_url.to_string(),
+            transfer_id: transfer_id.to_string(),
+            sender_proxy,
+            sender_pubkey: result.sender_pk.clone(),
+            consignment_hash: result.consignment_hash.clone(),
+            recipient_encryption: candidate.transfer.recipient_encryption,
+            batch: result.batch,
+        };
+        let mode = ReceiveMode::Proxy(data.clone());
+
+        // decode and (if needed) decrypt the consignment; a malformed payload is refused like one
+        // that fails decryption or verification
+        let decoded = general_purpose::STANDARD
+            .decode(&result.consignment)
+            .map_err(|e| Error::InvalidEncryptedBlob {
+                details: e.to_string(),
+            });
+        let consignment_bytes = decoded.and_then(|raw| {
+            self.decrypt_blob_with_shared_key(
+                raw,
+                data.recipient_encryption,
+                &recipient_seed,
+                &data.sender_pubkey,
+                &data.consignment_hash,
+            )
+        });
+        let consignment_bytes = match consignment_bytes {
+            Ok(bytes) => bytes,
+            Err(e @ Error::IO { .. }) => return Err(e),
+            Err(_) => {
+                let txn = self.database().begin_transaction()?;
+                let mut updated: DbBatchTransferActMod = candidate.batch.clone().into();
+                {
+                    let transport = WasmReceiveTransport::new(self, indexer_url);
+                    self.refuse_consignment_via(
+                        &transport,
+                        &txn,
+                        &mode,
+                        &recipient_id,
+                        &recipient_seed,
+                        &mut updated,
+                    )
+                    .await?;
+                }
+                self.persist_and_commit(txn)?;
+                return Ok(ReceiveOutcome::Handled);
+            }
+        };
+
+        let consignment_path = self.get_receive_consignment_path(&recipient_id);
+        let consignment_key = self.wallet_key(&consignment_path)?;
+        self.files()
+            .atomic_write(&consignment_key, &consignment_bytes)?;
+        let meta = ReceivedConsignmentMeta {
+            proxy_url: Some(proxy_url.to_string()),
+            transfer_id: Some(transfer_id.to_string()),
+            sender_transport_endpoint: result.sender_transport_endpoint.clone(),
+            sender_pubkey: result.sender_pk.clone(),
+            consignment_hash: result.consignment_hash.clone(),
+            batch: result.batch,
+        };
+        let meta_str = serde_json::to_string(&meta).map_err(InternalError::from)?;
+        let meta_key = self.wallet_key(&self.get_receive_consignment_meta_path(&recipient_id))?;
+        self.files().atomic_write(&meta_key, meta_str.as_bytes())?;
+
+        // parse once for the prefetch set; a malformed consignment still runs the driver, which
+        // refuses it with the same error a native load would report
+        let questions = RgbTransfer::load(consignment_bytes.as_slice()).ok();
+        let prefetched = prefetch_chain_answers(self, indexer_url, questions.as_ref()).await?;
+
+        let txn = self.database().begin_transaction()?;
+        // mark the recipient proxy endpoint used, when the invoice persisted one
+        if let Some((tte, _)) = txn
+            .get_transfer_transport_endpoints_data(candidate.transfer.idx)?
+            .into_iter()
+            .find(|(tte, te)| {
+                tte.kind == TransportEndpointKind::RecipientProxy && te.endpoint == proxy_url
+            })
+            && !tte.used
+        {
+            let mut updated_tte: DbTransferTransportEndpointActMod = tte.into();
+            updated_tte.used = ActiveValue::Set(true);
+            txn.update_transfer_transport_endpoint(&mut updated_tte)?;
+        }
+        // persist the transfer ID, consignment hash and sender proxy endpoint (for the ACK),
+        // exactly like the native download does before the shared driver runs
+        let mut updated_transfer: DbTransferActMod = candidate.transfer.clone().into();
+        updated_transfer.consignment_hash = ActiveValue::Set(Some(data.consignment_hash.clone()));
+        updated_transfer.proxy_transfer_id = ActiveValue::Set(Some(transfer_id.to_string()));
+        txn.update_transfer(&mut updated_transfer)?;
+        self.save_sender_transport_endpoint(&txn, candidate.transfer.idx, &data.sender_proxy)?;
+
+        let mut updated_batch_transfer: DbBatchTransferActMod = candidate.batch.clone().into();
+        let outcome = {
+            let transport = WasmReceiveTransport::new(self, indexer_url);
+            self.drive_receive(
+                &transport,
+                &prefetched,
+                &txn,
+                &candidate.batch,
+                &candidate.asset_transfer,
+                &candidate.transfer,
+                recipient_id,
+                &consignment_path,
+                mode,
+                &mut updated_batch_transfer,
+            )
+            .await
+        };
+        match outcome {
+            Ok(_) => {
+                self.persist_and_commit(txn)?;
+                Ok(ReceiveOutcome::Handled)
+            }
+            Err(e) => {
+                // dropping the transaction is the rollback
+                drop(txn);
+                Err(e)
+            }
+        }
+    }
+}

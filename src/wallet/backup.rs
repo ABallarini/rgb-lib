@@ -16,6 +16,11 @@ const BACKUP_BUFFER_LEN_ENCRYPT: usize = 239; // 255 max, leaving 16 for the che
 const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
 const BACKUP_NONCE_LENGTH: usize = 19;
+const MAX_BACKUP_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_BACKUP_ENTRY_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BACKUP_ENTRIES: usize = 10_000;
+const MAX_PUB_DATA_BYTES: u64 = 64 * 1024;
+const MAX_SCRYPT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const BACKUP_VERSION: u8 = 1;
 const BACKUP_PUB_DATA_FILE: &str = "backup.pub_data";
 const BACKUP_ENCRYPTED_FILE: &str = "backup.enc";
@@ -65,6 +70,22 @@ impl TryInto<Params> for ScryptParams {
     type Error = Error;
 
     fn try_into(self: ScryptParams) -> Result<Params, Error> {
+        // Restoring accepts parameters from an untrusted archive, so bound the work before scrypt
+        // allocates or runs: the writer only emits the crate defaults, which are well below these.
+        if self.log_n > 18 || self.r > 16 || self.p > 4 || self.len != BACKUP_KEY_LENGTH {
+            return Err(Error::Internal {
+                details: "backup scrypt parameters exceed the accepted limits".to_string(),
+            });
+        }
+        let memory = 128u64
+            .checked_mul(1u64 << self.log_n)
+            .and_then(|n| n.checked_mul(u64::from(self.r)))
+            .unwrap_or(u64::MAX);
+        if memory > MAX_SCRYPT_MEMORY_BYTES {
+            return Err(Error::Internal {
+                details: "backup scrypt parameters exceed the accepted limits".to_string(),
+            });
+        }
         Params::new_with_output_len(self.log_n, self.r, self.p, self.len).map_err(|e| {
             Error::Internal {
                 details: format!("invalid params {e}"),
@@ -83,10 +104,11 @@ pub(crate) struct BackupPubData {
 
 impl BackupPubData {
     fn nonce(&self) -> Result<[u8; BACKUP_NONCE_LENGTH], InternalError> {
-        let nonce_bytes = self.nonce.as_bytes();
-        nonce_bytes[0..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| InternalError::Unexpected)
+        self.nonce
+            .as_bytes()
+            .get(..BACKUP_NONCE_LENGTH)
+            .and_then(|nonce| nonce.try_into().ok())
+            .ok_or(InternalError::Unexpected)
     }
 }
 
@@ -355,15 +377,26 @@ pub(crate) fn create_backup_bytes(
 
     debug!(logger, "zipping {} entries", entries.len());
     let zip = zip_entries(entries, logger)?;
+    if zip.len() > MAX_BACKUP_ENTRY_BYTES {
+        return Err(Error::Internal {
+            details: "wallet backup exceeds the size limit".to_string(),
+        });
+    }
     let encrypted = encrypt_bytes(&zip, password, &backup_pub_data)?;
     let pub_data = serde_json::to_vec(&backup_pub_data).map_err(InternalError::from)?;
-    zip_entries(
+    let bytes = zip_entries(
         &[
             BackupEntry::file(BACKUP_ENCRYPTED_FILE, encrypted),
             BackupEntry::file(BACKUP_PUB_DATA_FILE, pub_data),
         ],
         logger,
-    )
+    )?;
+    if bytes.len() > MAX_BACKUP_ARCHIVE_BYTES {
+        return Err(Error::Internal {
+            details: "wallet backup exceeds the size limit".to_string(),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Native wallet backup: archive the wallet directory and wrap it in the backup format.
@@ -518,8 +551,17 @@ fn invalid_archive(path_label: Option<&str>, error: impl std::fmt::Display) -> E
 
 /// Split the outer archive into its public metadata and encrypted payload.
 fn backup_parts(bytes: &[u8], path_label: Option<&str>) -> Result<(BackupPubData, Vec<u8>), Error> {
+    if bytes.len() > MAX_BACKUP_ARCHIVE_BYTES {
+        return Err(invalid_archive(
+            path_label,
+            "archive exceeds the size limit",
+        ));
+    }
     let mut archive =
         ZipArchive::new(io::Cursor::new(bytes)).map_err(|e| invalid_archive(path_label, e))?;
+    if archive.len() > MAX_BACKUP_ENTRIES {
+        return Err(invalid_archive(path_label, "too many archive entries"));
+    }
     let mut pub_data = None;
     let mut encrypted = None;
     for i in 0..archive.len() {
@@ -527,11 +569,17 @@ fn backup_parts(bytes: &[u8], path_label: Option<&str>) -> Result<(BackupPubData
         let name = entry.name().map_err(InternalError::from)?;
         match name.as_ref() {
             BACKUP_PUB_DATA_FILE => {
+                if entry.size() > MAX_PUB_DATA_BYTES {
+                    return Err(invalid_archive(path_label, "backup metadata is too large"));
+                }
                 let mut json = String::new();
                 entry.read_to_string(&mut json)?;
                 pub_data = Some(serde_json::from_str(json.as_str()).map_err(InternalError::from)?);
             }
             BACKUP_ENCRYPTED_FILE => {
+                if entry.size() > MAX_BACKUP_ENTRY_BYTES as u64 {
+                    return Err(invalid_archive(path_label, "backup payload is too large"));
+                }
                 let mut payload = Vec::new();
                 entry.read_to_end(&mut payload)?;
                 encrypted = Some(payload);
@@ -550,8 +598,17 @@ fn backup_parts(bytes: &[u8], path_label: Option<&str>) -> Result<(BackupPubData
 
 /// Unpack a wallet archive from memory, rejecting entries that escape its root.
 fn unzip_in_memory(bytes: &[u8], path_label: Option<&str>) -> Result<RestoredBackup, Error> {
+    if bytes.len() > MAX_BACKUP_ENTRY_BYTES {
+        return Err(invalid_archive(
+            path_label,
+            "unpacked archive exceeds the size limit",
+        ));
+    }
     let mut archive =
         ZipArchive::new(io::Cursor::new(bytes)).map_err(|e| invalid_archive(path_label, e))?;
+    if archive.len() > MAX_BACKUP_ENTRIES {
+        return Err(invalid_archive(path_label, "too many archive entries"));
+    }
     let fingerprint = archive
         .name_for_index(0)
         .transpose()
@@ -560,6 +617,7 @@ fn unzip_in_memory(bytes: &[u8], path_label: Option<&str>) -> Result<RestoredBac
         .to_string()
         .replace("/", "");
     let mut entries = Vec::with_capacity(archive.len());
+    let mut total = 0u64;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(InternalError::from)?;
         let Some(path) = entry.enclosed_name() else {
@@ -569,6 +627,14 @@ fn unzip_in_memory(bytes: &[u8], path_label: Option<&str>) -> Result<RestoredBac
         let bytes = if is_dir {
             None
         } else {
+            total = total.saturating_add(entry.size());
+            if entry.size() > MAX_BACKUP_ENTRY_BYTES as u64 || total > MAX_BACKUP_ENTRY_BYTES as u64
+            {
+                return Err(invalid_archive(
+                    path_label,
+                    "backup contents exceed the size limit",
+                ));
+            }
             let mut contents = Vec::new();
             entry.read_to_end(&mut contents)?;
             Some(contents)
@@ -694,11 +760,11 @@ fn get_cypher_secrets(password: &str, backup_pub_data: &BackupPubData) -> Result
     let salt = Salt::from_b64(&backup_pub_data.salt).map_err(InternalError::from)?;
     let params = backup_pub_data.scrypt_params.clone().try_into()?;
     let mut hash = [0u8; BACKUP_KEY_LENGTH];
-    crate::executor::cpu_executor()
-        .scrypt(password_bytes, salt.as_ref(), &params, &mut hash)
-        .map_err(|_| Error::Internal {
+    scrypt::scrypt(password_bytes, salt.as_ref(), &params, &mut hash).map_err(|_| {
+        Error::Internal {
             details: s!("failed to derive backup encryption key"),
-        })?;
+        }
+    })?;
 
     // get key from password hash
     let key =
@@ -956,5 +1022,28 @@ mod tests {
         // absolute paths are made relative to the output dir
         assert_eq!(fs::read(output.join("absolute")).unwrap(), b"/absolute");
         assert_eq!(fs::read(output.join("safe/file")).unwrap(), b"safe/file");
+    }
+
+    #[test]
+    fn short_nonce_is_rejected() {
+        let pub_data = BackupPubData {
+            scrypt_params: ScryptParams::default(),
+            salt: String::new(),
+            nonce: "short".to_string(),
+            version: BACKUP_VERSION,
+        };
+        assert_matches!(pub_data.nonce(), Err(InternalError::Unexpected));
+    }
+
+    #[test]
+    fn oversized_scrypt_params_are_rejected() {
+        let params = ScryptParams {
+            log_n: 24,
+            r: 1,
+            p: 1,
+            len: BACKUP_KEY_LENGTH,
+        };
+        let result: Result<Params, Error> = params.try_into();
+        assert_matches!(result, Err(Error::Internal { .. }));
     }
 }

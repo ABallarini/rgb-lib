@@ -26,12 +26,17 @@ use std::num::NonZeroU32;
 use super::*;
 use crate::bitcoin::block::Header;
 
+/// Upper bound on the chain questions one consignment may cause the browser to fetch.
+const MAX_PREFETCH_WITNESSES: usize = 512;
+/// Upper bound on the block headers one consignment may cause the browser to fetch.
+const MAX_PREFETCH_HEADERS: usize = 128;
+
 /// The chain answers a validation or consumption run needs, fetched asynchronously.
 ///
 /// Method for method the async counterpart of `ResolveWitness`, so an adapter only has to change
 /// how it fetches, and [`PrefetchedChain`] can feed the sync traits unchanged. Not object safe by
 /// design: callers take it by generic parameter.
-#[allow(dead_code)] // only the tests implement it until the browser path is wired
+#[allow(dead_code)] // native builds drive the blocking resolver; the browser receive path uses this
 pub(crate) trait AsyncChainResolver {
     /// Status of the witness TX with `witness_id`.
     async fn resolve_witness(
@@ -73,6 +78,14 @@ impl PrefetchedChain {
         heights: impl IntoIterator<Item = NonZeroU32>,
     ) -> Result<Self, WitnessResolverError> {
         resolver.check_chain_net(chain_net).await?;
+        let witness_ids: Vec<RgbTxid> = witness_ids.into_iter().collect();
+        let heights: Vec<NonZeroU32> = heights.into_iter().collect();
+        if witness_ids.len() > MAX_PREFETCH_WITNESSES || heights.len() > MAX_PREFETCH_HEADERS {
+            return Err(WitnessResolverError::ResolverIssue(
+                None,
+                s!("consignment asks for more chain data than the prefetch limit"),
+            ));
+        }
         let mut witnesses = BTreeMap::new();
         for witness_id in witness_ids {
             let status = resolver.resolve_witness(witness_id).await?;

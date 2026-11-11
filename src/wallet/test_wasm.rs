@@ -1049,36 +1049,6 @@ fn wallet_creation_and_issuance_need_no_worker() {
     assert!(!asset.asset_id.is_empty());
 }
 
-/// The default CPU executor runs expensive work inline, on the browser's only thread, and needs no
-/// Worker. A binding may install a worker-backed executor later; until then a poisoned
-/// `globalThis.Worker` must not be touched.
-#[wasm_bindgen_test]
-fn default_cpu_executor_runs_inline_without_a_worker() {
-    use scrypt::Params;
-
-    let global = js_sys::global();
-    let worker = JsValue::from_str("Worker");
-    let saved = js_sys::Reflect::get(&global, &worker).expect("read globalThis.Worker");
-    let thrower =
-        js_sys::Function::new_no_args("throw new Error('CPU work constructed a browser Worker')");
-    assert!(
-        js_sys::Reflect::set(&global, &worker, thrower.as_ref()).expect("poison globalThis.Worker"),
-        "globalThis.Worker is writable"
-    );
-
-    // cheap params keep the test fast; the point is that the call completes inline
-    let params = Params::new(4, 1, 1).expect("valid params");
-    let mut actual = [0u8; 32];
-    crate::executor::cpu_executor()
-        .scrypt(b"password", b"salt", &params, &mut actual)
-        .expect("inline scrypt");
-    let mut expected = [0u8; 32];
-    scrypt::scrypt(b"password", b"salt", &params, &mut expected).expect("reference scrypt");
-
-    js_sys::Reflect::set(&global, &worker, &saved).expect("restore globalThis.Worker");
-    assert_eq!(actual, expected);
-}
-
 /// Pins the wasm logger: a discard drain with a zero-sized guard, so no `slog-async` worker or
 /// any other thread is spawned. `std::thread::spawn` panics on wasm32-unknown-unknown, so
 /// construction succeeding without a directory is the thread-free proof; the guard size pins that

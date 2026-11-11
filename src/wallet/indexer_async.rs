@@ -7,8 +7,9 @@
 //! preserved when the wallet online path moves over to it.
 //!
 //! The read-only BDK sync (`Wallet::sync_async` in `wasm_online`) drives the transport through
-//! [`EsploraAsyncExt`](bdk_esplora::EsploraAsyncExt); the resolver is still compile-proven only.
-//! Building a transport only constructs the HTTP client and never contacts the server.
+//! [`EsploraAsyncExt`](bdk_esplora::EsploraAsyncExt); the browser receive path uses the same
+//! client through the prefetched resolver. Building a transport only constructs the HTTP client
+//! and never contacts the server.
 
 use std::sync::{
     Arc, Mutex,

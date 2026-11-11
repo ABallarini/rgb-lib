@@ -10,9 +10,11 @@
 //! written before the guard existed are a bare `Uint8Array`; they still load, as sequence `0` with
 //! writer `legacy`, and the first guarded save migrates them to the record shape.
 //!
-//! Only the wallet id, the snapshot and the writer id are written: the snapshot excludes the
-//! mnemonic and the signing keys (see `Wallet::snapshot`), so the stored value carries no secret
-//! material. It does carry the wallet's browser blobs, so one write makes the database, BDK and
+//! Only the wallet id, the snapshot and the writer id are written. The snapshot excludes the
+//! mnemonic and the signing keys (see `Wallet::snapshot`) but is still sensitive: it carries the
+//! proxy operation secret keys and RGB secret seals needed to finish pending transfers, together
+//! with the wallet's browser blobs. It is stored as plain bytes, not encrypted at rest, so the host
+//! must treat the IndexedDB origin as private wallet storage. One write makes the database, BDK and
 //! file state durable together. Errors surface as [`Error::Internal`] with the JS failure message
 //! and never with a value.
 //!
