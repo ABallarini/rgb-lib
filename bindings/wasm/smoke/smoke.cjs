@@ -1,5 +1,6 @@
-// Node smoke test for the generated bindings: create, offline reads, address, snapshot, restore,
-// keys, watch-only, the hub-free multisig subset, invoice parsing and consignment validation.
+// Node smoke test for the generated bindings: create, offline reads, address, out-of-band receive,
+// snapshot, restore, keys, watch-only, the hub-free multisig subset, invoice parsing,
+// consignment validation and the offline proxy health-check rejection.
 //
 // Run it against the `nodejs` target bundle:
 //   wasm-pack build bindings/wasm --target nodejs --out-dir pkg-node
@@ -18,6 +19,7 @@ const {
   RgbLibMultisigWallet,
   WasmInvoice,
   backupInfo,
+  checkProxyUrl,
   generateKeys,
   restoreKeys,
   validateConsignmentOffchain,
@@ -62,7 +64,7 @@ function cosigner(keys) {
   };
 }
 
-function main() {
+async function main() {
   const wallet = RgbLibWallet.create("smoke", MNEMONIC, NETWORK);
   const id = wallet.id();
   assert.match(id, /^[0-9a-f]{8}$/, `unexpected wallet id '${id}'`);
@@ -89,6 +91,31 @@ function main() {
   const walletData = JSON.parse(wallet.getWalletData());
   assert.equal(walletData.bitcoin_network, "Regtest");
   assert.equal(walletData.max_allocations_per_utxo, 5);
+
+  // out-of-band witness receive: no transport endpoint, no proxy reservation, witness script
+  // recipient, so a fresh wallet with no colored UTXO can create it
+  const expiration = Math.floor(Date.now() / 1000) + 3600;
+  const receive = JSON.parse(wallet.witnessReceive(null, '{"Fungible":1000}', BigInt(expiration), 1, "optional"));
+  assert.ok(receive.invoice.startsWith("rgb:"), `unexpected invoice '${receive.invoice}'`);
+  assert.ok(receive.recipient_id.startsWith("bcrt:wvout:"), `unexpected recipient '${receive.recipient_id}'`);
+  assert.equal(receive.expiration_timestamp, expiration);
+  assert.ok(Number.isInteger(receive.batch_transfer_idx) && receive.batch_transfer_idx >= 0);
+  assert.match(receive.public_key, /^[0-9a-f]{64}$/);
+  assert.equal(receive.invoice.includes("endpoints="), false);
+
+  // out-of-band blind receive needs a colored UTXO: the core error surfaces, nothing is faked
+  assert.throws(
+    () => wallet.blindReceive(null, '{"Fungible":1000}', BigInt(expiration), 1, null),
+    /cannot create the blind receive/,
+  );
+  assert.throws(
+    () => wallet.witnessReceive(null, "not json", BigInt(expiration), 1, null),
+    /cannot parse the assignment/,
+  );
+  assert.throws(
+    () => wallet.witnessReceive(null, '"Any"', BigInt(expiration), 1, "sometimes"),
+    /unsupported encryption/,
+  );
 
   // the snapshot carries the database and BDK state, never the mnemonic
   const snapshot = wallet.snapshot();
@@ -248,6 +275,17 @@ function main() {
     /cannot validate the consignment/,
   );
 
+  // proxy health check: an invalid endpoint is rejected by the shared transport-endpoint parser
+  // before any request, so this needs no live proxy and makes no network call
+  await assert.rejects(
+    checkProxyUrl("not-a-url"),
+    /cannot check the proxy URL: Invalid transport endpoint/,
+  );
+  await assert.rejects(
+    checkProxyUrl("http://"),
+    /cannot check the proxy URL: Invalid transport endpoint/,
+  );
+
   console.log(`wallet id: ${id}`);
   console.log(`address: ${firstAddress}`);
   console.log(`restored address: ${nextAddress}`);
@@ -255,9 +293,14 @@ function main() {
   console.log(`backup: ${backup.length} bytes, restored with a password`);
   console.log(`keys: ${generated.master_fingerprint}, restored from the mnemonic`);
   console.log(`watch-only: ${watchOnly.id()}, address: ${watchOnlyAddress}`);
+  console.log(`witness receive: ${receive.recipient_id}, batch ${receive.batch_transfer_idx}`);
   console.log(`multisig id: ${multisigId}, address: ${multisigAddress}`);
   console.log(`invoice: ${invoiceData.asset_id}, network: ${invoiceData.network}`);
   console.log("consignment validation: invalid bytes rejected");
+  console.log("proxy check: invalid URL rejected without network");
 }
 
-main();
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

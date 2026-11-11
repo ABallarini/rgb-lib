@@ -7,13 +7,17 @@
 #
 # What is proven: the async `EsploraTransport` and `EsploraResolver` reach a real Esplora over the
 # browser `fetch` backend (tip height, tip/block-1 hash, header, block-1 coinbase TX, confirmations,
-# fee-estimate mapping, witness/chain-net resolution). When `RGB_REGTEST_PROXY_URL` is set, one
-# read-only proxy call (`server.info`) is proven too.
+# fee-estimate mapping, witness/chain-net resolution). The wallet's read-only online step is proven
+# too: `Wallet::sync_async` full-scans both BDK keychains through the transport, persists the update
+# in the wallet database (a snapshot restore sees it), and answers `tip_height_async` and
+# `fee_estimation_async`. When `RGB_REGTEST_PROXY_URL` is set, one read-only proxy call
+# (`server.info`) is proven too. When `RGB_REGTEST_MNEMONIC` is set, the scan must see funding of
+# that mnemonic's first internal receive address.
 #
-# What is NOT proven: the wallet online flow. On wasm, `go_online`, `OnlineOptions`, sync and
-# transfers still live behind the native-only `_online` feature; `esplora_async` does not enable it.
-# The test asserts that gate instead of faking an end-to-end flow. Wiring the transport into
-# `WalletOnline` is a later step.
+# What is NOT proven: the RGB online flow. On wasm, `go_online`, `OnlineOptions`, consignment
+# reception, transfers, send and broadcast still live behind the native-only `_online` feature;
+# `esplora_async` does not enable it. The test asserts that gate instead of faking an end-to-end
+# flow.
 #
 # Controlled environment (a fresh regtest chain has only genesis, so mine first):
 #
@@ -25,7 +29,13 @@
 # Usage:
 #   export RGB_REGTEST_ESPLORA_URL=http://127.0.0.1:3002
 #   export RGB_REGTEST_PROXY_URL=http://127.0.0.1:3000   # optional
+#   export RGB_REGTEST_MNEMONIC="..."                    # optional: fund its first internal address
 #   bash scripts/wasm_online_smoke.sh
+#
+# `RGB_REGTEST_MNEMONIC` makes the funded-balance assertion real. Create a wallet from it, take the
+# first address from `getAddress()` (the vanilla/internal receive address) and send regtest BTC to
+# it before running. Without the variable that assertion is skipped, so the smoke still proves the
+# scan, the persisted state, the tip and the fee estimate on an unfunded wallet.
 #
 # Requirements: rust with the wasm32-unknown-unknown target, `wasm-bindgen-test-runner` matching
 # the wasm-bindgen version in Cargo.lock, and a Chrome/chromedriver pair. CI adds these in the
@@ -36,6 +46,7 @@ cd "$(dirname "${0}")/.."
 
 ESPLORA_URL="${RGB_REGTEST_ESPLORA_URL:-}"
 PROXY_URL="${RGB_REGTEST_PROXY_URL:-}"
+FUNDED_MNEMONIC="${RGB_REGTEST_MNEMONIC:-}"
 
 if [[ -z "${ESPLORA_URL}" ]]; then
     echo "RGB_REGTEST_ESPLORA_URL is not set; nothing to smoke against." >&2
@@ -59,6 +70,9 @@ fi
 export RGB_REGTEST_ESPLORA_URL="${ESPLORA_URL}"
 if [[ -n "${PROXY_URL}" ]]; then
     export RGB_REGTEST_PROXY_URL="${PROXY_URL}"
+fi
+if [[ -n "${FUNDED_MNEMONIC}" ]]; then
+    export RGB_REGTEST_MNEMONIC="${FUNDED_MNEMONIC}"
 fi
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
 export WASM_BINDGEN_TEST_TIMEOUT=300

@@ -4,6 +4,8 @@
 
 use super::*;
 
+use super::receive::{NativeReceiveTransport, ReceiveDriver, drive_native};
+
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
 /// Signed TX released to a recipient, saved to broadcast it again until the broadcast deadline
 const RECEIVED_SIGNED_TX_FILE: &str = "rcv_signed.tx";
@@ -206,7 +208,7 @@ fn incoming_expired(batch_transfer: &DbBatchTransfer, now: i64) -> bool {
 /// The retention grace advertised by a sender proxy (`retention_grace_secs`), i.e. how long
 /// after an operation expiration it keeps a released signed TX available to the recipients. A
 /// proxy not advertising it is considered to grant none.
-fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error> {
+pub(super) fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error> {
     #[cfg(test)]
     if let Some(grace) = mock_retention_grace() {
         return Ok(grace);
@@ -222,7 +224,7 @@ fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error> {
 }
 
 /// The minimum sender proxy retention grace a recipient requires to ACK a transfer.
-fn min_sender_retention_grace() -> u32 {
+pub(super) fn min_sender_retention_grace() -> u32 {
     #[cfg(test)]
     if let Some(grace) = mock_min_retention_grace() {
         return grace;
@@ -232,7 +234,7 @@ fn min_sender_retention_grace() -> u32 {
 
 /// The broadcast deadline of an operation from the `expires_at` returned by `ack.post` and the
 /// sender proxy retention grace, `None` if the proxy didn't return a valid expiration.
-fn broadcast_deadline(expires_at: Option<&str>, retention_grace: u32) -> Option<i64> {
+pub(super) fn broadcast_deadline(expires_at: Option<&str>, retention_grace: u32) -> Option<i64> {
     expires_at
         .and_then(|exp| exp.parse::<i64>().ok())
         .map(|exp| exp + i64::from(retention_grace))
@@ -1367,12 +1369,7 @@ pub trait WalletOnline: WalletOffline {
         consignment_hash: &str,
         recipient_seed: &[u8],
     ) -> Result<PostAckResponse, Error> {
-        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
-            details: s!("invalid recipient secret key"),
-        })?;
-        let sk = ed25519_from_seed(&seed);
-        let digest = Self::ack_digest(transfer_id, ack, consignment_hash);
-        let sig = hex::encode(sign_ed25519(&sk, &digest));
+        let sig = receive::ack_signature(transfer_id, ack, consignment_hash, recipient_seed)?;
         let proxy_client = ProxyClient::new(sender_proxy)?;
         let res = proxy_client.post_ack(transfer_id, ack, &sig)?;
         if let Some(err) = res.error {
@@ -1455,42 +1452,15 @@ pub trait WalletOnline: WalletOffline {
         recipient_seed: &[u8],
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
-        debug!(
-            self.logger(),
-            "Refusing invalid consignment for {recipient_id}"
-        );
-
-        // only the proxy exchange has an operation to NACK; out-of-band just fails locally
-        if let ReceiveMode::Proxy(data) = mode {
-            match self.sign_and_post_ack(
-                &data.sender_proxy,
-                &data.transfer_id,
-                false,
-                &data.consignment_hash,
-                recipient_seed,
-            ) {
-                Ok(r) => debug!(self.logger(), "Consignment NACK response: {:?}", r),
-                Err(Error::ProxyCannotChange { .. }) => {
-                    warn!(self.logger(), "Found an ACK when trying NACK");
-                }
-                // the sender proxy may have no operation (e.g. donation): just fail locally
-                Err(Error::OperationNotFound) => {}
-                Err(e) => {
-                    error!(self.logger(), "Failed to post NACK: {e}");
-                    return Err(e);
-                }
-            };
-        }
-
-        // a refused receive has no TXO registered, but a sync may have detected one paying its
-        // script if the counterparty has already broadcast
-        let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
-            .into_iter()
-            .collect();
-        self.unflag_pending_witness_txos(txn, &HashSet::new(), &scripts)?;
-        self.delete_valid_consignment(recipient_id)?;
-        updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
-        Ok(Some(txn.update_batch_transfer(updated_batch_transfer)?))
+        let transport = NativeReceiveTransport::new(self);
+        drive_native(self.refuse_consignment_via(
+            &transport,
+            txn,
+            mode,
+            recipient_id,
+            recipient_seed,
+            updated_batch_transfer,
+        ))
     }
 
     fn fetch_and_save_attachments(
@@ -1982,36 +1952,6 @@ pub trait WalletOnline: WalletOffline {
         self.files().remove(&key)
     }
 
-    fn collect_unsafe_history_txids(warnings: &[Warning], exclude_txid: &str) -> HashSet<String> {
-        let mut txids = HashSet::new();
-        for warning in warnings {
-            if let Warning::UnsafeHistory(unsafe_history) = warning {
-                for other_txids in unsafe_history.values() {
-                    for txid in other_txids {
-                        let txid = txid.to_string();
-                        if txid != *exclude_txid {
-                            txids.insert(txid);
-                        }
-                    }
-                }
-            }
-        }
-        txids
-    }
-
-    // return the signed witness tx embedded in the consignment, if present
-    fn donation_signed_tx(tx: &BdkTransaction) -> Option<BdkTransaction> {
-        Some(tx)
-            .filter(|tx| {
-                !tx.input.is_empty()
-                    && tx
-                        .input
-                        .iter()
-                        .all(|i| !i.witness.is_empty() || !i.script_sig.is_empty())
-            })
-            .cloned()
-    }
-
     // the `RecipientProxy` transport endpoint marked used, if any
     fn used_recipient_proxy_endpoint(
         tte_data: &[(DbTransferTransportEndpoint, DbTransportEndpoint)],
@@ -2033,159 +1973,17 @@ pub trait WalletOnline: WalletOffline {
         // signed TX embedded in the consignment (donation flow), broadcast directly if present
         donation_tx: Option<BdkTransaction>,
     ) -> Result<Option<DbBatchTransfer>, Error> {
-        debug!(self.logger(), "ACKing consignment...");
-
-        let recipient_id = transfer
-            .recipient_id
-            .clone()
-            .expect("transfer should have a recipient ID");
-
-        // the sender proxy retention grace is how long after the operation expiration a released
-        // signed TX can still be retrieved: a non-donation transfer whose sender proxy grants
-        // less than the acceptable minimum is NACKed (v1.0-changes-spec.md 6.4)
-        let mut retention_grace = None;
-        if let ReceiveMode::Proxy(data) = mode
-            && donation_tx.is_none()
-        {
-            let grace = sender_proxy_retention_grace(&data.sender_proxy)?;
-            if grace < min_sender_retention_grace() {
-                warn!(
-                    self.logger(),
-                    "Sender proxy retention grace ({grace}s) is below the acceptable minimum"
-                );
-                return self.refuse_consignment(
-                    txn,
-                    mode,
-                    &recipient_id,
-                    recipient_seed,
-                    updated_batch_transfer,
-                );
-            }
-            retention_grace = Some(grace);
-        }
-
-        match self.set_hub_accept_status(batch_transfer.idx)? {
-            Some(true) => {}
-            Some(false) => return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?)),
-            None => return Ok(None),
-        }
-
-        // record our own ACK on the transfer
-        let record_own_ack = |txn: &DbTxn| -> Result<(), Error> {
-            let mut updated_transfer: DbTransferActMod = transfer.clone().into();
-            updated_transfer.ack = ActiveValue::Set(Some(true));
-            txn.update_transfer(&mut updated_transfer)?;
-            Ok(())
-        };
-
-        match mode {
-            ReceiveMode::Proxy(data) => {
-                let res = match self.sign_and_post_ack(
-                    &data.sender_proxy,
-                    &data.transfer_id,
-                    true,
-                    &data.consignment_hash,
-                    recipient_seed,
-                ) {
-                    Ok(r) => r,
-                    // the sender proxy may have no operation (e.g. donation): broadcast locally
-                    Err(Error::OperationNotFound) if donation_tx.is_some() => {
-                        record_own_ack(txn)?;
-                        self.broadcast_tx(donation_tx.expect("checked to be some"))?;
-                        updated_batch_transfer.status =
-                            ActiveValue::Set(TransferStatus::WaitingConfirmations);
-                        return Ok(Some(txn.update_batch_transfer(updated_batch_transfer)?));
-                    }
-                    // a NACK is already recorded for this recipient (only this wallet could have
-                    // posted it, as ACKs are signed with its operation key): the sender fails the
-                    // operation on seeing it, so there is nothing left to wait for
-                    Err(Error::ProxyCannotChange { .. }) => {
-                        warn!(
-                            self.logger(),
-                            "A NACK was already posted for this recipient, failing the transfer"
-                        );
-                        return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
-                    }
-                    Err(e) => return Err(e),
-                };
-                debug!(self.logger(), "Consignment ACK response: {:?}", res);
-
-                record_own_ack(txn)?;
-
-                // the shared deadline for broadcasting the TX, after which (plus a confirmation
-                // margin) the transfer is failed if the TX is not confirmed
-                if let Some(grace) = retention_grace {
-                    updated_batch_transfer.broadcast_deadline =
-                        ActiveValue::Set(broadcast_deadline(res.expires_at.as_deref(), grace));
-                }
-
-                match (res.signed_tx, res.signed_tx_hash, res.sender_pk) {
-                    (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
-                        // the TX has been released: decrypt and broadcast it
-                        self.broadcast_received_tx(
-                            &recipient_id,
-                            &signed_tx,
-                            &signed_tx_hash,
-                            &sender_pubkey,
-                            recipient_seed,
-                        )?;
-                        updated_batch_transfer.status =
-                            ActiveValue::Set(TransferStatus::WaitingConfirmations);
-                    }
-                    _ if donation_tx.is_some() => {
-                        // donation: the signed TX travels inside the consignment, broadcast it
-                        self.broadcast_tx(donation_tx.expect("checked to be some"))?;
-                        updated_batch_transfer.status =
-                            ActiveValue::Set(TransferStatus::WaitingConfirmations);
-                    }
-                    _ => {
-                        // the TX has not been released (yet): for a batch operation not all
-                        // recipients have ACKed yet, for a non-batch one the proxy is not
-                        // compliant. Either way wait for the broadcast, posting the ACK again until
-                        // the TX is returned or the operation expires (v1.0-changes-spec.md 6.4)
-                        if !data.batch {
-                            warn!(
-                                self.logger(),
-                                "No signed TX released for a non-batch operation"
-                            );
-                        }
-                        updated_batch_transfer.status =
-                            ActiveValue::Set(TransferStatus::WaitingBroadcast);
-                    }
-                }
-            }
-            ReceiveMode::OutOfBand { .. } => {
-                // out-of-band: no proxy operation to ACK; the counterparty ACK is exchanged out of
-                // band. Broadcast the donation TX if present, otherwise wait for the broadcast.
-                record_own_ack(txn)?;
-                updated_batch_transfer.status = if let Some(tx) = donation_tx {
-                    debug!(
-                        self.logger(),
-                        "Consignment contains the signed TX, broadcasting it"
-                    );
-                    self.broadcast_tx(tx)?;
-                    ActiveValue::Set(TransferStatus::WaitingConfirmations)
-                } else {
-                    debug!(
-                        self.logger(),
-                        "Consignment doesn't contain the signed TX, waiting for broadcast"
-                    );
-                    ActiveValue::Set(TransferStatus::WaitingBroadcast)
-                };
-            }
-        }
-
-        Ok(Some(txn.update_batch_transfer(updated_batch_transfer)?))
-    }
-
-    /// the canonical ACK/NACK content message digest used both when signing (recipient) and
-    /// verifying (sender) an ACK (SHA-256 of `recipient_id || true|false || consignment_hash`)
-    fn ack_digest(transfer_id: &str, ack: bool, consignment_hash: &str) -> [u8; 32] {
-        let msg = format!(
-            "{transfer_id}{}{consignment_hash}",
-            if ack { "true" } else { "false" }
-        );
-        sha256_digest(msg.as_bytes())
+        let transport = NativeReceiveTransport::new(self);
+        drive_native(self.ack_consignment_via(
+            &transport,
+            txn,
+            batch_transfer,
+            transfer,
+            updated_batch_transfer,
+            mode,
+            recipient_seed,
+            donation_tx,
+        ))
     }
 
     fn wait_consignment(
@@ -2375,10 +2173,8 @@ pub trait WalletOnline: WalletOffline {
             data
         };
 
-        let proxy_url = data.proxy_url.clone();
-        let transfer_id = data.transfer_id.clone();
         let mode = ReceiveMode::Proxy(data);
-        let res = self.process_received_consignment(
+        self.process_received_consignment(
             txn,
             batch_transfer,
             &asset_transfer,
@@ -2387,13 +2183,7 @@ pub trait WalletOnline: WalletOffline {
             &consignment_path,
             mode,
             &mut updated_batch_transfer,
-        )?;
-        // once the consignment has been handled (ACKed or refused), its data is saved locally and
-        // the proxy can delete it, while the transfer keeps counting towards the invoice quota
-        if res.is_some() && self.releases_received_transfer_data() {
-            self.mark_transfer_retrieved(&proxy_url, &transfer_id, &recipient_seed);
-        }
-        Ok(res)
+        )
     }
 
     /// Find the transfer to an invoice on a recipient proxy and download its consignment.
@@ -2570,333 +2360,18 @@ pub trait WalletOnline: WalletOffline {
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
-        let mut stock = self.rgb_stock(txn)?;
-        // the recipient's per-operation Ed25519 secret seed (for ACK signing / decryption)
-        let recipient_seed = batch_transfer
-            .operation_secret_key
-            .clone()
-            .unwrap_or_default();
-        let consignment = match RgbTransfer::load_file(consignment_path) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(self.logger(), "Failed to load consignment file: {e}");
-                return self.refuse_consignment(
-                    txn,
-                    &mode,
-                    &recipient_id,
-                    &recipient_seed,
-                    updated_batch_transfer,
-                );
-            }
-        };
-        let contract_id = consignment.contract_id();
-        let asset_id = contract_id.to_string();
-        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-
-        // check if the received schema is supported
-        if !self.supports_schema(&asset_schema) {
-            error!(
-                self.logger(),
-                "The wallet doesn't support the provided schema: {}", asset_schema
-            );
-            return self.refuse_consignment(
-                txn,
-                &mode,
-                &recipient_id,
-                &recipient_seed,
-                updated_batch_transfer,
-            );
-        }
-
-        // check if DB transfer is connected to an asset
-        if let Some(aid) = asset_transfer.asset_id.clone() {
-            // check if asset transfer is connected to the asset we are actually receiving
-            if aid != asset_id {
-                error!(
-                    self.logger(),
-                    "Received a different asset than the expected one"
-                );
-                return self.refuse_consignment(
-                    txn,
-                    &mode,
-                    &recipient_id,
-                    &recipient_seed,
-                    updated_batch_transfer,
-                );
-            }
-        }
-
-        // a transfer consignment must declare the terminals it pays
-        if consignment.terminals.is_empty() {
-            error!(self.logger(), "Consignment declares no terminals");
-            return self.refuse_consignment(
-                txn,
-                &mode,
-                &recipient_id,
-                &recipient_seed,
-                updated_batch_transfer,
-            );
-        }
-
-        // locate the terminal paying us
-        let blinding = match &mode {
-            ReceiveMode::Proxy(data) => {
-                let seed: [u8; 32] =
-                    recipient_seed
-                        .clone()
-                        .try_into()
-                        .map_err(|_| Error::Internal {
-                            details: s!("invalid recipient secret key"),
-                        })?;
-                let sender_vk = hex::decode(&data.sender_pubkey)
-                    .ok()
-                    .and_then(|pk| verifying_key_from_bytes(&pk).ok());
-                let Some(sender_vk) = sender_vk else {
-                    error!(self.logger(), "Invalid sender pubkey");
-                    return self.refuse_consignment(
-                        txn,
-                        &mode,
-                        &recipient_id,
-                        &recipient_seed,
-                        updated_batch_transfer,
-                    );
-                };
-                Some(derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding)
-            }
-            ReceiveMode::OutOfBand { .. } => None,
-        };
-        let matcher = transfer.receive_matcher(blinding)?;
-        let Some((terminal_bundle, vout)) = self.find_terminal_bundle(&consignment, &matcher)
-        else {
-            error!(
-                self.logger(),
-                "Cannot find a consignment terminal paying this recipient"
-            );
-            return self.refuse_consignment(
-                txn,
-                &mode,
-                &recipient_id,
-                &recipient_seed,
-                updated_batch_transfer,
-            );
-        };
-        let witness_id = terminal_bundle.witness_id();
-        let txid = witness_id.to_string();
-        let known_concealed = match matcher {
-            ReceiveMatcher::Blind(secret_seal) => Some(secret_seal),
-            ReceiveMatcher::Witness(..) => None,
-        };
-
-        // validate consignment
-        debug!(self.logger(), "Validating consignment...");
-        let safe_height = NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations)?);
-        let validation_config = ValidationConfig {
-            chain_net: self.chain_net(),
-            build_opouts_dag: Self::schema_supports_reject_list(asset_schema),
-            safe_height,
-        };
-        let resolver = OffchainResolver {
-            witness_id,
-            consignment: &consignment,
-            fallback: self.blockchain_resolver(),
-        };
-        let valid_consignment = match consignment.clone().validate(
-            &asset_schema.schema_rules(),
-            &resolver,
-            &validation_config,
-        ) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger(), "Consignment is invalid: {}", e);
-                return self.refuse_consignment(
-                    txn,
-                    &mode,
-                    &recipient_id,
-                    &recipient_seed,
-                    updated_batch_transfer,
-                );
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger(), "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(Error::Internal {
-                    details: format!("unexpected consignment validation error: {e}"),
-                });
-            }
-        };
-        let validation_status = valid_consignment.validation_status();
-        let validity = validation_status.validity();
-        debug!(self.logger(), "Consignment validity: {:?}", validity);
-
-        let receiving = self.assignments_for_bundle(terminal_bundle, vout, known_concealed);
-        if receiving.is_empty() {
-            error!(self.logger(), "Cannot find any receiving assignment");
-            return self.refuse_consignment(
-                txn,
-                &mode,
-                &recipient_id,
-                &recipient_seed,
-                updated_batch_transfer,
-            );
-        };
-
-        if Self::schema_supports_reject_list(asset_schema) {
-            let url = if let Ok(ass) = txn.check_asset_exists(asset_id.clone()) {
-                ass.reject_list_url
-            } else {
-                Self::reject_list_url_for_schema(
-                    asset_schema,
-                    stock.consignment_data(&valid_consignment)?,
-                )
-            };
-            if let Some(url) = &url {
-                let (reject_opouts, allow_opouts) = self.get_reject_list(url)?;
-
-                let to_reject = self.check_dag(
-                    validation_status
-                        .dag_data_opt
-                        .as_ref()
-                        .expect("build_opouts_dag is set for schemas supporting a reject list"),
-                    &reject_opouts,
-                    &allow_opouts,
-                    &receiving.clone().into_keys().collect(),
-                )?;
-
-                if !to_reject.is_empty() {
-                    error!(
-                        self.logger(),
-                        "Found {} opout(s) that must be rejected",
-                        to_reject.len()
-                    );
-                    return self.refuse_consignment(
-                        txn,
-                        &mode,
-                        &recipient_id,
-                        &recipient_seed,
-                        updated_batch_transfer,
-                    );
-                } else {
-                    info!(
-                        self.logger(),
-                        "Didn't find any opout(s) that should be rejected"
-                    );
-                }
-            }
-        }
-
-        if asset_transfer.asset_id.is_none() {
-            if txn.check_asset_exists(asset_id.clone()).is_err() {
-                // unknown asset
-                debug!(self.logger(), "Receiving unknown contract...");
-                let valid_contract = valid_consignment.clone().into_valid_contract();
-
-                let attachments =
-                    self.extract_attachments(&stock, &valid_contract, asset_schema)?;
-                if !self.fetch_and_save_attachments(attachments, &mode, &recipient_seed)? {
-                    return self.refuse_consignment(
-                        txn,
-                        &mode,
-                        &recipient_id,
-                        &recipient_seed,
-                        updated_batch_transfer,
-                    );
-                }
-
-                stock
-                    .import_contract(valid_contract.clone(), &self.blockchain_resolver())
-                    .expect("failure importing received contract");
-                debug!(self.logger(), "Contract registered");
-                self.save_new_asset_internal(
-                    txn,
-                    &stock,
-                    contract_id,
-                    asset_schema,
-                    valid_contract,
-                    Some(valid_consignment.clone()),
-                )?;
-            }
-
-            // add asset info to transfer if missing
-            let mut updated_asset_transfer: DbAssetTransferActMod = asset_transfer.clone().into();
-            updated_asset_transfer.asset_id = ActiveValue::Set(Some(asset_id.clone()));
-            txn.update_asset_transfer(&mut updated_asset_transfer)?;
-        }
-
-        // keep the validated consignment while the transfer is pending, to avoid validating again
-        let valid_consignment_path = self.get_receive_valid_consignment_path(consignment_path);
-        atomic_write_with(&valid_consignment_path, |tmp| {
-            Ok(valid_consignment.save_file(tmp)?)
-        })?;
-
-        debug!(
-            self.logger(),
-            "Consignment is valid. Receiving '{:?}' of contract '{}'", receiving, asset_id
-        );
-
-        updated_batch_transfer.txid = ActiveValue::Set(Some(txid.clone()));
-
-        let utxo_idx = match transfer.recipient_type {
-            Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
-                txn.get_txo(unblinded_utxo)?.expect("utxo must exist").idx
-            }
-            Some(RecipientTypeFull::Witness { .. }) => {
-                let mut updated_transfer: DbTransferActMod = transfer.clone().into();
-                updated_transfer.recipient_type =
-                    ActiveValue::Set(Some(RecipientTypeFull::Witness { vout }));
-                txn.update_transfer(&mut updated_transfer)?;
-                let db_utxo = DbTxoActMod {
-                    txid: ActiveValue::Set(txid.clone()),
-                    vout: ActiveValue::Set(vout.unwrap()),
-                    btc_amount: ActiveValue::Set(s!("0")),
-                    spent: ActiveValue::Set(false),
-                    exists: ActiveValue::Set(false),
-                    pending_witness: ActiveValue::Set(true),
-                    ..Default::default()
-                };
-                txn.set_txo(db_utxo)?
-            }
-            _ => return Err(InternalError::Unexpected.into()),
-        };
-        for assignment in receiving.into_values() {
-            let db_coloring = DbColoringActMod {
-                txo_idx: ActiveValue::Set(utxo_idx),
-                asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
-                r#type: ActiveValue::Set(ColoringType::Receive),
-                assignment: ActiveValue::Set(assignment),
-                ..Default::default()
-            };
-            txn.set_coloring(db_coloring)?;
-        }
-
-        // if the consignment contains unsafe history set status to WaitingSafeHeight and stop here
-        if validation_status.validity() == Validity::Warnings {
-            let unsafe_txids =
-                Self::collect_unsafe_history_txids(&validation_status.warnings, &txid);
-            if !unsafe_txids.is_empty() {
-                warn!(
-                    self.logger(),
-                    "Unsafe history detected in consignment: {unsafe_txids:?}"
-                );
-                updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingSafeHeight);
-                return Ok(Some(txn.update_batch_transfer(updated_batch_transfer)?));
-            }
-        }
-
-        let donation_tx = Self::donation_signed_tx(&terminal_bundle.tx);
-
-        self.ack_consignment(
+        let transport = NativeReceiveTransport::new(self);
+        drive_native(self.drive_receive(
+            &transport,
             txn,
             batch_transfer,
+            asset_transfer,
             transfer,
+            recipient_id,
+            consignment_path,
+            mode,
             updated_batch_transfer,
-            &mode,
-            &recipient_seed,
-            donation_tx,
-        )
+        ))
     }
 
     fn provide_out_of_band_consignment_impl(
@@ -3053,7 +2528,7 @@ pub trait WalletOnline: WalletOffline {
 
         let valid_consignment = self.load_received_valid_transfer(batch_transfer, &recipient_id)?;
         let validation_status = valid_consignment.validation_status();
-        let unsafe_txids = Self::collect_unsafe_history_txids(&validation_status.warnings, txid);
+        let unsafe_txids = receive::collect_unsafe_history_txids(&validation_status.warnings, txid);
 
         if !unsafe_txids.is_empty() {
             let safe_height = self.safe_height(batch_transfer.min_confirmations)?;
@@ -3072,7 +2547,7 @@ pub trait WalletOnline: WalletOffline {
             .find_terminal_bundle(&valid_consignment, &matcher)
             .map(|(terminal_bundle, _)| terminal_bundle);
         let signed_tx = terminal_bundle
-            .and_then(|terminal_bundle| Self::donation_signed_tx(&terminal_bundle.tx));
+            .and_then(|terminal_bundle| receive::donation_signed_tx(&terminal_bundle.tx));
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         let tte_data = txn.get_transfer_transport_endpoints_data(transfer.idx)?;
         let mode = if tte_data.is_empty() {
@@ -3254,7 +2729,7 @@ pub trait WalletOnline: WalletOffline {
                         .ok_or_else(|| Error::Internal {
                             details: s!("missing consignment hash"),
                         })?;
-                let digest = Self::ack_digest(&transfer_id, ack, &consignment_hash);
+                let digest = receive::ack_digest(&transfer_id, ack, &consignment_hash);
                 let sig_bytes =
                     hex::decode(&sig_hex).map_err(|_| Error::InvalidContentSignature)?;
                 if !verify_ed25519(&vk, &digest, &sig_bytes) {

@@ -21,6 +21,7 @@ name = "rgb_lib_wasm"
 # driver, Tokio and the migration crate out of the wasm graph.
 rgb-lib = { version = "0.3.0-beta.7", path = "../../", default-features = false, features = [
     "wallet",
+    "esplora_async",
 ] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
