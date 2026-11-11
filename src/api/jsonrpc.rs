@@ -114,6 +114,31 @@ pub(crate) struct ServerInfoResponse {
     pub(crate) max_media: Option<String>,
 }
 
+/// Version of the proxy protocol this crate speaks.
+pub(crate) const PROXY_PROTOCOL_VERSION: &str = "1.0";
+
+/// Validate a `server.info` response, returning the proxy info for a supported protocol version.
+///
+/// Shared by the native blocking check and the browser async one, so both accept and reject the
+/// same proxies.
+pub(crate) fn check_server_info(
+    server_info: JsonRpcResponse<ServerInfoResponse>,
+) -> Result<ServerInfoResponse, Error> {
+    if let Some(info) = server_info.result {
+        if info.protocol_version == *PROXY_PROTOCOL_VERSION {
+            return Ok(info);
+        }
+        return Err(Error::InvalidProxyProtocol {
+            version: info.protocol_version,
+        });
+    }
+    let details = match server_info.error {
+        Some(err) => err.message,
+        None => s!("proxy response has neither result nor error"),
+    };
+    Err(Error::Proxy { details })
+}
+
 /// Status of an invoice on a recipient proxy, as reported by `invoice.check`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

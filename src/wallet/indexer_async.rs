@@ -6,18 +6,32 @@
 //! and maps its errors through the same [`IndexerError`] variant, so response semantics are
 //! preserved when the wallet online path moves over to it.
 //!
-//! Nothing here is wired into the wallet yet: the sync path and the resolver come next. Building a
-//! transport only constructs the HTTP client and never contacts the server.
+//! The read-only BDK sync (`Wallet::sync_async` in `wasm_online`) drives the transport through
+//! [`EsploraAsyncExt`](bdk_esplora::EsploraAsyncExt); the resolver is still compile-proven only.
+//! Building a transport only constructs the HTTP client and never contacts the server.
 
-use std::{cmp::Ordering, future::Future, num::NonZeroU32, pin::Pin, str::FromStr, time::Duration};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
+use std::{
+    cmp::Ordering,
+    future::Future,
+    num::NonZeroU32,
+    pin::Pin,
+    str::FromStr,
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
 
+use bdk_chain::spk_client::{FullScanRequest, FullScanResponse};
+use bdk_esplora::EsploraAsyncExt;
 use bdk_esplora::esplora_client::{
     AsyncClient, Builder as EsploraAsyncBuilder, Sleeper, Tx as EsploraTx,
 };
-use js_sys::Promise;
 use rgbstd::bitcoin::constants::ChainHash;
 use rgbstd::vm::WitnessPos;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::{error::IndexerError, utils::INDEXER_RETRIES};
 
@@ -28,25 +42,74 @@ use super::*;
 ///
 /// `Sleeper` is the seam that keeps `AsyncClient` runtime-agnostic: without the client's `tokio`
 /// feature there is no `DefaultSleeper` implementation, and the browser has no runtime timer of
-/// its own, so the delay resolves a promise driven by `setTimeout`.
+/// its own, so the delay is a promise driven by `setTimeout`.
 #[derive(Debug, Clone, Copy)]
 struct BrowserSleeper;
 
 impl Sleeper for BrowserSleeper {
-    type Sleep = Pin<Box<dyn Future<Output = ()>>>;
+    type Sleep = BrowserSleep;
 
     fn sleep(duration: Duration) -> Self::Sleep {
-        Box::pin(async move {
-            let promise = Promise::new(&mut |resolve, _reject| {
-                // shortcut: `setTimeout` takes i32 milliseconds (~24.8 days), far beyond any backoff
-                let millis = duration.as_millis().min(i32::MAX as u128) as i32;
-                web_sys::window()
-                    .expect("browser window")
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
-                    .expect("setTimeout");
-            });
-            let _ = JsFuture::from(promise).await;
-        })
+        BrowserSleep::new(duration)
+    }
+}
+
+/// One `setTimeout` delay as a `Send` future.
+///
+/// BDK's async extension requires `S::Sleep: Send`, but [`JsFuture`](js_sys::futures::JsFuture)
+/// holds an `Rc` and is not `Send`. The timer callback therefore only flips an `AtomicBool` and
+/// wakes the stored waker, while the JS closure stays on the JS side: the future itself carries
+/// `Send` state.
+pub(crate) struct BrowserSleep {
+    fired: Arc<AtomicBool>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl BrowserSleep {
+    fn new(duration: Duration) -> Self {
+        let fired = Arc::new(AtomicBool::new(false));
+        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let callback_fired = Arc::clone(&fired);
+        let callback_waker = Arc::clone(&waker);
+        let callback = Closure::once(move || {
+            callback_fired.store(true, AtomicOrdering::SeqCst);
+            if let Some(waker) = callback_waker
+                .lock()
+                .expect("the sleeper waker is never poisoned")
+                .take()
+            {
+                waker.wake();
+            }
+        });
+        // shortcut: `setTimeout` takes i32 milliseconds (~24.8 days), far beyond any backoff
+        let millis = duration.as_millis().min(i32::MAX as u128) as i32;
+        let function = callback
+            .into_js_value()
+            .unchecked_into::<js_sys::Function>();
+        web_sys::window()
+            .expect("browser window")
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&function, millis)
+            .expect("setTimeout");
+        Self { fired, waker }
+    }
+}
+
+impl Future for BrowserSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.fired.load(AtomicOrdering::SeqCst) {
+            return Poll::Ready(());
+        }
+        *self
+            .waker
+            .lock()
+            .expect("the sleeper waker is never poisoned") = Some(cx.waker().clone());
+        // the callback may have fired between the first load and storing the waker
+        if self.fired.load(AtomicOrdering::SeqCst) {
+            return Poll::Ready(());
+        }
+        Poll::Pending
     }
 }
 
@@ -71,6 +134,22 @@ impl EsploraTransport {
         Ok(Self {
             client: AsyncClient::from_builder(builder)?,
         })
+    }
+
+    /// Run a BDK full scan over the browser transport.
+    ///
+    /// The response is the update the wallet applies; the scan stops after `stop_gap` unused
+    /// script pubkeys per keychain and issues at most `parallel_requests` HTTP requests at a time.
+    pub(crate) async fn full_scan(
+        &self,
+        request: FullScanRequest<KeychainKind>,
+        stop_gap: usize,
+        parallel_requests: usize,
+    ) -> Result<FullScanResponse<KeychainKind>, Error> {
+        self.client
+            .full_scan(request, stop_gap, parallel_requests)
+            .await
+            .map_err(|e| Error::from(IndexerError::from(*e)))
     }
 
     /// Hash of the block at `height`.

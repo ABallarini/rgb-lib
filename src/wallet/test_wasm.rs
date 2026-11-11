@@ -32,7 +32,8 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 use super::*;
 use crate::wallet::persistence::{
-    InjectedFailure, delete_snapshot, load_snapshot, save_snapshot, set_injected_failure,
+    InjectedFailure, delete_snapshot, load_snapshot, load_snapshot_record, new_writer_id,
+    save_snapshot, save_snapshot_record, set_injected_failure,
 };
 use crate::{
     Error, LoggerGuard,
@@ -289,14 +290,22 @@ fn add_unspent_colored_txo(wallet: &impl WalletCore) {
         .unwrap();
 }
 
-/// Turn a snapshot write into a JS promise so two writes can be in flight at once.
-fn save_promise(wallet_id: &str, bytes: Vec<u8>) -> js_sys::Promise {
+/// Turn a guarded save into a JS promise that never rejects, so two writes can be in flight at
+/// once: it resolves to `ok <writer> <sequence>` or `error <message>`.
+fn guarded_save_promise(
+    wallet_id: &str,
+    bytes: Vec<u8>,
+    writer: String,
+    expected_sequence: u64,
+) -> js_sys::Promise {
     let wallet_id = wallet_id.to_string();
     wasm_bindgen_futures::future_to_promise(async move {
-        save_snapshot(&wallet_id, &bytes)
-            .await
-            .map(|()| JsValue::UNDEFINED)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        let outcome =
+            match save_snapshot_record(&wallet_id, &bytes, &writer, expected_sequence).await {
+                Ok(sequence) => format!("ok {writer} {sequence}"),
+                Err(error) => format!("error {error}"),
+            };
+        Ok(JsValue::from_str(&outcome))
     })
 }
 
@@ -307,15 +316,49 @@ async fn indexeddb_unavailable() {
 
     set_injected_failure(Some(InjectedFailure::Unavailable));
     let saved = save_snapshot(WALLET_ID, b"snapshot").await;
+    let saved_record = save_snapshot_record(WALLET_ID, b"snapshot", &new_writer_id(), 0).await;
     let loaded = load_snapshot(WALLET_ID).await;
+    let loaded_record = load_snapshot_record(WALLET_ID).await;
     let deleted = delete_snapshot(WALLET_ID).await;
     set_injected_failure(None);
 
     assert!(matches!(saved, Err(Error::Internal { .. })));
+    assert!(matches!(saved_record, Err(Error::Internal { .. })));
     assert!(matches!(loaded, Err(Error::Internal { .. })));
+    assert!(matches!(loaded_record, Err(Error::Internal { .. })));
     assert!(matches!(deleted, Err(Error::Internal { .. })));
     // the failure happened before any transaction, so nothing was written
     assert!(load_snapshot(WALLET_ID).await.unwrap().is_none());
+}
+
+/// Deleting a snapshot removes the record and its sequence, so a deliberate recreate starts at `0`.
+///
+/// This is the core half of the binding `deleteSnapshot` contract: the binding detaches the
+/// instance so it cannot recreate the record by accident, and a new instance's first guarded save
+/// at sequence `0` is accepted instead of rejected against the deleted record.
+#[wasm_bindgen_test]
+async fn deleted_snapshot_restarts_the_sequence() {
+    const WALLET_ID: &str = "delete-restarts-sequence-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+    save_snapshot_record(WALLET_ID, b"first", &new_writer_id(), 0)
+        .await
+        .unwrap();
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+    // deleting a missing key is not an error, so a repeated delete succeeds
+    delete_snapshot(WALLET_ID).await.unwrap();
+    assert!(load_snapshot_record(WALLET_ID).await.unwrap().is_none());
+
+    // a new writer at sequence 0 recreates the record: the deleted sequence does not reject it
+    let sequence = save_snapshot_record(WALLET_ID, b"recreated", &new_writer_id(), 0)
+        .await
+        .unwrap();
+    assert_eq!(sequence, 1);
+    assert_eq!(
+        load_snapshot(WALLET_ID).await.unwrap().as_deref(),
+        Some(b"recreated".as_slice())
+    );
+    delete_snapshot(WALLET_ID).await.unwrap();
 }
 
 #[wasm_bindgen_test]
@@ -421,7 +464,7 @@ async fn stale_snapshot_version_fails_restore() {
 }
 
 #[wasm_bindgen_test]
-async fn concurrent_flush_last_write_wins() {
+async fn concurrent_flush_serializes_and_rejects_the_stale_writer() {
     const WALLET_ID: &str = "concurrent-flush-test";
     delete_snapshot(WALLET_ID).await.unwrap();
 
@@ -432,26 +475,219 @@ async fn concurrent_flush_last_write_wins() {
     let second = wallet.snapshot().unwrap().expect("memory wallet snapshot");
     assert_ne!(first, second);
 
-    // both writes are in flight together: IndexedDB serializes their read-write transactions on
-    // the single `snapshots` store, so both commit and the last one wins
+    // both instances loaded sequence 0 and race to write it: IndexedDB serializes their read-write
+    // transactions on the single `snapshots` store, so exactly one commits sequence 1 and the
+    // other is rejected as stale
+    let writer_a = new_writer_id();
+    let writer_b = new_writer_id();
     let both = js_sys::Promise::all(&js_sys::Array::of2(
-        &save_promise(WALLET_ID, first.clone()),
-        &save_promise(WALLET_ID, second.clone()),
+        &guarded_save_promise(WALLET_ID, first.clone(), writer_a.clone(), 0),
+        &guarded_save_promise(WALLET_ID, second.clone(), writer_b.clone(), 0),
     ));
-    wasm_bindgen_futures::JsFuture::from(both)
+    let outcomes = wasm_bindgen_futures::JsFuture::from(both)
         .await
-        .expect("both concurrent writes commit");
+        .expect("both guarded writes settle");
+    let outcomes = js_sys::Array::from(&outcomes);
+    let outcomes: Vec<String> = (0..outcomes.length())
+        .map(|index| outcomes.get(index).as_string().unwrap_or_default())
+        .collect();
+    let successes: Vec<&String> = outcomes
+        .iter()
+        .filter(|outcome| outcome.starts_with("ok "))
+        .collect();
+    assert_eq!(
+        successes.len(),
+        1,
+        "exactly one writer commits, got {outcomes:?}"
+    );
+    let winner = successes[0]
+        .split_whitespace()
+        .nth(1)
+        .expect("the winning writer id")
+        .to_string();
+    let winner_bytes = if winner == writer_a { &first } else { &second };
 
-    let stored = load_snapshot(WALLET_ID)
+    let stored = load_snapshot_record(WALLET_ID)
         .await
         .unwrap()
-        .expect("the concurrent write");
-    assert!(
-        stored == first || stored == second,
-        "the store holds one whole snapshot, never a mix of the two writes"
+        .expect("the guarded write");
+    assert_eq!(stored.sequence, 1);
+    assert_eq!(stored.writer, winner);
+    assert_eq!(&stored.bytes, winner_bytes);
+    // whichever write won, the stored bytes still rebuild the wallet and the legacy reader agrees
+    assert_eq!(
+        load_snapshot(WALLET_ID).await.unwrap().as_deref(),
+        Some(winner_bytes.as_slice())
     );
-    // whichever write won, the stored bytes still rebuild the wallet
-    Wallet::from_snapshot(&stored, wallet_data(), keys).expect("wallet restore");
+    Wallet::from_snapshot(&stored.bytes, wallet_data(), keys).expect("wallet restore");
+
+    // a fresh load adopts the committed sequence, so its next write is accepted
+    let fresh = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the committed record");
+    assert_eq!(fresh.sequence, 1);
+    let sequence = save_snapshot_record(WALLET_ID, &fresh.bytes, &new_writer_id(), fresh.sequence)
+        .await
+        .unwrap();
+    assert_eq!(sequence, 2);
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+}
+
+/// Two instances load the same record; the first flushes, the second is stale and must not
+/// overwrite the newer bytes. A fresh load sees the new sequence and can flush again.
+#[wasm_bindgen_test]
+async fn stale_sequence_is_rejected_and_keeps_the_newer_snapshot() {
+    const WALLET_ID: &str = "stale-sequence-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+
+    let (mut wallet, _keys) = memory_wallet();
+    let first = wallet.snapshot().unwrap().expect("memory wallet snapshot");
+    let writer = new_writer_id();
+    assert_eq!(
+        save_snapshot_record(WALLET_ID, &first, &writer, 0)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // both instances load the same record and adopt its writer and sequence
+    let instance_a = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the stored record");
+    let instance_b = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the stored record");
+    assert_eq!(instance_a, instance_b);
+    assert_eq!(instance_a.writer, writer);
+    assert_eq!(instance_a.sequence, 1);
+
+    // the first instance flushes the newer state
+    let _ = wallet.get_address().unwrap();
+    let second = wallet.snapshot().unwrap().expect("memory wallet snapshot");
+    let sequence =
+        save_snapshot_record(WALLET_ID, &second, &instance_a.writer, instance_a.sequence)
+            .await
+            .unwrap();
+    assert_eq!(sequence, 2);
+
+    // the second instance still expects sequence 1: rejected, and the message names the stored
+    // sequence and the writer that owns it
+    let error = save_snapshot_record(
+        WALLET_ID,
+        b"stale snapshot bytes",
+        &instance_b.writer,
+        instance_b.sequence,
+    )
+    .await
+    .expect_err("a stale sequence must be rejected");
+    assert!(matches!(error, Error::Internal { .. }));
+    let message = error.to_string();
+    assert!(
+        message.contains("stored sequence is 2"),
+        "the stale error must name the stored sequence: {message}"
+    );
+    assert!(
+        message.contains(&writer),
+        "the stale error must name the current writer: {message}"
+    );
+    let stored = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the newer record");
+    assert_eq!(stored.bytes, second);
+    assert_eq!(stored.writer, writer);
+    assert_eq!(stored.sequence, 2);
+
+    // a fresh load sees the new sequence and its flush is accepted
+    let fresh = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the newer record");
+    assert_eq!(fresh.sequence, 2);
+    assert_eq!(
+        save_snapshot_record(WALLET_ID, &fresh.bytes, &new_writer_id(), fresh.sequence)
+            .await
+            .unwrap(),
+        3
+    );
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+}
+
+/// A pre-guard `Uint8Array` value loads as `legacy` / sequence 0 and the first guarded save
+/// migrates it to the record shape without losing the bytes.
+#[wasm_bindgen_test]
+async fn legacy_snapshot_migrates_on_the_first_guarded_save() {
+    const WALLET_ID: &str = "legacy-record-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+
+    let legacy = b"legacy snapshot bytes".to_vec();
+    save_snapshot(WALLET_ID, &legacy).await.unwrap();
+
+    let record = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("a legacy value loads");
+    assert_eq!(record.bytes, legacy);
+    assert_eq!(record.writer, "legacy");
+    assert_eq!(record.sequence, 0);
+    // the compatibility reader returns the same bytes
+    assert_eq!(
+        load_snapshot(WALLET_ID).await.unwrap().as_deref(),
+        Some(legacy.as_slice())
+    );
+
+    let writer = new_writer_id();
+    let sequence = save_snapshot_record(WALLET_ID, &legacy, &writer, record.sequence)
+        .await
+        .unwrap();
+    assert_eq!(sequence, 1);
+
+    // the legacy value is now a guarded record owned by the new writer
+    let migrated = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the migrated record");
+    assert_eq!(migrated.bytes, legacy);
+    assert_eq!(migrated.writer, writer);
+    assert_eq!(migrated.sequence, 1);
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+}
+
+/// Both failure-injection paths leave the previous guarded record intact and keep its sequence.
+#[wasm_bindgen_test]
+async fn guarded_write_failure_keeps_the_previous_record() {
+    const WALLET_ID: &str = "guarded-write-failure-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+
+    let first = b"first committed snapshot".to_vec();
+    let writer = new_writer_id();
+    save_snapshot_record(WALLET_ID, &first, &writer, 0)
+        .await
+        .unwrap();
+
+    for failure in [
+        InjectedFailure::WriteFailed,
+        InjectedFailure::AbortBeforeCommit,
+    ] {
+        set_injected_failure(Some(failure));
+        let result = save_snapshot_record(WALLET_ID, b"second snapshot", "other-writer", 1).await;
+        set_injected_failure(None);
+
+        assert!(matches!(result, Err(Error::Internal { .. })));
+        let stored = load_snapshot_record(WALLET_ID)
+            .await
+            .unwrap()
+            .expect("the committed record");
+        assert_eq!(stored.bytes, first);
+        assert_eq!(stored.writer, writer);
+        assert_eq!(stored.sequence, 1);
+    }
 
     delete_snapshot(WALLET_ID).await.unwrap();
 }
@@ -1026,5 +1262,21 @@ fn asset_genesis_timestamps_are_sane_and_survive_restore() {
             .expect("the issued asset is missing after the restore");
         assert_eq!(restored_asset.timestamp, asset.timestamp);
         assert_eq!(restored_asset.added_at, asset.added_at);
+    }
+}
+
+// The proxy health check is read-only and needs no proxy for the invalid-endpoint path: the shared
+// transport-endpoint parser rejects the URL before any request is built.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn check_proxy_url_async_rejects_an_invalid_endpoint() {
+    for url in ["not-a-url", "http://", "ftp://proxy.example.com"] {
+        assert!(
+            matches!(
+                super::rust_only::check_proxy_url_async(url).await,
+                Err(Error::InvalidTransportEndpoint { .. })
+            ),
+            "expected an invalid transport endpoint for {url}"
+        );
     }
 }

@@ -1,12 +1,12 @@
-//! Opt-in browser smoke test for the async Esplora transport and resolver.
+//! Opt-in browser smoke test for the read-only wasm online path.
 //!
-//! What "online" means on wasm today: the browser can reach an Esplora endpoint through
-//! `fetch`, and the async transport/resolver below answer the chain questions the native
-//! indexer answers. The wallet online flow itself (`RgbWalletOpsOnline`, `OnlineOptions`,
-//! `go_online`, sync, fee estimation on a wallet, transfers) is still gated by the native-only
-//! `_online` feature: `esplora_async` deliberately does not enable it, and this test asserts
-//! that gate instead of pretending the flow exists. Wiring the transport into `WalletOnline` is a
-//! later step.
+//! What "online" means on wasm today: the browser reaches an Esplora endpoint through `fetch`; the
+//! async transport/resolver answer the chain questions the native indexer answers; and
+//! [`Wallet::sync_async`](super::Wallet::sync_async) runs a read-only BDK full scan through that
+//! transport, persisting the result through the wallet's own database seam. The RGB online flow
+//! (`RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, consignment reception, transfers) stays
+//! gated by the native-only `_online` feature, which `esplora_async` deliberately does not enable;
+//! this test still asserts that gate.
 //!
 //! The test is opt-in and deterministic:
 //!
@@ -15,9 +15,11 @@
 //!   is the case in the default `wasm_browser_lifecycle` CI job: no regtest service is available
 //!   there.
 //! - it never broadcasts and never spends: every request is a read (tip height, block hash, block
-//!   header, a block's first TX ID, that TX, its confirmations, the fee-estimate map, and the
-//!   resolver's witness/header/chain-net answers).
+//!   header, a block's first TX ID, that TX, its confirmations, the fee-estimate map, the
+//!   resolver's witness/header/chain-net answers, and a wallet BDK full scan).
 //! - the optional `RGB_REGTEST_PROXY_URL` enables one read-only proxy request (`server.info`).
+//! - the optional `RGB_REGTEST_MNEMONIC` makes the funded-balance check real: the harness funds
+//!   the first internal receive address of that mnemonic, and the test asserts the scan sees it.
 //!
 //! Run it through `scripts/wasm_online_smoke.sh`, which documents the controlled regtest setup
 //! and exports the variables below. Temporal caveat: because the env vars are compile-time, a
@@ -40,6 +42,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 const ESPLORA_URL: Option<&str> = option_env!("RGB_REGTEST_ESPLORA_URL");
 /// Optional proxy base URL of the same environment, baked in at compile time.
 const PROXY_URL: Option<&str> = option_env!("RGB_REGTEST_PROXY_URL");
+/// Optional mnemonic whose first internal receive address the harness funds, baked in at compile
+/// time. Without it the funded-balance assertion is skipped.
+const FUNDED_MNEMONIC: Option<&str> = option_env!("RGB_REGTEST_MNEMONIC");
 
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.filter(|v| !v.is_empty())
@@ -135,6 +140,77 @@ async fn regtest_esplora_online_smoke() {
         ),
         Err(Error::CannotEstimateFees) => {}
         Err(e) => panic!("fee estimation failed: {e}"),
+    }
+
+    // Read-only BDK wallet sync. The wallet is built over the in-memory backend, so the scan
+    // persists into the DB and the host-side snapshot carries it.
+    let funded = non_empty(FUNDED_MNEMONIC);
+    let keys = match funded {
+        Some(mnemonic) => crate::keys::restore_keys(
+            BitcoinNetwork::Regtest,
+            mnemonic.to_string(),
+            WitnessVersion::Taproot,
+        )
+        .expect("the harness mnemonic is valid"),
+        None => crate::keys::generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot),
+    };
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet_data = WalletData {
+        data_dir: String::new(),
+        bitcoin_network: BitcoinNetwork::Regtest,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 5,
+        supported_schemas: AssetSchema::VALUES.to_vec(),
+    };
+    let mut wallet = Wallet::new_in_memory(wallet_data.clone(), wallet_keys.clone())
+        .expect("wallet over the in-memory backend");
+    let receive_address = wallet.get_address().expect("vanilla receive address");
+    wallet
+        .sync_async(url, None)
+        .await
+        .expect("read-only BDK wallet sync");
+
+    let wallet_tip = wallet
+        .tip_height_async(url)
+        .await
+        .expect("tip height through the wallet");
+    assert!(
+        wallet_tip >= height,
+        "the wallet tip went backwards: {wallet_tip} < {height}"
+    );
+    match wallet.fee_estimation_async(url, 2).await {
+        Ok(estimate) => assert!(
+            estimate > 0.0,
+            "the wallet returned a non-positive fee estimate: {estimate}"
+        ),
+        Err(Error::CannotEstimateFees) => {}
+        Err(e) => panic!("wallet fee estimation failed: {e}"),
+    }
+
+    // The scan is in the wallet DB, not only in BDK's stage: a snapshot restore sees the same
+    // balance without another network access.
+    let balance = wallet
+        .get_btc_balance(None, true)
+        .expect("BTC balance after sync");
+    let snapshot = wallet
+        .snapshot()
+        .expect("the in-memory wallet snapshots")
+        .expect("the in-memory wallet produces a snapshot");
+    let mut restored = Wallet::from_snapshot(&snapshot, wallet_data, wallet_keys)
+        .expect("restore the synced wallet from its snapshot");
+    let restored_balance = restored
+        .get_btc_balance(None, true)
+        .expect("BTC balance of the restored wallet");
+    assert_eq!(
+        restored_balance.vanilla.future, balance.vanilla.future,
+        "the sync did not reach the persisted wallet state"
+    );
+
+    if funded.is_some() {
+        assert!(
+            balance.vanilla.future > 0,
+            "no funds seen for the scanned address {receive_address}: fund it before the smoke"
+        );
     }
 
     // Optional read-only proxy smoke: `server.info` changes nothing on the server.

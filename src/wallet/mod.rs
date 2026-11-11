@@ -19,6 +19,10 @@ pub(crate) mod offline;
 pub(crate) mod online;
 #[cfg(target_arch = "wasm32")]
 pub mod persistence;
+#[cfg(feature = "_online")]
+pub(crate) mod receive;
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) mod wasm_online;
 // async chain-resolution boundary: the browser fetches before the DB transaction opens, native
 // builds keep the blocking resolver
 #[cfg(feature = "wallet")]

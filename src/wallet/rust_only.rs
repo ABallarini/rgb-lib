@@ -38,6 +38,23 @@ pub fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
     check_proxy(proxy_url).map(|_| ())
 }
 
+/// Check whether the provided URL points to a valid proxy, over the browser `fetch` transport.
+///
+/// The async counterpart of [`check_proxy_url`] for wasm32, taking an RGB transport endpoint
+/// (`rpc://host` or `rpcs://host`): it validates the endpoint with the shared
+/// [`TransportEndpoint`] parser, asks the proxy for `server.info` through
+/// [`ProxyFetchClient`](crate::api::fetch::ProxyFetchClient) and accepts it only when it reports
+/// the supported protocol version. Read-only: it never writes to the proxy.
+///
+/// <div class="warning">This method is meant for special usage and is normally not needed, use
+/// it only if you know what you're doing</div>
+#[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+pub async fn check_proxy_url_async(proxy_url: &str) -> Result<bool, Error> {
+    let endpoint = TransportEndpoint::new(proxy_url.to_string())?;
+    let proxy_client = crate::api::fetch::ProxyFetchClient::new(&endpoint.endpoint)?;
+    crate::api::jsonrpc::check_server_info(proxy_client.get_info().await?).map(|_| true)
+}
+
 /// Load an RGB fascia from the file at the provided path.
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use

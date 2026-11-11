@@ -14,7 +14,13 @@
 //!   never the mnemonic) into bytes the host can store wherever it wants.
 //! * [`RgbLibWallet::flush`] is the durable-write boundary: it stores those bytes in IndexedDB
 //!   (database `rgb-lib`, store `snapshots`, keyed by the wallet name) and resolves once the
-//!   transaction commits. Only available where IndexedDB exists, i.e. in a browser.
+//!   transaction commits. The write carries this instance's writer id and snapshot sequence, so a
+//!   stale instance is rejected instead of overwriting a newer snapshot; `load` adopts the stored
+//!   writer and sequence, while the synchronous `restore` starts a fresh writer at sequence `0`.
+//!   Only available where IndexedDB exists, i.e. in a browser.
+//! * [`RgbLibWallet::delete_snapshot`] removes that record and detaches the instance: it refuses a
+//!   name other than the wallet's own, and every later `flush` fails instead of recreating the
+//!   deleted snapshot, so the host must `load` a new instance to start over.
 //!
 //! `name` is the durable key: two wallets created with the same name share one snapshot entry, so
 //! keep it stable per wallet. The wallet identity itself is the master fingerprint returned by
@@ -26,11 +32,13 @@
 //! returned here echoes it. Errors carry the failing operation and the `rgb-lib` message, which
 //! describes settings and state, never key material.
 
+use std::cell::Cell;
+
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 use rgb_lib::{
-    AssetSchema, BitcoinNetwork, Error,
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error,
     keys::{
         Keys, WitnessVersion, generate_keys as core_generate_keys,
         restore_keys as core_restore_keys,
@@ -39,10 +47,17 @@ use rgb_lib::{
     wallet::{
         AssetFilter, DatabaseType, Invoice as CoreInvoice, MultisigKeys, MultisigWallet,
         RgbWalletOpsOffline, SinglesigKeys, TransferScope, Wallet, WalletData,
-        backup_info_bytes as core_backup_info_bytes, persistence::load_snapshot,
+        backup_info_bytes as core_backup_info_bytes,
+        persistence::{
+            delete_snapshot as core_delete_snapshot, load_snapshot_record, new_writer_id,
+            save_snapshot_record,
+        },
         restore_backup_bytes as core_restore_backup_bytes,
     },
 };
+
+#[cfg(target_arch = "wasm32")]
+use rgb_lib::wallet::rust_only::check_proxy_url_async as core_check_proxy_url_async;
 
 /// `rgb-lib` default: allocations allowed per UTXO.
 const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
@@ -112,6 +127,34 @@ fn failure(context: &str, e: Error) -> JsValue {
     JsValue::from_str(&format!("{context}: {e}"))
 }
 
+/// Parse an RGB assignment from the core serde shape: `{"Fungible":1000}`, `"NonFungible"`,
+/// `{"InflationRight":1000}` or `"Any"`.
+fn parse_assignment(assignment: &str) -> Result<Assignment, JsValue> {
+    serde_json::from_str(assignment).map_err(|e| {
+        JsValue::from_str(&format!(
+            "cannot parse the assignment: {e}; use the core shape, e.g. {{\"Fungible\":1000}} or \"Any\""
+        ))
+    })
+}
+
+/// Parse an optional encryption preference: `required`, `unsupported` or `optional`.
+fn parse_encryption(encryption: Option<String>) -> Result<Option<Encryption>, JsValue> {
+    let Some(encryption) = encryption else {
+        return Ok(None);
+    };
+    let encryption = match encryption.to_ascii_lowercase().as_str() {
+        "required" => Encryption::Required,
+        "unsupported" => Encryption::Unsupported,
+        "optional" => Encryption::Optional,
+        _ => {
+            return Err(JsValue::from_str(
+                "unsupported encryption: use required, unsupported or optional",
+            ));
+        }
+    };
+    Ok(Some(encryption))
+}
+
 /// Serialize an `rgb-lib` object for the host.
 ///
 /// The JSON uses the `rgb-lib` serde field names (`snake_case`); the bindings do not rename them.
@@ -173,6 +216,20 @@ pub fn backup_info(backup_bytes: Vec<u8>) -> Result<String, JsValue> {
     json_result("cannot serialize the backup info", &info)
 }
 
+/// Check that the proxy at `url` speaks the supported protocol version.
+///
+/// Async and read-only: validates an RGB transport endpoint (`rpc://host` or `rpcs://host`) with
+/// the shared parser, performs the proxy's `server.info` request over browser `fetch` and resolves
+/// to `true` when the reported protocol version matches. An invalid URL, an unreachable proxy or an
+/// unsupported protocol version throws a sanitized error; no write is ever sent.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = checkProxyUrl)]
+pub async fn check_proxy_url(url: String) -> Result<bool, JsValue> {
+    core_check_proxy_url_async(&url)
+        .await
+        .map_err(|e| failure("cannot check the proxy URL", e))
+}
+
 /// An RGB invoice parsed from a string.
 #[wasm_bindgen]
 pub struct WasmInvoice {
@@ -219,6 +276,17 @@ impl WasmInvoice {
 pub struct RgbLibWallet {
     wallet: Wallet,
     name: String,
+    /// This instance's id in the snapshot record; a flush writes it next to the bytes.
+    writer: String,
+    /// Sequence this instance last saw or wrote; a guarded flush needs it to match the store.
+    sequence: Cell<u64>,
+    /// Set once this instance deleted its own snapshot: a later flush must not resurrect it.
+    detached: Cell<bool>,
+}
+
+/// A fresh writer id at sequence 0: a wallet with no stored record yet.
+fn fresh_writer() -> (String, Cell<u64>) {
+    (new_writer_id(), Cell::new(0))
 }
 
 #[wasm_bindgen]
@@ -233,13 +301,23 @@ impl RgbLibWallet {
         let network = parse_network(&network)?;
         let wallet = Wallet::new_in_memory(wallet_data(network), derived_keys(network, &mnemonic)?)
             .map_err(|e| failure("cannot create the wallet", e))?;
-        Ok(Self { wallet, name })
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet,
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
     }
 
     /// Rebuild a wallet from the bytes of [`RgbLibWallet::snapshot`].
     ///
     /// The snapshot carries the wallet settings, which are validated against the supplied
-    /// mnemonic and network; a mismatch is an error, never a fresh wallet.
+    /// mnemonic and network; a mismatch is an error, never a fresh wallet. Restoring is
+    /// synchronous, so the stored sequence cannot be read here: this instance starts a fresh
+    /// writer at sequence `0`. Use [`RgbLibWallet::load`] to attach to an existing IndexedDB
+    /// record, or the first flush is rejected when that record is already newer.
     #[wasm_bindgen]
     pub fn restore(
         name: String,
@@ -254,7 +332,14 @@ impl RgbLibWallet {
             derived_keys(network, &mnemonic)?,
         )
         .map_err(|e| failure("cannot restore the wallet", e))?;
-        Ok(Self { wallet, name })
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet,
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
     }
 
     /// Create a watch-only wallet from public keys JSON.
@@ -274,7 +359,14 @@ impl RgbLibWallet {
         let keys = watch_only_keys(&keys)?;
         let wallet = Wallet::new_in_memory(wallet_data(network), keys)
             .map_err(|e| failure("cannot create the watch-only wallet", e))?;
-        Ok(Self { wallet, name })
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet,
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
     }
 
     /// Rebuild a watch-only wallet from the bytes of [`RgbLibWallet::snapshot`] and its public keys.
@@ -289,13 +381,22 @@ impl RgbLibWallet {
         let keys = watch_only_keys(&keys)?;
         let wallet = Wallet::from_snapshot(&snapshot, wallet_data(network), keys)
             .map_err(|e| failure("cannot restore the watch-only wallet", e))?;
-        Ok(Self { wallet, name })
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet,
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
     }
 
     /// Load the snapshot stored under `name` from IndexedDB and rebuild the wallet.
     ///
     /// When no snapshot exists yet, a fresh wallet is created instead, so this is the single entry
-    /// point a host needs on startup. Await it before using the wallet.
+    /// point a host needs on startup. Await it before using the wallet. The stored writer id and
+    /// sequence are adopted, so this instance's next flush is guarded against a newer one; a stale
+    /// wallet must call `load` again instead of retrying the clashing flush.
     #[wasm_bindgen]
     pub async fn load(
         name: String,
@@ -305,17 +406,32 @@ impl RgbLibWallet {
         let network = parse_network(&network)?;
         let keys = derived_keys(network, &mnemonic)?;
         let wallet_data = wallet_data(network);
-        match load_snapshot(&name)
+        match load_snapshot_record(&name)
             .await
             .map_err(|e| failure("cannot read the wallet snapshot", e))?
         {
-            Some(snapshot) => Wallet::from_snapshot(&snapshot, wallet_data, keys)
-                .map(|wallet| Self { wallet, name })
+            Some(record) => Wallet::from_snapshot(&record.bytes, wallet_data, keys)
+                .map(|wallet| Self {
+                    wallet,
+                    name,
+                    writer: record.writer,
+                    sequence: Cell::new(record.sequence),
+                    detached: Cell::new(false),
+                })
                 .map_err(|e| failure("cannot restore the wallet", e)),
             // a corrupt snapshot is an error above, never a fresh wallet: no fallback here
-            None => Wallet::new_in_memory(wallet_data, keys)
-                .map(|wallet| Self { wallet, name })
-                .map_err(|e| failure("cannot create the wallet", e)),
+            None => {
+                let wallet = Wallet::new_in_memory(wallet_data, keys)
+                    .map_err(|e| failure("cannot create the wallet", e))?;
+                let (writer, sequence) = fresh_writer();
+                Ok(Self {
+                    wallet,
+                    name,
+                    writer,
+                    sequence,
+                    detached: Cell::new(false),
+                })
+            }
         }
     }
 
@@ -339,6 +455,51 @@ impl RgbLibWallet {
             .get_btc_balance(None, true)
             .map_err(|e| failure("cannot get the BTC balance", e))?;
         json_result("cannot serialize the BTC balance", &balance)
+    }
+
+    /// Sync the BDK wallet against an Esplora endpoint, read-only.
+    ///
+    /// Runs a full scan of both wallet keychains and applies the result to the shared wallet. The
+    /// change is in the in-memory database when this resolves; call `flush()` to make it durable.
+    /// `stop_gap` is the unused script count per keychain (default 20). Nothing is broadcast and
+    /// no RGB state is touched: RGB consignment reception, transfers and send stay native-only.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn sync(
+        &mut self,
+        indexer_url: String,
+        stop_gap: Option<u32>,
+    ) -> Result<(), JsValue> {
+        self.wallet
+            .sync_async(&indexer_url, stop_gap.map(|gap| gap as usize))
+            .await
+            .map_err(|e| failure("cannot sync the wallet", e))
+    }
+
+    /// Fee estimate for confirmation within `blocks`, in sat/vB, from an Esplora endpoint.
+    ///
+    /// `blocks` must be in `1..=1008`. An endpoint without fee history throws the sanitized
+    /// `Cannot estimate fees` error.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = getFeeEstimation)]
+    pub async fn get_fee_estimation(
+        &self,
+        indexer_url: String,
+        blocks: u16,
+    ) -> Result<f64, JsValue> {
+        self.wallet
+            .fee_estimation_async(&indexer_url, blocks)
+            .await
+            .map_err(|e| failure("cannot estimate the fee", e))
+    }
+
+    /// Height of the best-chain tip reported by an Esplora endpoint.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = getTipHeight)]
+    pub async fn get_tip_height(&self, indexer_url: String) -> Result<u32, JsValue> {
+        self.wallet
+            .tip_height_async(&indexer_url)
+            .await
+            .map_err(|e| failure("cannot get the tip height", e))
     }
 
     /// Return the RGB asset balance as JSON, from local data only.
@@ -420,6 +581,69 @@ impl RgbLibWallet {
         self.wallet
             .get_address()
             .map_err(|e| failure("cannot derive a receive address", e))
+    }
+
+    /// Create an out-of-band blind receive request and return its `ReceiveData` as JSON.
+    ///
+    /// `assignment` is the core serde shape (`{"Fungible":1000}`, `"NonFungible"`,
+    /// `{"InflationRight":1000}` or `"Any"`). `encryption` is `required`, `unsupported` or
+    /// `optional`. Transport endpoints are always empty: the invoice carries no proxy endpoint and
+    /// the consignment is exchanged out-of-band, so no proxy reservation is made. A blind receive
+    /// allocates on an existing colored UTXO; a wallet without one throws the core error.
+    #[wasm_bindgen(js_name = blindReceive)]
+    pub fn blind_receive(
+        &mut self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = self
+            .wallet
+            .blind_receive(
+                None,
+                asset_id,
+                assignment,
+                expiration_timestamp,
+                vec![],
+                min_confirmations,
+                encryption,
+            )
+            .map_err(|e| failure("cannot create the blind receive", e))?;
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
+    /// Create an out-of-band witness receive request and return its `ReceiveData` as JSON.
+    ///
+    /// Arguments and out-of-band semantics are the same as [`RgbLibWallet::blind_receive`], but the
+    /// recipient is a new script and no colored UTXO is needed.
+    #[wasm_bindgen(js_name = witnessReceive)]
+    pub fn witness_receive(
+        &mut self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = self
+            .wallet
+            .witness_receive(
+                None,
+                asset_id,
+                assignment,
+                expiration_timestamp,
+                vec![],
+                min_confirmations,
+                encryption,
+            )
+            .map_err(|e| failure("cannot create the witness receive", e))?;
+        json_result("cannot serialize the receive data", &receive_data)
     }
 
     /// Issue a NIA asset and return its asset ID.
@@ -582,11 +806,47 @@ impl RgbLibWallet {
     }
 
     /// Store the wallet state in IndexedDB and resolve once the transaction commits.
+    ///
+    /// The write is guarded: it carries this instance's writer id and sequence, and IndexedDB
+    /// rejects it when the stored sequence is newer. The error names the stored sequence and its
+    /// writer; call `load` again to adopt the newer state. A successful flush adopts the returned
+    /// sequence for the next call. After `deleteSnapshot` this instance is detached and every flush
+    /// fails instead of recreating the deleted record.
     pub async fn flush(&self) -> Result<(), JsValue> {
-        self.wallet
-            .flush(&self.name)
+        if self.detached.get() {
+            return Err(JsValue::from_str(
+                "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",
+            ));
+        }
+        let bytes = self.snapshot()?;
+        let sequence = save_snapshot_record(&self.name, &bytes, &self.writer, self.sequence.get())
             .await
-            .map_err(|e| failure("cannot persist the wallet", e))
+            .map_err(|e| failure("cannot persist the wallet", e))?;
+        self.sequence.set(sequence);
+        Ok(())
+    }
+
+    /// Delete the snapshot stored under `name` from IndexedDB and detach this instance.
+    ///
+    /// `name` must be this wallet's name: any other key is refused, so the call can never remove
+    /// another wallet's record. A missing record is not an error, so a repeated call succeeds. The
+    /// in-memory wallet stays usable, but this instance is detached: every later `flush` fails
+    /// instead of recreating the deleted snapshot with a stale sequence. Recreate the record
+    /// deliberately with `load` on a new instance, which starts at sequence `0`, or drop the
+    /// instance.
+    #[wasm_bindgen(js_name = deleteSnapshot)]
+    pub async fn delete_snapshot(&self, name: String) -> Result<(), JsValue> {
+        if name != self.name {
+            return Err(JsValue::from_str(&format!(
+                "cannot delete the snapshot '{name}': this wallet stores its snapshot under '{}'",
+                self.name
+            )));
+        }
+        core_delete_snapshot(&self.name)
+            .await
+            .map_err(|e| failure("cannot delete the wallet snapshot", e))?;
+        self.detached.set(true);
+        Ok(())
     }
 }
 
@@ -599,6 +859,12 @@ impl RgbLibWallet {
 pub struct RgbLibMultisigWallet {
     wallet: MultisigWallet,
     name: String,
+    /// This instance's id in the snapshot record; a flush writes it next to the bytes.
+    writer: String,
+    /// Sequence this instance last saw or wrote; a guarded flush needs it to match the store.
+    sequence: Cell<u64>,
+    /// Set once this instance deleted its own snapshot: a later flush must not resurrect it.
+    detached: Cell<bool>,
 }
 
 #[wasm_bindgen]
@@ -618,7 +884,14 @@ impl RgbLibMultisigWallet {
         let keys = multisig_keys(&keys)?;
         let wallet = MultisigWallet::new(wallet_data(network), keys)
             .map_err(|e| failure("cannot create the multisig wallet", e))?;
-        Ok(Self { wallet, name })
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet,
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
     }
 
     /// Rebuild a multisig wallet from the bytes of [`RgbLibMultisigWallet::snapshot`] and its keys.
@@ -633,7 +906,55 @@ impl RgbLibMultisigWallet {
         let keys = multisig_keys(&keys)?;
         let wallet = MultisigWallet::from_snapshot(&snapshot, wallet_data(network), keys)
             .map_err(|e| failure("cannot restore the multisig wallet", e))?;
-        Ok(Self { wallet, name })
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet,
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Load the snapshot stored under `name` from IndexedDB and rebuild the multisig wallet.
+    ///
+    /// When no snapshot exists yet, a fresh wallet is created. The stored writer id and sequence
+    /// are adopted, so this instance's next flush is guarded like the singlesig one.
+    #[wasm_bindgen]
+    pub async fn load(
+        name: String,
+        keys: String,
+        network: String,
+    ) -> Result<RgbLibMultisigWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = multisig_keys(&keys)?;
+        let wallet_data = wallet_data(network);
+        match load_snapshot_record(&name)
+            .await
+            .map_err(|e| failure("cannot read the wallet snapshot", e))?
+        {
+            Some(record) => MultisigWallet::from_snapshot(&record.bytes, wallet_data, keys)
+                .map(|wallet| Self {
+                    wallet,
+                    name,
+                    writer: record.writer,
+                    sequence: Cell::new(record.sequence),
+                    detached: Cell::new(false),
+                })
+                .map_err(|e| failure("cannot restore the multisig wallet", e)),
+            None => {
+                let wallet = MultisigWallet::new(wallet_data, keys)
+                    .map_err(|e| failure("cannot create the multisig wallet", e))?;
+                let (writer, sequence) = fresh_writer();
+                Ok(Self {
+                    wallet,
+                    name,
+                    writer,
+                    sequence,
+                    detached: Cell::new(false),
+                })
+            }
+        }
     }
 
     /// The wallet name, i.e. the key of its durable snapshot.
@@ -686,10 +1007,42 @@ impl RgbLibMultisigWallet {
     }
 
     /// Store the wallet state in IndexedDB and resolve once the transaction commits.
+    ///
+    /// The write is guarded like the singlesig one: a stale sequence is rejected and the error
+    /// names the stored sequence and its writer. Call `load` again to adopt the newer state. After
+    /// `deleteSnapshot` this instance is detached and every flush fails.
     pub async fn flush(&self) -> Result<(), JsValue> {
-        self.wallet
-            .flush(&self.name)
+        if self.detached.get() {
+            return Err(JsValue::from_str(
+                "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",
+            ));
+        }
+        let bytes = self.snapshot()?;
+        let sequence = save_snapshot_record(&self.name, &bytes, &self.writer, self.sequence.get())
             .await
-            .map_err(|e| failure("cannot persist the wallet", e))
+            .map_err(|e| failure("cannot persist the wallet", e))?;
+        self.sequence.set(sequence);
+        Ok(())
+    }
+
+    /// Delete the snapshot stored under `name` from IndexedDB and detach this instance.
+    ///
+    /// `name` must be this wallet's name: any other key is refused. A missing record is not an
+    /// error. The in-memory wallet stays usable, but every later `flush` fails instead of
+    /// recreating the deleted snapshot; `load` on a new instance recreates the record at sequence
+    /// `0` deliberately.
+    #[wasm_bindgen(js_name = deleteSnapshot)]
+    pub async fn delete_snapshot(&self, name: String) -> Result<(), JsValue> {
+        if name != self.name {
+            return Err(JsValue::from_str(&format!(
+                "cannot delete the snapshot '{name}': this wallet stores its snapshot under '{}'",
+                self.name
+            )));
+        }
+        core_delete_snapshot(&self.name)
+            .await
+            .map_err(|e| failure("cannot delete the wallet snapshot", e))?;
+        self.detached.set(true);
+        Ok(())
     }
 }

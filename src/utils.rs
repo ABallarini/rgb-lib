@@ -42,9 +42,6 @@ pub(crate) const INDEXER_BATCH_SIZE: usize = 5;
 #[cfg(feature = "esplora")]
 pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 
-#[cfg(feature = "_online")]
-const PROXY_PROTOCOL_VERSION: &str = "1.0";
-
 // The blocking runtime boundary lives in its own module; re-exported here because `utils::block_on`
 // is part of the public API.
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
@@ -462,21 +459,7 @@ pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
 #[cfg(feature = "_online")]
 pub(crate) fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> {
     let proxy_client = ProxyClient::new(proxy_url)?;
-    let server_info = proxy_client.get_info()?;
-    if let Some(info) = server_info.result {
-        if info.protocol_version == *PROXY_PROTOCOL_VERSION {
-            return Ok(info);
-        } else {
-            return Err(Error::InvalidProxyProtocol {
-                version: info.protocol_version,
-            });
-        }
-    }
-    let details = match server_info.error {
-        Some(err) => err.message,
-        None => s!("proxy response has neither result nor error"),
-    };
-    Err(Error::Proxy { details })
+    crate::api::jsonrpc::check_server_info(proxy_client.get_info()?)
 }
 
 #[cfg(feature = "_online")]

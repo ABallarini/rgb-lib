@@ -31,7 +31,7 @@ use super::*;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(READ_WRITE_TIMEOUT);
 
 /// Proxy client over the browser `fetch` API, the async counterpart of the blocking one.
-#[allow(dead_code)] // only the compile-time proof below uses it until the online flow is wired
+#[allow(dead_code)] // only the read-only health check (`new` + `get_info`) uses it until the online flow is wired
 pub(crate) struct ProxyFetchClient {
     client: Client,
     base_url: String,

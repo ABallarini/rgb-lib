@@ -2,7 +2,7 @@
 
 `wasm-bindgen` API for the [`rgb-lib`](../../) wallet, for browsers and other JavaScript runtimes with no filesystem and no SQLite driver.
 
-The crate is a thin shell over the shared implementation: wallets are built with `Wallet::new_in_memory`, restored with `Wallet::from_snapshot`, persisted with `Wallet::flush` and filled with the ordinary `rgb-lib` operations. No wallet or RGB logic is reimplemented here, and `rgb-lib` is a path dependency with `default-features = false, features = ["wallet"]`, so the wasm graph has no SQLite driver, Tokio or migration crate.
+The crate is a thin shell over the shared implementation: wallets are built with `Wallet::new_in_memory`, restored with `Wallet::from_snapshot`, persisted with `Wallet::flush`, synced read-only with `Wallet::sync_async` and filled with the ordinary `rgb-lib` operations. No wallet or RGB logic is reimplemented here, and `rgb-lib` is a path dependency with `default-features = false, features = ["wallet", "esplora_async"]`, so the wasm graph has no SQLite driver, Tokio or migration crate.
 
 Like [`c-ffi`](../c-ffi) and [`uniffi`](../uniffi), this is a separate crate with its own `Cargo.lock` and its own `[workspace]` table: it is not a member of the `rgb-lib` workspace, and the root lockfile and default build are unchanged. It builds for `wasm32-unknown-unknown` only.
 
@@ -49,7 +49,7 @@ wasm-pack build bindings/wasm --target nodejs --out-dir pkg-node
 node bindings/wasm/smoke/smoke.cjs
 ```
 
-The smoke script has no IndexedDB, so it covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`), snapshot and restore, the encrypted backup round trip (bytes out, public metadata, restore, wrong password), key generation and restore, watch-only creation/restore, the hub-free multisig subset, invoice parsing and the invalid-consignment rejection; `flush()`/`load()` are the browser path and are covered by the demo.
+The smoke script has no IndexedDB or indexer, so it covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`), the out-of-band `witnessReceive` invoice and the `blindReceive` core error without a colored UTXO, snapshot and restore, the encrypted backup round trip (bytes out, public metadata, restore, wrong password), key generation and restore, watch-only creation/restore, the hub-free multisig subset, invoice parsing, the invalid-consignment rejection and the offline rejection of an invalid `checkProxyUrl` endpoint; `flush()`/`load()`, the online `sync`/`getTipHeight`/`getFeeEstimation` and a reachable proxy are covered by the browser demo and the opt-in regtest smoke.
 
 ## API
 
@@ -66,11 +66,17 @@ The smoke script has no IndexedDB, so it covers create, wallet id, receive addre
 | `invoiceData()` | JSON: the core `InvoiceData` shape (`recipient_id`, `asset_schema`, `asset_id`, `assignment`, `assignment_name`, `network`, `expiration_timestamp`, `transport_endpoints`, `public_key`, `encryption`, `unknown_query_params`). |
 | `invoiceString()` | The invoice string the data was parsed from. |
 | `validateConsignmentOffchain(bytes, txid, network)` | JSON: `valid`, `warnings`, `error` and `details` from validating a transfer consignment against its bundled witness data; invalid bytes and an invalid TXID throw. |
+| `checkProxyUrl(url)` | Async, read-only: validates an RGB transport endpoint (`rpc://host` or `rpcs://host`) with the shared parser, asks the proxy for `server.info` over browser `fetch` and resolves to `true` when it reports the supported protocol version. An invalid URL, an unreachable proxy or an unsupported version throws a sanitized error; no write is sent. |
 | `name()` | The durable snapshot key (the `name` passed in). |
 | `id()` | The wallet identity: the master fingerprint of its keys. |
 | `getWalletData()` | JSON: the data that defines the wallet (network, database type, allocation limit, supported schemas). |
 | `getAddress()` | New vanilla receive address. |
+| `blindReceive(asset_id?, assignment, expiration_timestamp, min_confirmations, encryption?)` | JSON `ReceiveData` for an out-of-band blinded recipient: `invoice`, `recipient_id`, `expiration_timestamp`, `batch_transfer_idx`, `public_key`. Endpoints are fixed to empty, so no proxy is contacted and no reservation is made; `expiration_timestamp` is a `bigint`. `assignment` is the core serde shape (`{"Fungible":1000}`, `"NonFungible"`, `{"InflationRight":1000}` or `"Any"`), `encryption` is `required`, `unsupported` or `optional`. Needs a colored UTXO; otherwise the core `Insufficient allocations` error is thrown. |
+| `witnessReceive(asset_id?, assignment, expiration_timestamp, min_confirmations, encryption?)` | The same out-of-band `ReceiveData` for a new witness script recipient; no colored UTXO is needed. |
 | `getBtcBalance()` | JSON: vanilla and colored BTC balances, from local data only. |
+| `sync(indexer_url, stop_gap?)` | Async: read-only BDK full scan against Esplora (both keychains, `stop_gap` default 20). Applies the update to the shared wallet and persists it in its database; call `flush()` for durable storage. No broadcast and no RGB state change. |
+| `getTipHeight(indexer_url)` | Async: best-chain tip height from the Esplora endpoint. |
+| `getFeeEstimation(indexer_url, blocks)` | Async: sat/vB estimate for confirmation within `blocks` (`1..=1008`); throws `Cannot estimate fees` when the endpoint has no fee history. |
 | `getAssetBalance(asset_id)` | JSON: settled, future and spendable balance of an RGB asset. |
 | `getAssetMetadata(asset_id)` | JSON: schema, supply, precision, ticker, details and token metadata of an RGB asset. |
 | `listAssets()` | JSON: assets grouped by schema (`nia`, `uda`, `cfa`, `ifa`). |
@@ -88,20 +94,36 @@ The smoke script has no IndexedDB, so it covers create, wallet id, receive addre
 | `backup(password)` | Encrypted backup archive as bytes: the native archive and encryption format, with the snapshot as its payload. |
 | `restoreBackup(bytes, password)` | Rebuild this wallet from the bytes of `backup()`. A wrong password, a different wallet or a corrupt archive throws; it never creates a fresh wallet. |
 | `backupInfo(bytes)` | JSON: public archive metadata (`version`, `scrypt_params`), no password needed. |
-| `flush()` | Async: write the snapshot to IndexedDB, resolve once committed. |
+| `flush()` | Async: guarded write of the snapshot to IndexedDB; rejects a stale writer sequence and resolves once committed. |
+| `deleteSnapshot(name)` | Async: delete this wallet's IndexedDB snapshot, then detach the instance. `name` must equal `name()`; a missing record is not an error and every later `flush()` throws instead of recreating it. |
 
-`RgbLibMultisigWallet` is the hub-free multisig class: `create(name, keys, network)` and `restore(name, snapshot, keys, network)` take the core `MultisigKeys` JSON (`cosigners`, `threshold_colored`, `threshold_vanilla`), and the wallet exposes `name()`, `id()` (descriptor-derived), `getWalletData()`, `getKeys()`, `getDescriptors()`, `getAddress(index)` (descriptor-derived and deterministic, it does not persist the index), `snapshot()` and `flush()`.
+`RgbLibMultisigWallet` is the hub-free multisig class: `create(name, keys, network)`, `restore(name, snapshot, keys, network)` and `load(name, keys, network)` take the core `MultisigKeys` JSON (`cosigners`, `threshold_colored`, `threshold_vanilla`), and the wallet exposes `name()`, `id()` (descriptor-derived), `getWalletData()`, `getKeys()`, `getDescriptors()`, `getAddress(index)` (descriptor-derived and deterministic, it does not persist the index), `snapshot()`, `flush()` and `deleteSnapshot(name)`.
 
-Every read method returns a JSON string; it uses the `rgb-lib` serde field names (`snake_case`) and the host parses it. `getFeeEstimation`, `go_online`, sync, send, inflate and burn stay unavailable: they live behind the native-only `_online` feature, together with the hub-coordinated multisig operations.
+Every read method returns a JSON string; it uses the `rgb-lib` serde field names (`snake_case`) and the host parses it. `sync`, `getTipHeight` and `getFeeEstimation` are read-only: they reach Esplora through the browser `fetch` backend. `blindReceive` and `witnessReceive` create out-of-band invoices only; consignment import, ACK, send, inflate and burn stay unavailable: they live behind the native-only `_online` feature, together with `go_online` and the hub-coordinated multisig operations.
 
 
 `name` is the durable key: two wallets created with the same name share one snapshot entry, so keep it stable per wallet. The snapshot never carries the mnemonic, and no error returned by the bindings echoes it.
+
+Each wallet instance has a random non-secret writer id and tracks the snapshot sequence it last saw. `load()` adopts both from IndexedDB and `flush()` writes `{ bytes, writer, sequence }` in one transaction only when the stored sequence is not newer, so a stale tab's flush throws an error naming the stored sequence and its writer instead of overwriting the newer snapshot; call `load()` again to recover. A snapshot stored by an older release as a bare `Uint8Array` loads as writer `legacy` at sequence `0` and is migrated by the first flush. Keep one writer per wallet name: the guard rejects stale writes but does not merge divergent in-memory state.
+
+`deleteSnapshot(name)` removes that one record and nothing else: it throws when `name` differs from `name()`, so it cannot touch another wallet's key, and a missing record is not an error. The in-memory wallet stays usable, but the instance is detached and every later `flush()` throws instead of silently recreating the deleted snapshot with its old sequence. Recreate the record deliberately by calling `load()` on a new instance, which starts at sequence `0`, or drop the instance.
+
+## Out-of-band receive
+
+`blindReceive` and `witnessReceive` delegate to the core `Wallet::blind_receive` and `Wallet::witness_receive` with `online = None` and an empty transport endpoint list, which selects the out-of-band exchange: the invoice carries no proxy endpoint, no reservation is made, and the host moves the invoice, consignment and ACK over its own channel.
+`witnessReceive` works on a fresh wallet because it only derives a new script; `blindReceive` allocates on an existing colored UTXO and otherwise throws the core `Insufficient allocations` error, so it does not fake a UTXO.
+The receive side stays native-only: the core `provide_out_of_band_consignment` and `provide_out_of_band_ack` live in the `_online` implementation, take an `Online` indexer and may broadcast, so this package creates the invoice but cannot complete the transfer.
+Proxy receive is native-only too: any transport endpoint would require a proxy reservation and an `Online` object, and the wasm methods accept none.
 
 ## Caveats
 
 * `flush()` and `load()` need IndexedDB and therefore a browser. In Node use `snapshot()` and
   `restore()` instead, with the host's own storage.
-* `issueNia()`, `issueUda()`, `issueCfa()` and `issueIfa()` allocate on an existing colored UTXO. A fresh wallet must be funded and synced before issuance succeeds; the browser demo does not go online yet.
+* A `flush()` that reports a stale sequence did not write anything: another instance committed a
+  newer snapshot. Call `load()` again before retrying, and do not fall back to `restore()` with the
+  old bytes.
+* `deleteSnapshot()` needs IndexedDB like `flush()` and `load()`; it removes the wallet's whole durable state, so export `snapshot()` or `backup()` first if the host may want it back.
+* `issueNia()`, `issueUda()`, `issueCfa()` and `issueIfa()` allocate on an existing colored UTXO. `sync()` sees funding of the wallet's own addresses, but it does not receive or validate RGB consignments, so the current browser API cannot produce a colored UTXO; issuance still needs the native flow.
 * `generateKeys()` returns the mnemonic in its JSON. Store that secret yourself; `createWatchOnly()` takes only the public fields and refuses a key JSON that still carries a phrase.
 * `RgbLibMultisigWallet` is hub-free: `getAddress(index)` derives from the descriptors without hub coordination, and `flush()` needs IndexedDB like the singlesig wallet.
 * `backup()` and `restoreBackup()` derive the key with scrypt on the calling thread; the default parameters need 128 MiB and block the page until they finish. Pass the password yourself and keep it out of logs; it is never stored.
