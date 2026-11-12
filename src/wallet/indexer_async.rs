@@ -10,6 +10,11 @@
 //! [`EsploraAsyncExt`](bdk_esplora::EsploraAsyncExt); the browser receive path uses the same
 //! client through the prefetched resolver. Building a transport only constructs the HTTP client
 //! and never contacts the server.
+//!
+//! `esplora-client` drops `Builder::timeout` on wasm32, so every request instead gets a hard
+//! deadline from a `fetch` wrapper the transport installs before building its client. The wrapper
+//! also marks responses `no-store`, because an Esplora server may send `cache-control: max-age`
+//! and the browser would otherwise serve stale chain data.
 
 use std::sync::{
     Arc, Mutex,
@@ -34,10 +39,70 @@ use rgbstd::bitcoin::constants::ChainHash;
 use rgbstd::vm::WitnessPos;
 use wasm_bindgen::{JsCast, closure::Closure};
 
-use crate::{error::IndexerError, utils::INDEXER_RETRIES};
+use crate::{error::IndexerError, utils::INDEXER_RETRIES, utils::INDEXER_TIMEOUT};
 
 use super::resolver_async::AsyncChainResolver;
 use super::*;
+
+/// Installs, for `base`, a `fetch` wrapper that bounds every request it serves.
+///
+/// `esplora-client` ignores `Builder::timeout` on wasm32 because its `reqwest` fetch backend has
+/// no request timeout, so the deadline is set on the browser side: the wrapper combines the
+/// request's own signal with `AbortSignal.timeout` and marks the response `no-store`. Requests are
+/// matched by their normalized URL, so a trailing slash on `base` makes no difference. A browser
+/// without `AbortSignal.any` or `AbortSignal.timeout` gets a plain `fetch` with `no-store` and no
+/// deadline: the request is then bounded only by the network stack.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+function normalizeBase(value) {
+    return String(value).replace(/\/+$/, '');
+}
+
+function timeoutFor(url) {
+    const timeouts = globalThis.__rgbLibEsploraTimeouts;
+    if (!timeouts) return undefined;
+    const target = normalizeBase(url);
+    for (const [base, millis] of timeouts) {
+        if (target === base || target.startsWith(base + '/')) return millis;
+    }
+    return undefined;
+}
+
+function deadlineSignal(input, init, millis) {
+    const AbortSignalImpl = globalThis.AbortSignal;
+    if (!AbortSignalImpl || !AbortSignalImpl.any || !AbortSignalImpl.timeout) {
+        // no combinable deadline in this browser: fetch without one, as before
+        return undefined;
+    }
+    const signals = [];
+    if (input && input.signal) signals.push(input.signal);
+    if (init && init.signal) signals.push(init.signal);
+    signals.push(AbortSignalImpl.timeout(millis));
+    return AbortSignalImpl.any(signals);
+}
+
+export function installEsploraRequestTimeout(base, timeoutMillis) {
+    const g = globalThis;
+    if (!g.__rgbLibEsploraTimeouts) g.__rgbLibEsploraTimeouts = new Map();
+    g.__rgbLibEsploraTimeouts.set(normalizeBase(base), timeoutMillis);
+    if (g.fetch && g.fetch.__rgbLibEsploraWrapped) return;
+    const inner = g.fetch;
+    const wrapped = function (input, init) {
+        const raw = typeof input === 'string' ? input : input && (input.url || input.href);
+        const millis = timeoutFor(raw || '');
+        const signal = millis === undefined ? undefined : deadlineSignal(input, init, millis);
+        // cloning keeps the caller's method, headers and body; only cache mode and signal change
+        const options = Object.assign({}, init, { cache: 'no-store' });
+        if (signal !== undefined) options.signal = signal;
+        return inner.call(g, new Request(input, options));
+    };
+    wrapped.__rgbLibEsploraWrapped = true;
+    g.fetch = wrapped;
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = installEsploraRequestTimeout)]
+    fn install_esplora_request_timeout(base: &str, timeout_millis: u32);
+}
 
 /// Browser timer for the client's retry backoff.
 ///
@@ -128,10 +193,31 @@ pub(crate) struct EsploraTransport {
 impl EsploraTransport {
     /// Build the transport for `indexer_url` without contacting the server.
     ///
-    /// The URL is used exactly as given, as the blocking indexer does. `reqwest`'s wasm backend has
-    /// no per-request timeout, so only the retry count is carried over from its builder.
+    /// The URL is used exactly as given, as the blocking indexer does. `reqwest`'s wasm backend
+    /// has no per-request timeout, so the deadline comes from the `fetch` wrapper installed here,
+    /// before the client is built; `.timeout` is still set so the builder reads the same as the
+    /// native one, but `esplora-client` ignores it on wasm32.
     pub(crate) fn new(indexer_url: &str) -> Result<Self, IndexerError> {
-        let builder = EsploraAsyncBuilder::new(indexer_url).max_retries(INDEXER_RETRIES.into());
+        Self::with_request_timeout(indexer_url, INDEXER_TIMEOUT)
+    }
+
+    /// [`new`](Self::new) with an explicit per-request deadline in seconds.
+    #[cfg(test)]
+    pub(crate) fn new_with_timeout(
+        indexer_url: &str,
+        timeout_secs: u64,
+    ) -> Result<Self, IndexerError> {
+        Self::with_request_timeout(indexer_url, timeout_secs)
+    }
+
+    fn with_request_timeout(indexer_url: &str, timeout_secs: u64) -> Result<Self, IndexerError> {
+        // bounded to u32 milliseconds: the native default is 10 s, far below the i32 `setTimeout`
+        // and `AbortSignal.timeout` limits, and a caller cannot ask for an unbounded one
+        let timeout_millis = u32::try_from(timeout_secs.saturating_mul(1000)).unwrap_or(u32::MAX);
+        install_esplora_request_timeout(indexer_url, timeout_millis);
+        let builder = EsploraAsyncBuilder::new(indexer_url)
+            .max_retries(INDEXER_RETRIES.into())
+            .timeout(timeout_secs);
         Ok(Self {
             client: AsyncClient::from_builder(builder)?,
         })

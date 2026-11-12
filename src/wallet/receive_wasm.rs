@@ -272,6 +272,8 @@ async fn prefetch_chain_answers(
         let stock = wallet.rgb_stock(&txn)?;
         questions.add_known_alternatives(&stock, consignment)?;
     }
+    // the read transaction is closed before the prefetch: no DB transaction stays open across the
+    // network wait, which a single-threaded browser cannot afford
     drop(txn);
 
     let resolver = EsploraResolver::new(EsploraTransport::new(indexer_url)?);

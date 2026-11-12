@@ -33,7 +33,7 @@ pub(crate) const KEYCHAIN_BTC: u8 = 0;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const INDEXER_STOP_GAP: usize = 20;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora_async"))]
 pub(crate) const INDEXER_TIMEOUT: u64 = 10;
 #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora_async"))]
 pub(crate) const INDEXER_RETRIES: u8 = 3;

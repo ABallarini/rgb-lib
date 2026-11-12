@@ -54,6 +54,90 @@ fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.filter(|v| !v.is_empty())
 }
 
+// Browser test for the fetch-level request deadline the transport installs. `esplora-client`
+// ignores `Builder::timeout` on wasm32, so the only proof is a stalled `fetch` that has to be
+// aborted by the wrapper.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let originalFetch = null;
+
+export function installStalledFetch() {
+    const g = globalThis;
+    if (originalFetch === null) originalFetch = g.fetch;
+    g.__stalledFetchCalls = 0;
+    g.fetch = function (input) {
+        g.__stalledFetchCalls += 1;
+        return new Promise(function (_resolve, reject) {
+            const signal = input && input.signal;
+            // no deadline signal means the request would never settle: a bare promise it is
+            if (!signal) return;
+            if (signal.aborted) {
+                reject(signal.reason);
+                return;
+            }
+            signal.addEventListener('abort', function () {
+                reject(signal.reason);
+            }, { once: true });
+        });
+    };
+}
+
+export function restoreFetch() {
+    if (originalFetch !== null) {
+        globalThis.fetch = originalFetch;
+        originalFetch = null;
+    }
+}
+
+export function stalledFetchCalls() {
+    return globalThis.__stalledFetchCalls || 0;
+}
+
+export function deadlineSupported() {
+    const AbortSignalImpl = globalThis.AbortSignal;
+    return !!(AbortSignalImpl && AbortSignalImpl.any && AbortSignalImpl.timeout);
+}
+"#)]
+extern "C" {
+    fn installStalledFetch();
+    fn restoreFetch();
+    fn stalledFetchCalls() -> u32;
+    fn deadlineSupported() -> bool;
+}
+
+/// A stalled request must be aborted by the deadline the transport installed, not left pending.
+///
+/// `esplora-client` drops `Builder::timeout` on wasm32, so without the `fetch` wrapper this test
+/// would never settle: the mock rejects only when the request signal aborts.
+#[wasm_bindgen_test]
+async fn a_stalled_fetch_is_aborted_within_the_request_deadline() {
+    // the wrapper falls back to a plain fetch without a deadline on such a browser, so there is
+    // no deadline to wait for here either
+    if !deadlineSupported() {
+        return;
+    }
+    installStalledFetch();
+    let transport = EsploraTransport::new_with_timeout("https://esplora.invalid", 1)
+        .expect("build the transport over the mocked fetch");
+    let started = js_sys::Date::now();
+    let result = transport.get_latest_block_height().await;
+    let elapsed = js_sys::Date::now() - started;
+    restoreFetch();
+
+    assert!(
+        result.is_err(),
+        "a stalled request resolved instead of hitting the deadline"
+    );
+    assert_eq!(
+        stalledFetchCalls(),
+        1,
+        "the stalled request must be issued once: a transport error is not retried"
+    );
+    assert!(
+        elapsed < 5_000.0,
+        "the stalled request took {elapsed} ms, above the 1000 ms deadline"
+    );
+}
+
 #[wasm_bindgen_test]
 #[ignore]
 async fn regtest_esplora_online_smoke() {
