@@ -49,7 +49,7 @@ wasm-pack build bindings/wasm --target nodejs --out-dir pkg-node
 node bindings/wasm/smoke/smoke.cjs
 ```
 
-The smoke script has no IndexedDB or indexer, so it covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`), the out-of-band `witnessReceive` invoice and the `blindReceive` core error without a colored UTXO, snapshot and restore, the encrypted backup round trip (bytes out, public metadata, restore, wrong password), key generation and restore, watch-only creation/restore, the hub-free multisig subset, invoice parsing, the invalid-consignment rejection and the offline rejection of an invalid `checkProxyUrl` endpoint; `flush()`/`load()`, the online `sync`/`getTipHeight`/`getFeeEstimation` and a reachable proxy are covered by the browser demo and the opt-in regtest smoke.
+The smoke script has no IndexedDB or indexer, so it covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`), the out-of-band `witnessReceive` invoice and the `blindReceive` core error without a colored UTXO, snapshot and restore, the encrypted backup round trip (bytes out, public metadata, restore, wrong password), key generation and restore, watch-only creation/restore, the hub-free multisig subset, invoice parsing, the invalid-consignment rejection, the offline rejection of an invalid `checkProxyUrl` endpoint and the re-entrant call guard (a second call while a `sync` is in flight throws `the wallet is busy with another operation`); `flush()`/`load()`, the online `sync`/`getTipHeight`/`getFeeEstimation` and a reachable proxy are covered by the browser demo and the opt-in regtest smoke.
 
 ## API
 
@@ -134,3 +134,4 @@ Proxy receive is supported separately: `receiveTransfer` and `syncOnline` take t
 * Wallet construction is synchronous (`create`/`restore`) and reading IndexedDB is not, hence
   `load()`; do not fall back to `create` when a stored snapshot fails to restore. `load()` returns
   the error instead.
+* One operation per wallet instance at a time: every method holds the instance until it returns or, for an async one, until it settles, and a call that starts while another is still in flight throws `the wallet is busy with another operation`. Await each call before starting the next one.

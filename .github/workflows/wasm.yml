@@ -92,6 +92,16 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/wasm-logs"
           cargo test --lib --target wasm32-unknown-unknown --no-default-features --features wallet,esplora_async 2>&1 \
             | tee "${RUNNER_TEMP}/wasm-logs/browser-lifecycle.log"
+      - name: Run the re-entrant call guard test in headless Chrome
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        # the bindings crate is its own workspace: a second call on an instance still holding the
+        # wallet must throw the busy error, so the guard and its two classes are pinned here
+        run: |
+          set -o pipefail
+          cargo test --manifest-path bindings/wasm/Cargo.toml --lib --target wasm32-unknown-unknown 2>&1 \
+            | tee "${RUNNER_TEMP}/wasm-logs/bindings-reentrancy.log"
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
