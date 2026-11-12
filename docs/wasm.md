@@ -22,8 +22,8 @@ The implementation is shared with the native wallet: the browser binding is a th
 | Consignment validation | Supported and exported (`validateConsignmentOffchain`), over the witnesses bundled in the consignment |
 | Multisig, hub-free | Supported and exported (`RgbLibMultisigWallet`: construction, descriptors, descriptor-derived addresses, state, flush, restore) |
 | Multisig hub paths | Not available on wasm |
-| Read-only BDK online access (sync, tip height, fee estimation) | Supported over the async Esplora transport (`sync`, `getTipHeight`, `getFeeEstimation`) |
-| RGB receive over a proxy (download, decrypt, validate, ACK/NACK, `transfer.retrieved`) | Supported and exported (`receiveTransfer`, `syncOnline`) over the Fetch proxy client and the prefetched async chain resolver |
+| BDK online access (sync with DB reconciliation, tip height, fee estimation) | Supported over the async Esplora transport (`sync`, `getTipHeight`, `getFeeEstimation`) |
+| RGB receive over a proxy (download, decrypt, validate, ACK/NACK, resume `WaitingSafeHeight`/`WaitingBroadcast`, `transfer.retrieved`) | Supported and exported (`receiveTransfer`, `syncOnline`) over the Fetch proxy client and the prefetched async chain resolver |
 | Proxy health check | Supported and exported (`checkProxyUrl`): read-only `server.info` over the Fetch proxy client |
 | RGB transfers, send, proxy invoice reservation, media upload, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
 | Out-of-band consignment import and ACK | Native-only: `provide_out_of_band_consignment` and `provide_out_of_band_ack` take `Online` and may broadcast |
@@ -158,7 +158,7 @@ const address = wallet.getAddress();
 // Issuance allocates on an existing colored UTXO. A fresh wallet has none, and the read-only
 // sync below sees funding but does not color a UTXO; RGB issuance needs the native flow today.
 const indexer = "https://your-esplora-endpoint";
-await wallet.sync(indexer, 20); // read-only BDK scan
+await wallet.sync(indexer, 20); // BDK scan + DB reconciliation
 const tipHeight = await wallet.getTipHeight(indexer);
 const assetId = wallet.issueNia("DEMO", "Demo asset", 0, new BigUint64Array([1000n]));
 
@@ -199,8 +199,8 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | `blindReceive(asset_id?, assignment, expiration_timestamp, min_confirmations, encryption?)` | JSON. Out-of-band `ReceiveData` (`invoice`, `recipient_id`, `expiration_timestamp`, `batch_transfer_idx`, `public_key`) for a blinded recipient. Transport endpoints are fixed to empty, so no proxy is contacted and no reservation is made; `expiration_timestamp` is a `bigint` in JS. `assignment` is the core serde shape (`{"Fungible":1000}`, `"NonFungible"`, `{"InflationRight":1000}` or `"Any"`); `encryption` is `required`, `unsupported` or `optional`. A wallet without a colored UTXO throws the core `Insufficient allocations` error. |
 | `witnessReceive(asset_id?, assignment, expiration_timestamp, min_confirmations, encryption?)` | JSON. The same out-of-band `ReceiveData` for a new witness script recipient; no colored UTXO is needed. |
 | `getBtcBalance()` | JSON. Vanilla and colored BTC balances from local data; no chain sync. |
-| `sync(indexer_url, stop_gap?)` | Async. Read-only BDK full scan against an Esplora endpoint: both keychains, `stop_gap` unused scripts per keychain (default 20). Applies the update to the shared wallet and persists it in the wallet database; call `flush()` for durable storage. Nothing is broadcast and no RGB state changes. |
-| `syncOnline(proxy_url, indexer_url, stop_gap?)` | Async. Runs the `sync` scan, then lists the transfers of each pending incoming proxy invoice and receives and ACKs each one addressed to this wallet. Returns JSON: the handled `batch_transfer_idx` values. A repeated call is idempotent; a failure rolls back only the transfer it happened on. Call `flush()` afterwards. |
+| `sync(indexer_url, stop_gap?)` | Async. BDK full scan against an Esplora endpoint: both keychains, `stop_gap` unused scripts per keychain (default 20). Applies the update and, in the same database transaction, reconciles the pending witness state and registers the newly seen colored TXOs, like the native full scan. Nothing is broadcast and no consignment is received; call `flush()` for durable storage. |
+| `syncOnline(proxy_url, indexer_url, stop_gap?)` | Async. Runs the `sync` scan, then lists the transfers of each pending incoming proxy invoice and receives and ACKs each one addressed to this wallet. A receive left in `WaitingSafeHeight` or `WaitingBroadcast` is resumed; a `Settled` or `Failed` one is skipped. Returns JSON: the handled `batch_transfer_idx` values. A repeated call is idempotent; a failure rolls back only the transfer it happened on. Call `flush()` afterwards. |
 | `receiveTransfer(proxy_url, indexer_url, transfer_id)` | Async. Receives, validates and ACKs one proxy transfer by ID, including `transfer.retrieved` and the broadcast of a released signed TX. The whole receive is one wallet transaction: a failure rolls it back. Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already handled. A transfer not addressed to this wallet throws. Call `flush()` afterwards. |
 | `getTipHeight(indexer_url)` | Async. Best-chain tip height reported by the Esplora endpoint. |
 | `getFeeEstimation(indexer_url, blocks)` | Async. Fee estimate in sat/vB for confirmation within `blocks` (`1..=1008`), interpolated like the native Esplora indexer; an endpoint without fee history throws `Cannot estimate fees`. |
@@ -366,7 +366,7 @@ The root crate with `esplora_async` compiles the browser transport, resolver and
 | `EsploraResolver` | Async witness, block-header and chain-net answers for RGB validation |
 | `ProxyFetchClient` | RGB proxy JSON-RPC over `fetch`, including in-memory multipart uploads |
 
-`EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a read-only BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of a released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`; the remaining proxy writes (invoice reservation, media upload, send) stay in the native-only flow.
+`EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transaction runs the native sync bookkeeping: pending witness state is reconciled and colored TXOs new to the DB are registered. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of a released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`; the remaining proxy writes (invoice reservation, media upload, send) stay in the native-only flow.
 
 The bindings crate enables `wallet,esplora_async`, so the generated package contains the transport and the three read-only methods. No native blocking transport is in the wasm graph: `bitcoind`, `electrum` and `esplora` are native-only, and the graph check rejects their crates.
 
@@ -379,7 +379,7 @@ For a consumer this means:
 - a browser wallet can be created, restored, persisted, derive addresses, read its snapshot and **sync its BDK wallet** against Esplora, so new funding of its own addresses becomes visible in its BTC balance;
 - it can **receive and ACK a pending proxy consignment** whose invoice was created for its keys, coloring the UTXO and importing an unknown contract;
 - sending, proxy invoice creation and media upload still need the native flow, so the browser cannot start a transfer or reserve an invoice;
-- the receive does not resume `WaitingBroadcast` polling or fail expired transfers: a host that needs the rest of the native refresh lifecycle must use the native wallet.
+- `syncOnline` resumes a receive left in `WaitingSafeHeight` or `WaitingBroadcast`, and a terminal (`Settled`/`Failed`) one is skipped, but `WaitingConfirmations` settlement, expiry-based failure and the rest of the native refresh lifecycle still need the native wallet.
 
 ## Unsupported features and explicit errors
 

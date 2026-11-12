@@ -2,9 +2,10 @@
 //!
 //! This is the smallest real online step on wasm32: a full scan of the BDK wallet over the async
 //! Esplora transport, plus the tip height and fee estimate the host needs to show chain state. The
-//! scan only reads from the indexer and only updates the BDK side of the shared wallet: the update
-//! is applied in memory and persisted through the same database transaction and `persist_bdk` seam
-//! the offline operations use, so a host snapshot/`flush` keeps it.
+//! scan only reads from the indexer: the update is applied in memory and persisted through the same
+//! database transaction and `persist_bdk` seam the offline operations use, so a host
+//! snapshot/`flush` keeps it. Inside that transaction the shared native bookkeeping runs too, so a
+//! payment to a pending witness script is reconciled and a newly seen colored TXO is registered.
 //!
 //! Not assembled here: `RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, RGB consignment
 //! reception, transfers and broadcast. They stay behind the native-only `_online` feature, and
@@ -37,9 +38,10 @@ impl Wallet {
     /// the shared BDK wallet. The resulting change is written to the wallet database in the same
     /// transaction as any other operation, so the wallet's next `snapshot`/`flush` carries it.
     ///
-    /// Nothing is broadcast and no RGB state is touched: this does not receive or validate RGB
-    /// consignments, color new UTXOs or resolve witnesses. Those paths need the RGB proxy and stay
-    /// native-only for now.
+    /// The same transaction reconciles the pending witness state and registers the colored TXOs
+    /// that became visible, exactly like the native full scan. Nothing is broadcast and no RGB
+    /// consignment is received or validated: those paths need the RGB proxy and stay behind the
+    /// proxy receive methods.
     pub async fn sync_async(
         &mut self,
         indexer_url: &str,
@@ -62,6 +64,7 @@ impl Wallet {
                 details: e.to_string(),
             })?;
         let txn = self.database().begin_transaction()?;
+        self.sync_db_txos_from_bdk(&txn, false)?;
         self.persist_and_commit(txn)?;
         Ok(())
     }

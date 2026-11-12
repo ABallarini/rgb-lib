@@ -17,6 +17,7 @@
 use std::future::Future;
 #[cfg(not(target_arch = "wasm32"))]
 use std::pin::pin;
+use std::str::FromStr;
 #[cfg(not(target_arch = "wasm32"))]
 use std::task::{Context, Poll, Waker};
 
@@ -640,17 +641,106 @@ impl PendingReceive {
     }
 }
 
+/// Rebuild the receive mode of an already-applied transfer from its saved endpoints and metadata.
+///
+/// The native `wait_safe_height` and the browser resume path both need to ACK again without
+/// downloading the consignment, so they share this lookup. A transfer without a transport endpoint
+/// was received out of band.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(super) fn receive_mode_from_transfer<W: ReceiveWallet + ?Sized>(
+    wallet: &W,
+    txn: &DbTxn,
+    transfer: &DbTransfer,
+) -> Result<ReceiveMode, Error> {
+    let recipient_id = transfer
+        .recipient_id
+        .clone()
+        .ok_or_else(|| Error::Internal {
+            details: s!("missing recipient ID"),
+        })?;
+    let tte_data = txn.get_transfer_transport_endpoints_data(transfer.idx)?;
+    if tte_data.is_empty() {
+        return Ok(ReceiveMode::OutOfBand {
+            media_file_paths: vec![],
+        });
+    }
+    let proxy_url = tte_data
+        .iter()
+        .find(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy && tte.used)
+        .map(|(_, te)| te.endpoint.clone())
+        .ok_or_else(|| Error::Internal {
+            details: s!("missing used recipient proxy endpoint"),
+        })?;
+    let consignment_meta_path = wallet.get_receive_consignment_meta_path(&recipient_id);
+    let meta: ReceivedConsignmentMeta = serde_json::from_slice(
+        &wallet
+            .files()
+            .read(&wallet.wallet_key(&consignment_meta_path)?)?,
+    )
+    .map_err(InternalError::from)?;
+    let transfer_id = transfer
+        .proxy_transfer_id
+        .clone()
+        .or(meta.transfer_id)
+        .ok_or_else(|| Error::Internal {
+            details: s!("missing transfer ID"),
+        })?;
+    Ok(ReceiveMode::Proxy(ProxyReceiveData {
+        proxy_url,
+        transfer_id,
+        sender_proxy: meta.sender_transport_endpoint,
+        sender_pubkey: meta.sender_pubkey,
+        consignment_hash: meta.consignment_hash,
+        recipient_encryption: transfer.recipient_encryption,
+        batch: meta.batch,
+    }))
+}
+
+/// The mined height of `txid`, if the resolver can see it.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+fn witness_height(chain: &impl ResolveWitness, txid: &str) -> Result<Option<u32>, Error> {
+    let txid = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+    match chain.resolve_witness(txid).map_err(|e| Error::Network {
+        details: e.to_string(),
+    })? {
+        WitnessStatus::Resolved(_, WitnessOrd::Mined(witness_pos)) => {
+            Ok(Some(witness_pos.height().get()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether a batch transfer is still in one of the states the native refresh handles.
+///
+/// The receive loop uses this to resume a receive that was applied but not completed, instead of
+/// treating it as done. `Settled` and `Failed` are terminal.
+fn non_terminal_receive_status(status: TransferStatus) -> bool {
+    matches!(
+        status,
+        TransferStatus::WaitingCounterparty
+            | TransferStatus::WaitingSafeHeight
+            | TransferStatus::WaitingBroadcast
+            | TransferStatus::WaitingConfirmations
+    )
+}
+
 /// The pending incoming transfers that can still be received from a proxy.
 ///
-/// Outgoing transfers are skipped by `incoming`, and every status other than
-/// `WaitingCounterparty` is terminal for the receive loop: an applied transfer is idempotently
-/// skipped instead of being applied twice. Out-of-band invoices are skipped too, as they have no
-/// proxy transfer to fetch.
+/// Outgoing transfers are skipped by `incoming`, and only the non-terminal statuses native refresh
+/// handles are selected: a transfer applied before, but left in `WaitingSafeHeight` or
+/// `WaitingBroadcast`, is resumed instead of being treated as complete. Out-of-band invoices are
+/// skipped too, as they have no proxy transfer to fetch.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // used by the browser receive loop
 pub(super) fn pending_receives(db_data: &DbData) -> Result<Vec<PendingReceive>, Error> {
     let mut pending = vec![];
     for batch in &db_data.batch_transfers {
-        if !batch.incoming || batch.status != TransferStatus::WaitingCounterparty {
+        if !batch.incoming || !non_terminal_receive_status(batch.status) {
             continue;
         }
         let (asset_transfer, transfer) =
@@ -671,9 +761,8 @@ pub(super) fn pending_receives(db_data: &DbData) -> Result<Vec<PendingReceive>, 
     Ok(pending)
 }
 
-/// The index of an incoming transfer already bearing `transfer_id`, if any.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // used by the browser receive loop
-pub(super) fn already_handled(db_data: &DbData, transfer_id: &str) -> Option<i32> {
+/// The incoming batch transfer bearing `transfer_id`, whatever its status.
+fn receive_by_proxy_id<'a>(db_data: &'a DbData, transfer_id: &str) -> Option<&'a DbBatchTransfer> {
     db_data
         .transfers
         .iter()
@@ -690,6 +779,23 @@ pub(super) fn already_handled(db_data: &DbData, transfer_id: &str) -> Option<i32
                         .find(|b| b.idx == at.batch_transfer_idx && b.incoming)
                 })
         })
+}
+
+/// The index of an incoming transfer already bearing `transfer_id`, if any, terminal or not.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // used by the browser receive loop
+pub(super) fn receive_transfer_idx(db_data: &DbData, transfer_id: &str) -> Option<i32> {
+    receive_by_proxy_id(db_data, transfer_id).map(|b| b.idx)
+}
+
+/// The index of an incoming transfer that already reached a terminal status, if any.
+///
+/// A stored proxy transfer ID alone is not completion: a receive left in `WaitingSafeHeight`,
+/// `WaitingBroadcast` or `WaitingConfirmations` must be resumed. Only `Settled` and `Failed`
+/// transfers are skipped as already handled.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // used by the browser receive loop
+pub(super) fn already_handled(db_data: &DbData, transfer_id: &str) -> Option<i32> {
+    receive_by_proxy_id(db_data, transfer_id)
+        .filter(|b| b.status.settled() || b.status.failed())
         .map(|b| b.idx)
 }
 
@@ -1150,6 +1256,27 @@ pub(super) trait ReceiveDriver: ReceiveWallet {
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error>;
 
+    /// Resume an applied receive left in `WaitingSafeHeight`, without applying it again.
+    ///
+    /// The consignment is loaded and validated again at the current safe height; the ACK is
+    /// posted only when the unsafe history it contains has reached that height. The transfer is
+    /// never re-applied, so its colorings are not duplicated.
+    #[allow(dead_code)] // only the browser resume path calls it today
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_receive<T: ReceiveTransport + ?Sized>(
+        &self,
+        transport: &T,
+        chain: &impl ResolveWitness,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+        asset_transfer: &DbAssetTransfer,
+        transfer: &DbTransfer,
+        recipient_id: String,
+        consignment_path: &Path,
+        mode: &ReceiveMode,
+        updated_batch_transfer: &mut DbBatchTransferActMod,
+    ) -> Result<Option<DbBatchTransfer>, Error>;
+
     /// The phases of [`Self::drive_receive`], without releasing the proxy data.
     #[allow(clippy::too_many_arguments)]
     async fn drive_receive_inner<T: ReceiveTransport + ?Sized>(
@@ -1164,6 +1291,7 @@ pub(super) trait ReceiveDriver: ReceiveWallet {
         consignment_path: &Path,
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        resume: bool,
     ) -> Result<Option<DbBatchTransfer>, Error>;
 
     /// Sign and post the ACK (or the NACK a retention-grace failure calls for).
@@ -1227,6 +1355,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                 consignment_path,
                 &mode,
                 updated_batch_transfer,
+                false,
             )
             .await?;
 
@@ -1244,6 +1373,35 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         Ok(outcome)
     }
 
+    async fn resume_receive<T: ReceiveTransport + ?Sized>(
+        &self,
+        transport: &T,
+        chain: &impl ResolveWitness,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+        asset_transfer: &DbAssetTransfer,
+        transfer: &DbTransfer,
+        recipient_id: String,
+        consignment_path: &Path,
+        mode: &ReceiveMode,
+        updated_batch_transfer: &mut DbBatchTransferActMod,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        self.drive_receive_inner(
+            transport,
+            chain,
+            txn,
+            batch_transfer,
+            asset_transfer,
+            transfer,
+            recipient_id,
+            consignment_path,
+            mode,
+            updated_batch_transfer,
+            true,
+        )
+        .await
+    }
+
     async fn drive_receive_inner<T: ReceiveTransport + ?Sized>(
         &self,
         transport: &T,
@@ -1256,6 +1414,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         consignment_path: &Path,
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        resume: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         let mut stock = self.rgb_stock(txn)?;
         // the recipient's per-operation Ed25519 secret seed (for ACK signing / decryption)
@@ -1395,14 +1554,14 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
 
         // validate consignment
         debug!(self.logger(), "Validating consignment...");
-        let safe_height = NonZeroU32::new(safe_height(
+        let validation_safe_height = NonZeroU32::new(safe_height(
             transport.tip_height().await?,
             batch_transfer.min_confirmations,
         ));
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
             build_opouts_dag: Self::schema_supports_reject_list(asset_schema),
-            safe_height,
+            safe_height: validation_safe_height,
         };
         let resolver = OffchainResolver {
             witness_id,
@@ -1521,24 +1680,48 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
             }
         }
 
-        let outcome = match apply_received_consignment(
-            self,
-            chain,
-            txn,
-            asset_transfer,
-            transfer,
-            &prepared,
-            consignment_path,
-            valid_consignment,
-            receiving,
-            txid,
-            vout,
-            &terminal_bundle.tx,
-            unknown_asset,
-            &mut stock,
-            updated_batch_transfer,
-        )? {
-            ApplyOutcome::WaitingSafeHeight(batch_transfer) => Some(batch_transfer),
+        let outcome = if resume {
+            // the consignment was applied by an earlier attempt: never apply it again, or its
+            // colorings would be duplicated. A `WaitingSafeHeight` receive still waits until the
+            // unsafe history it carries has reached the current safe height before ACKing.
+            if batch_transfer.status == TransferStatus::WaitingSafeHeight {
+                let resume_safe_height = safe_height(
+                    transport.tip_height().await?,
+                    batch_transfer.min_confirmations,
+                );
+                for unsafe_txid in collect_unsafe_history_txids(&validation_status.warnings, &txid)
+                {
+                    let reached = witness_height(chain, &unsafe_txid)?
+                        .is_some_and(|h| h <= resume_safe_height);
+                    if !reached {
+                        return Ok(None);
+                    }
+                }
+            }
+            ApplyOutcome::ReadyForAck {
+                donation_tx: donation_signed_tx(&terminal_bundle.tx),
+            }
+        } else {
+            apply_received_consignment(
+                self,
+                chain,
+                txn,
+                asset_transfer,
+                transfer,
+                &prepared,
+                consignment_path,
+                valid_consignment,
+                receiving,
+                txid,
+                vout,
+                &terminal_bundle.tx,
+                unknown_asset,
+                &mut stock,
+                updated_batch_transfer,
+            )?
+        };
+        match outcome {
+            ApplyOutcome::WaitingSafeHeight(batch_transfer) => Ok(Some(batch_transfer)),
             ApplyOutcome::ReadyForAck { donation_tx } => {
                 self.ack_consignment_via(
                     transport,
@@ -1550,11 +1733,9 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                     &recipient_seed,
                     donation_tx,
                 )
-                .await?
+                .await
             }
-        };
-
-        Ok(outcome)
+        }
     }
 
     async fn ack_consignment_via<T: ReceiveTransport + ?Sized>(
@@ -2426,14 +2607,37 @@ mod tests {
         updated_transfer.proxy_transfer_id = ActiveValue::Set(Some(expected.clone()));
         txn.update_transfer(&mut updated_transfer).unwrap();
         let db_data = txn.get_db_data(false).unwrap();
-        assert_eq!(already_handled(&db_data, &expected), Some(batch.idx));
+        // a stored proxy ID alone is not completion: the receive is still waiting a counterparty
+        assert_eq!(already_handled(&db_data, &expected), None);
+        assert_eq!(receive_transfer_idx(&db_data, &expected), Some(batch.idx));
 
-        // a terminal status is no longer a candidate, so a repeated sync leaves it untouched
-        let mut updated_batch: DbBatchTransferActMod = batch.clone().into();
-        updated_batch.status = ActiveValue::Set(TransferStatus::WaitingBroadcast);
-        txn.update_batch_transfer(&mut updated_batch).unwrap();
-        let db_data = txn.get_db_data(false).unwrap();
-        assert!(pending_receives(&db_data).unwrap().is_empty());
+        // an applied receive left in WaitingBroadcast or WaitingSafeHeight stays a candidate
+        for status in [
+            TransferStatus::WaitingBroadcast,
+            TransferStatus::WaitingSafeHeight,
+            TransferStatus::WaitingConfirmations,
+        ] {
+            let mut updated_batch: DbBatchTransferActMod = batch.clone().into();
+            updated_batch.status = ActiveValue::Set(status);
+            txn.update_batch_transfer(&mut updated_batch).unwrap();
+            let db_data = txn.get_db_data(false).unwrap();
+            assert_eq!(
+                pending_receives(&db_data).unwrap().len(),
+                1,
+                "{status:?} must be resumable"
+            );
+            assert_eq!(already_handled(&db_data, &expected), None);
+        }
+
+        // only Settled and Failed are terminal, so a repeated sync leaves them untouched
+        for status in [TransferStatus::Settled, TransferStatus::Failed] {
+            let mut updated_batch: DbBatchTransferActMod = batch.clone().into();
+            updated_batch.status = ActiveValue::Set(status);
+            txn.update_batch_transfer(&mut updated_batch).unwrap();
+            let db_data = txn.get_db_data(false).unwrap();
+            assert!(pending_receives(&db_data).unwrap().is_empty());
+            assert_eq!(already_handled(&db_data, &expected), Some(batch.idx));
+        }
     }
 
     #[test]

@@ -1484,16 +1484,6 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         Ok(valid_consignment)
     }
 
-    // the `RecipientProxy` transport endpoint marked used, if any
-    fn used_recipient_proxy_endpoint(
-        tte_data: &[(DbTransferTransportEndpoint, DbTransportEndpoint)],
-    ) -> Option<String> {
-        tte_data
-            .iter()
-            .find(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy && tte.used)
-            .map(|(_, te)| te.endpoint.clone())
-    }
-
     fn ack_consignment(
         &self,
         txn: &DbTxn,
@@ -2055,38 +2045,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         let signed_tx = terminal_bundle
             .and_then(|terminal_bundle| receive::donation_signed_tx(&terminal_bundle.tx));
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
-        let tte_data = txn.get_transfer_transport_endpoints_data(transfer.idx)?;
-        let mode = if tte_data.is_empty() {
-            ReceiveMode::OutOfBand {
-                media_file_paths: vec![],
-            }
-        } else {
-            let proxy_url =
-                Self::used_recipient_proxy_endpoint(&tte_data).expect("there should be 1 used TTE");
-            let consignment_meta_path = self.get_receive_consignment_meta_path(&recipient_id);
-            let meta: ReceivedConsignmentMeta = serde_json::from_slice(
-                &self
-                    .files()
-                    .read(&self.wallet_key(&consignment_meta_path)?)?,
-            )
-            .map_err(InternalError::from)?;
-            let transfer_id = transfer
-                .proxy_transfer_id
-                .clone()
-                .or(meta.transfer_id)
-                .ok_or_else(|| Error::Internal {
-                    details: s!("missing transfer ID"),
-                })?;
-            ReceiveMode::Proxy(ProxyReceiveData {
-                proxy_url,
-                transfer_id,
-                sender_proxy: meta.sender_transport_endpoint,
-                sender_pubkey: meta.sender_pubkey,
-                consignment_hash: meta.consignment_hash,
-                recipient_encryption: transfer.recipient_encryption,
-                batch: meta.batch,
-            })
-        };
+        let mode = receive::receive_mode_from_transfer(self, txn, &transfer)?;
         let recipient_seed = batch_transfer
             .operation_secret_key
             .clone()

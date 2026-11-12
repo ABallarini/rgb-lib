@@ -502,6 +502,11 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 #[cfg(feature = "wallet")]
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use crate::database::entities::pending_witness_script::Model as DbPendingWitnessScript;
 #[cfg(feature = "wallet")]
 use crate::database::entities::{
     asset::{ActiveModel as DbAssetActMod, Model as DbAsset},
@@ -586,7 +591,6 @@ use crate::{
         reject_list::RejectListClient,
     },
     database::entities::{
-        pending_witness_script::Model as DbPendingWitnessScript,
         reserved_txo::ActiveModel as DbReservedTxoActMod,
         wallet_transaction::ActiveModel as DbWalletTransactionActMod,
     },

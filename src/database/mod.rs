@@ -602,7 +602,10 @@ impl SqliteTxn {
         Ok(())
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn del_pending_witness_script(&self, script: String) -> Result<(), Error> {
         block_on(
             PendingWitnessScript::delete_many()
@@ -713,7 +716,10 @@ impl SqliteTxn {
 
     /// The transfers of incoming batch transfers that are pending or that have failed after
     /// `failed_since`, each with its batch transfer.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_pending_or_recently_failed_incoming_transfers(
         &self,
         failed_since: i64,
@@ -757,7 +763,10 @@ impl SqliteTxn {
         )?)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_receive_colorings_by_txo_idxs(
         &self,
         txo_idxs: Vec<i32>,
@@ -835,7 +844,10 @@ impl SqliteTxn {
         Ok(block_on(Media::find().all(self.inner()))?)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn iter_pending_witness_scripts(
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, Error> {
@@ -1803,7 +1815,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn del_pending_witness_script(&self, script: String) -> Result<(), Error> {
         match self {
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
@@ -1950,7 +1965,10 @@ impl DbTxn {
 
     /// The transfers of incoming batch transfers that are pending or that have failed after
     /// `failed_since`, each with its batch transfer.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_pending_or_recently_failed_incoming_transfers(
         &self,
         failed_since: i64,
@@ -1989,7 +2007,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn get_receive_colorings_by_txo_idxs(
         &self,
         txo_idxs: Vec<i32>,
@@ -2099,7 +2120,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn iter_pending_witness_scripts(
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, Error> {
