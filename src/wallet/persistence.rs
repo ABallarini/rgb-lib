@@ -23,11 +23,11 @@
 //! The wallet owns every in-memory change until the host flushes it. On wasm32
 //! [`Wallet::flush`](crate::wallet::Wallet::flush) and
 //! [`MultisigWallet::flush`](crate::wallet::MultisigWallet::flush) serialize the wallet with
-//! `snapshot` and delegate the write to [`save_snapshot`]. The wasm bindings instead track the
-//! writer id and sequence and call [`save_snapshot_record`], so a stale instance cannot clobber a
-//! newer snapshot. Flush is the only durable-write boundary, and its future resolves once the
-//! IndexedDB transaction commits. Native builds expose no flush method: their SQLite backend writes
-//! every change itself, so a native flush would be a no-op.
+//! `snapshot` and delegate the write to [`save_snapshot_record`], so a stale instance cannot
+//! clobber a newer snapshot; the sequence returned by a successful flush is the one to pass to the
+//! next call. Flush is the only durable-write boundary, and its future resolves once the IndexedDB
+//! transaction commits. Native builds expose no flush method: their SQLite backend writes every
+//! change itself, so a native flush would be a no-op.
 //!
 //! Restoring is asynchronous, so the host loads the snapshot first and only then constructs the
 //! wallet with `from_snapshot`; constructors are synchronous and cannot await IndexedDB. Delete the
@@ -37,12 +37,17 @@
 //! # // wasm32-only example: it cannot compile or run in a native doctest.
 //! # async fn host_flow(wallet_data: WalletData, keys: SinglesigKeys) -> Result<(), Error> {
 //! let wallet_id = keys.master_fingerprint.clone();
+//! let record = load_snapshot_record(&wallet_id).await?;
+//! let (sequence, writer) = match record {
+//!     Some(record) => (record.sequence, record.writer),
+//!     None => (0, new_writer_id()),
+//! };
 //! let restored = match load_snapshot(&wallet_id).await? {
 //!     Some(bytes) => Wallet::from_snapshot(&bytes, wallet_data.clone(), keys)?,
 //!     None => Wallet::new(wallet_data, keys)?,
 //! };
 //! // ... use the wallet ...
-//! restored.flush(&wallet_id).await?;
+//! restored.flush(&wallet_id, &writer, sequence).await?;
 //! // when the wallet is deleted
 //! delete_snapshot(&wallet_id).await?;
 //! # Ok(())

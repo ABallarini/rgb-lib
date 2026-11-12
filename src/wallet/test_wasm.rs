@@ -27,9 +27,11 @@
 //! it: the wallet flush entry point and the persistence functions.
 
 use slog::{debug, info};
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+#[cfg(feature = "esplora_async")]
+use super::receive_wasm::set_fail_after_cache;
 use super::*;
 use crate::wallet::persistence::{
     InjectedFailure, delete_snapshot, load_snapshot, load_snapshot_record, new_writer_id,
@@ -108,7 +110,9 @@ async fn wallet_lifecycle_over_indexed_db() {
     );
 
     // flush through the wallet, then read back what IndexedDB stored
-    wallet.flush(WALLET_ID).await.unwrap();
+    let writer = new_writer_id();
+    let mut sequence = wallet.flush(WALLET_ID, &writer, 0).await.unwrap();
+    assert_eq!(sequence, 1);
     let stored = load_snapshot(WALLET_ID).await.unwrap();
     assert_eq!(stored.as_deref(), Some(snapshot.as_slice()));
 
@@ -116,7 +120,8 @@ async fn wallet_lifecycle_over_indexed_db() {
     // more that the restored wallet has to hand out next
     let _ = wallet.get_address().unwrap();
     let _ = wallet.get_address().unwrap();
-    wallet.flush(WALLET_ID).await.unwrap();
+    sequence = wallet.flush(WALLET_ID, &writer, sequence).await.unwrap();
+    assert_eq!(sequence, 2);
     let next_address = wallet.get_address().unwrap();
     drop(wallet);
 
@@ -216,7 +221,7 @@ async fn watch_only_wallet_lifecycle_over_indexed_db() {
     let descriptors = wallet.get_descriptors();
     let fingerprint = wallet.get_keys().master_fingerprint.clone();
 
-    wallet.flush(WALLET_ID).await.unwrap();
+    wallet.flush(WALLET_ID, &new_writer_id(), 0).await.unwrap();
     let stored = load_snapshot(WALLET_ID)
         .await
         .unwrap()
@@ -387,7 +392,9 @@ async fn interrupted_write_keeps_previous_snapshot() {
     delete_snapshot(WALLET_ID).await.unwrap();
     let (mut wallet, _keys) = memory_wallet();
     let first = wallet.snapshot().unwrap().expect("memory wallet snapshot");
-    wallet.flush(WALLET_ID).await.unwrap();
+    let writer = new_writer_id();
+    let sequence = wallet.flush(WALLET_ID, &writer, 0).await.unwrap();
+    assert_eq!(sequence, 1);
     assert_eq!(
         load_snapshot(WALLET_ID).await.unwrap().as_deref(),
         Some(first.as_slice())
@@ -396,7 +403,7 @@ async fn interrupted_write_keeps_previous_snapshot() {
     // a newer in-memory state that must not replace the committed snapshot when the write aborts
     let _ = wallet.get_address().unwrap();
     set_injected_failure(Some(InjectedFailure::AbortBeforeCommit));
-    let result = wallet.flush(WALLET_ID).await;
+    let result = wallet.flush(WALLET_ID, &writer, sequence).await;
     set_injected_failure(None);
 
     assert!(matches!(result, Err(Error::Internal { .. })));
@@ -405,7 +412,8 @@ async fn interrupted_write_keeps_previous_snapshot() {
         Some(first.as_slice())
     );
     // the wallet stays usable: a retry commits the newer state
-    wallet.flush(WALLET_ID).await.unwrap();
+    let sequence = wallet.flush(WALLET_ID, &writer, sequence).await.unwrap();
+    assert_eq!(sequence, 2);
     let latest = wallet.snapshot().unwrap().expect("memory wallet snapshot");
     assert_eq!(
         load_snapshot(WALLET_ID).await.unwrap().as_deref(),
@@ -568,22 +576,18 @@ async fn stale_sequence_is_rejected_and_keeps_the_newer_snapshot() {
     // the first instance flushes the newer state
     let _ = wallet.get_address().unwrap();
     let second = wallet.snapshot().unwrap().expect("memory wallet snapshot");
-    let sequence =
-        save_snapshot_record(WALLET_ID, &second, &instance_a.writer, instance_a.sequence)
-            .await
-            .unwrap();
+    let sequence = wallet
+        .flush(WALLET_ID, &instance_a.writer, instance_a.sequence)
+        .await
+        .unwrap();
     assert_eq!(sequence, 2);
 
     // the second instance still expects sequence 1: rejected, and the message names the stored
     // sequence and the writer that owns it
-    let error = save_snapshot_record(
-        WALLET_ID,
-        b"stale snapshot bytes",
-        &instance_b.writer,
-        instance_b.sequence,
-    )
-    .await
-    .expect_err("a stale sequence must be rejected");
+    let error = wallet
+        .flush(WALLET_ID, &instance_b.writer, instance_b.sequence)
+        .await
+        .expect_err("a stale sequence must be rejected");
     assert!(matches!(error, Error::Internal { .. }));
     let message = error.to_string();
     assert!(
@@ -719,15 +723,16 @@ async fn browser_files_survive_flush_and_restore() {
         .unwrap();
     assert!(wallet.files().exists(&media).unwrap());
 
-    wallet.flush(WALLET_ID).await.unwrap();
-    let stored = load_snapshot(WALLET_ID)
+    wallet.flush(WALLET_ID, &new_writer_id(), 0).await.unwrap();
+    let stored = load_snapshot_record(WALLET_ID)
         .await
         .unwrap()
         .expect("the flushed snapshot");
     drop(wallet);
 
     // the files travel in the snapshot and are in the adapter before the wallet is handed back
-    let restored = Wallet::from_snapshot(&stored, wallet_data(), keys.clone()).expect("restore");
+    let restored =
+        Wallet::from_snapshot(&stored.bytes, wallet_data(), keys.clone()).expect("restore");
     assert_eq!(restored.files().read(&media).unwrap(), media_bytes);
     assert!(restored.files().exists(&media).unwrap());
     assert_eq!(restored.files().read(&transfer).unwrap(), b"consignment");
@@ -748,7 +753,10 @@ async fn browser_files_survive_flush_and_restore() {
 
     // the restored wallet persists the files again, keeping the last bytes written
     restored.files().atomic_write(&media, b"second").unwrap();
-    restored.flush(WALLET_ID).await.unwrap();
+    restored
+        .flush(WALLET_ID, &stored.writer, stored.sequence)
+        .await
+        .unwrap();
     let reloaded = load_snapshot(WALLET_ID)
         .await
         .unwrap()
@@ -939,7 +947,7 @@ async fn multisig_browser_files_survive_restore() {
         .files()
         .atomic_write(&media, b"multisig media")
         .unwrap();
-    wallet.flush(WALLET_ID).await.unwrap();
+    wallet.flush(WALLET_ID, &new_writer_id(), 0).await.unwrap();
     let stored = load_snapshot(WALLET_ID)
         .await
         .unwrap()
@@ -984,7 +992,7 @@ async fn multisig_wallet_lifecycle_over_indexed_db() {
 
     // a representative database mutation that needs no native hub
     add_unspent_colored_txo(&wallet);
-    wallet.flush(WALLET_ID).await.unwrap();
+    wallet.flush(WALLET_ID, &new_writer_id(), 0).await.unwrap();
     let stored = load_snapshot(WALLET_ID)
         .await
         .unwrap()
@@ -1233,6 +1241,178 @@ fn asset_genesis_timestamps_are_sane_and_survive_restore() {
         assert_eq!(restored_asset.timestamp, asset.timestamp);
         assert_eq!(restored_asset.added_at, asset.added_at);
     }
+}
+
+/// The browser receive reuses a consignment cached by a failed earlier attempt.
+///
+/// The first attempt fetches through a fake `fetch`, writes the decrypted consignment and its
+/// metadata, then fails (injected just after the cache write). The proxy is then switched to
+/// `NoConsignment`, as it may delete the data once the transfer was handled: the second attempt
+/// succeeds from the cache, and `consignment.get` is never requested again.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use base64::Engine as _;
+    use js_sys::Reflect;
+
+    const PROXY_URL: &str = "http://recipient-proxy";
+    const INDEXER_URL: &str = "http://127.0.0.1:3002";
+
+    let (mut wallet, _keys) = memory_wallet();
+    let script =
+        ScriptBuf::new_p2wpkh(&bdk_wallet::bitcoin::WPubkeyHash::from_slice(&[0x11; 20]).unwrap());
+    let recipient_id = crate::utils::recipient_id_from_script_buf(script, BitcoinNetwork::Regtest);
+    let recipient_pubkey = vec![0x44; 32];
+    let batch_idx = insert_pending_proxy_receive(&wallet, &recipient_id, recipient_pubkey);
+    let sender_pk = hex::encode(crate::encryption::gen_ed25519().verifying_key().to_bytes());
+    let expected = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let db_data = txn.get_db_data(false).unwrap();
+        super::receive::pending_receives(&db_data).unwrap()[0]
+            .expected_transfer_id(&sender_pk)
+            .expect("the pending receive derives a proxy transfer ID")
+    };
+
+    // the payload the fake proxy serves: arbitrary bytes, whose declared hash matches, so the
+    // download path caches them; parsing only happens after the cache write
+    let consignment_bytes = b"cached consignment payload".to_vec();
+    let consignment_b64 = base64::engine::general_purpose::STANDARD.encode(&consignment_bytes);
+    let consignment_hash = hex::encode(crate::encryption::sha256_digest(&consignment_bytes));
+    let consignment_body = format!(
+        r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"{consignment_b64}","sender_transport_endpoint":"rpc://127.0.0.1:3000/json-rpc","sender_pk":"{sender_pk}","consignment_hash":"{consignment_hash}","batch":false}}}}"#
+    );
+
+    let global = js_sys::global();
+    let saved_fetch = Reflect::get(&global, &JsValue::from_str("fetch")).unwrap();
+    let no_consignment = Rc::new(Cell::new(false));
+    let consignment_gets = Rc::new(Cell::new(0));
+    let fetch = {
+        let no_consignment = no_consignment.clone();
+        let consignment_gets = consignment_gets.clone();
+        let global = global.clone();
+        Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
+            let method = Reflect::get(&request, &JsValue::from_str("method"))
+                .ok()
+                .and_then(|method| method.as_string())
+                .unwrap_or_default();
+            let body = match method.as_str() {
+                "consignment.get" => {
+                    consignment_gets.set(consignment_gets.get() + 1);
+                    if no_consignment.get() {
+                        // the proxy deleted the data after the first attempt handled it
+                        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-400,"message":"no consignment"}}"#
+                            .to_string()
+                    } else {
+                        consignment_body.clone()
+                    }
+                }
+                // a malformed cached consignment is refused, which NACKs and releases the transfer
+                "ack.post" => r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#.to_string(),
+                _ => r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string(),
+            };
+            let response = Reflect::get(&global, &JsValue::from_str("Response")).unwrap();
+            let response = response.dyn_into::<js_sys::Function>().unwrap();
+            let response =
+                Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(&body)))
+                    .unwrap();
+            js_sys::Promise::resolve(&response)
+        })
+    };
+    Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
+
+    // the first attempt downloads and caches, then fails before the database transaction
+    set_fail_after_cache(true);
+    let first = wallet
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected)
+        .await;
+    set_fail_after_cache(false);
+    assert!(matches!(first, Err(Error::Internal { .. })));
+
+    // the cache is complete, but no database row was written: the transfer is still pending
+    let db_data = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        txn.get_db_data(false).unwrap()
+    };
+    assert_eq!(super::receive::already_handled(&db_data, &expected), None);
+    assert!(
+        wallet
+            .cached_receive(&db_data, PROXY_URL, &expected)
+            .unwrap()
+            .is_some(),
+        "the first attempt did not leave a reusable cache"
+    );
+
+    // the proxy now says the consignment is gone: only the cache can complete the receive
+    no_consignment.set(true);
+    let second = wallet
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected)
+        .await;
+    let _ = Reflect::set(&global, &JsValue::from_str("fetch"), &saved_fetch);
+
+    assert_eq!(
+        second.expect("the second attempt must succeed from the cache"),
+        Some(batch_idx)
+    );
+    assert_eq!(
+        consignment_gets.get(),
+        1,
+        "the second attempt fetched the consignment from the proxy instead of the cache"
+    );
+
+    let txn = wallet.database().begin_transaction().unwrap();
+    let transfer = txn
+        .get_db_data(false)
+        .unwrap()
+        .transfers
+        .into_iter()
+        .find(|transfer| transfer.proxy_transfer_id.as_deref() == Some(expected.as_str()))
+        .expect("the reused cache recorded the proxy transfer ID");
+    assert_eq!(
+        transfer.proxy_transfer_id.as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+/// Insert one pending incoming proxy receive; no transport endpoint is needed for the cache test.
+#[cfg(feature = "esplora_async")]
+fn insert_pending_proxy_receive(
+    wallet: &Wallet,
+    recipient_id: &str,
+    recipient_pubkey: Vec<u8>,
+) -> i32 {
+    let txn = wallet.database().begin_transaction().unwrap();
+    let batch_idx = txn
+        .set_batch_transfer(DbBatchTransferActMod {
+            status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+            created_at: ActiveValue::Set(0),
+            updated_at: ActiveValue::Set(0),
+            min_confirmations: ActiveValue::Set(1),
+            incoming: ActiveValue::Set(true),
+            operation_secret_key: ActiveValue::Set(Some(vec![7u8; 32])),
+            ..Default::default()
+        })
+        .unwrap();
+    let asset_transfer_idx = txn
+        .set_asset_transfer(DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(false),
+            batch_transfer_idx: ActiveValue::Set(batch_idx),
+            asset_id: ActiveValue::Set(None),
+            ..Default::default()
+        })
+        .unwrap();
+    txn.set_transfer(DbTransferActMod {
+        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+        recipient_id: ActiveValue::Set(Some(recipient_id.to_string())),
+        recipient_pubkey: ActiveValue::Set(Some(recipient_pubkey)),
+        recipient_encryption: ActiveValue::Set(Encryption::Unsupported),
+        ..Default::default()
+    })
+    .unwrap();
+    txn.commit().unwrap();
+    batch_idx
 }
 
 // The proxy health check is read-only and needs no proxy for the invalid-endpoint path: the shared
