@@ -2176,6 +2176,31 @@ pub struct ReceivedConsignmentMeta {
     pub batch: bool,
 }
 
+/// A `transfer.retrieved` the caller must post once the handled receive is durable.
+///
+/// The browser writes it as a marker before the snapshot flush and removes it only after the
+/// recipient proxy accepted the release; the native caller posts it right after its commit.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct PendingRetrieval {
+    /// endpoint the consignment was downloaded from
+    pub proxy_url: String,
+    /// ID of the transfer on the proxies
+    pub transfer_id: String,
+    /// recipient ID of the receive, which names the marker file
+    pub recipient_id: String,
+    /// recipient operation seed, used to sign the release: never written to a marker file
+    #[serde(skip)]
+    pub recipient_seed: Vec<u8>,
+}
+
 /// The sender proxy's response to `ack.clean`, requested before failing an outgoing operation.
 #[cfg(feature = "_online")]
 #[derive(Debug)]

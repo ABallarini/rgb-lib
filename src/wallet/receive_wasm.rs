@@ -26,6 +26,9 @@ use crate::api::jsonrpc::{ProxyTransferState, list_transfers_message, map_proxy_
 use crate::encryption::sha256_digest;
 use base64::{Engine as _, engine::general_purpose};
 
+/// Marker of a `transfer.retrieved` the durable snapshot still owes the recipient proxy.
+const RETRIEVED_MARKER_FILE: &str = "retrieved.pending.json";
+
 /// [`ReceiveTransport`] over the browser's `fetch` client.
 pub(crate) struct WasmReceiveTransport<'a, W: WalletOffline + ?Sized> {
     wallet: &'a W,
@@ -137,9 +140,9 @@ impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W>
         proxy_url: &str,
         transfer_id: &str,
         recipient_seed: &[u8],
-    ) {
+    ) -> bool {
         let Some(signature) = transfer_retrieved_signature(transfer_id, recipient_seed) else {
-            return;
+            return false;
         };
         let res = match ProxyFetchClient::new(proxy_url) {
             Ok(client) => client.transfer_retrieved(transfer_id, &signature).await,
@@ -148,19 +151,25 @@ impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W>
                     self.wallet.logger(),
                     "Failed to mark transfer as retrieved: {e}"
                 );
-                return;
+                return false;
             }
         };
         match res {
-            Ok(r) if r.error.is_none() => {}
-            Ok(r) => warn!(
-                self.wallet.logger(),
-                "Failed to mark transfer as retrieved: {:?}", r.error
-            ),
-            Err(e) => warn!(
-                self.wallet.logger(),
-                "Failed to mark transfer as retrieved: {e}"
-            ),
+            Ok(r) if r.error.is_none() => true,
+            Ok(r) => {
+                warn!(
+                    self.wallet.logger(),
+                    "Failed to mark transfer as retrieved: {:?}", r.error
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    self.wallet.logger(),
+                    "Failed to mark transfer as retrieved: {e}"
+                );
+                false
+            }
         }
     }
 
@@ -287,6 +296,24 @@ async fn prefetch_chain_answers(
     .map_err(|e| Error::Network {
         details: e.to_string(),
     })
+}
+
+/// The operation seed of a receive, looked up by the proxy transfer ID stored with it.
+fn recipient_seed_for(db_data: &DbData, transfer_id: &str) -> Option<Vec<u8>> {
+    let transfer = db_data
+        .transfers
+        .iter()
+        .find(|transfer| transfer.proxy_transfer_id.as_deref() == Some(transfer_id))?;
+    let asset_transfer = db_data
+        .asset_transfers
+        .iter()
+        .find(|asset_transfer| asset_transfer.idx == transfer.asset_transfer_idx)?;
+    db_data
+        .batch_transfers
+        .iter()
+        .find(|batch_transfer| batch_transfer.idx == asset_transfer.batch_transfer_idx)?
+        .operation_secret_key
+        .clone()
 }
 
 impl Wallet {
@@ -562,8 +589,8 @@ impl Wallet {
                     )
                     .await
                 }
-                None => {
-                    self.ack_consignment_via(
+                None => self
+                    .ack_consignment_via(
                         &transport,
                         &txn,
                         &candidate.batch,
@@ -574,12 +601,16 @@ impl Wallet {
                         None,
                     )
                     .await
-                }
+                    .map(|outcome| (outcome, None)),
             }
         };
         match outcome {
-            Ok(_) => {
+            Ok((_, retrieval)) => {
                 self.persist_and_commit(txn)?;
+                // as in the fresh receive: the marker shares the snapshot with the receive
+                if let Some(retrieval) = &retrieval {
+                    self.save_pending_retrieval(retrieval)?;
+                }
                 Ok(ReceiveOutcome::Handled)
             }
             Err(e) => {
@@ -593,6 +624,93 @@ impl Wallet {
     fn db_data(&self) -> Result<DbData, Error> {
         let txn = self.database().begin_transaction()?;
         txn.get_db_data(false)
+    }
+
+    /// Key of the pending-release marker of one receive.
+    fn retrieved_marker_key(&self, recipient_id: &str) -> Result<WalletPath, Error> {
+        self.wallet_key(
+            &self
+                .get_receive_consignment_path(recipient_id)
+                .with_file_name(RETRIEVED_MARKER_FILE),
+        )
+    }
+
+    /// Record a release the caller must post once the receive is durable.
+    fn save_pending_retrieval(&self, retrieval: &PendingRetrieval) -> Result<(), Error> {
+        let key = self.retrieved_marker_key(&retrieval.recipient_id)?;
+        let bytes = serde_json::to_vec(retrieval).map_err(InternalError::from)?;
+        self.files().atomic_write(&key, &bytes)
+    }
+
+    /// Every release marker carried by the wallet files, which the snapshot keeps across reloads.
+    fn pending_retrievals(&self) -> Result<Vec<(WalletPath, PendingRetrieval)>, Error> {
+        let marker_suffix = format!("/{RETRIEVED_MARKER_FILE}");
+        let mut markers = vec![];
+        for key in self.files().list(&self.transfers_key()?)? {
+            if !key.as_str().ends_with(&marker_suffix) {
+                continue;
+            }
+            let Ok(bytes) = self.files().read(&key) else {
+                continue;
+            };
+            let Ok(marker) = serde_json::from_slice::<PendingRetrieval>(&bytes) else {
+                continue;
+            };
+            markers.push((key, marker));
+        }
+        Ok(markers)
+    }
+
+    /// Post the releases the durable snapshot still owes, removing each marker once the proxy
+    /// accepted it.
+    ///
+    /// The host calls this only after flushing the snapshot that holds the handled receive: the
+    /// proxy may delete the only copy of the consignment on this call, so it must never run
+    /// before. A marker left by a failed post is retried by the next call, and posting a release
+    /// twice is harmless.
+    pub async fn release_pending_retrievals(&self, indexer_url: &str) {
+        let markers = match self.pending_retrievals() {
+            Ok(markers) => markers,
+            Err(e) => {
+                warn!(self.logger(), "Cannot read pending transfer releases: {e}");
+                return;
+            }
+        };
+        if markers.is_empty() {
+            return;
+        }
+        let db_data = match self.db_data() {
+            Ok(db_data) => db_data,
+            Err(e) => {
+                warn!(
+                    self.logger(),
+                    "Cannot read the transfers of pending releases: {e}"
+                );
+                return;
+            }
+        };
+        for (key, marker) in markers {
+            let Some(seed) = recipient_seed_for(&db_data, &marker.transfer_id) else {
+                warn!(
+                    self.logger(),
+                    "Dropping the release marker of {}, which names no local transfer",
+                    marker.transfer_id
+                );
+                if let Err(e) = self.files().remove(&key) {
+                    warn!(self.logger(), "Cannot remove a release marker: {e}");
+                }
+                continue;
+            };
+            let transport = WasmReceiveTransport::new(self, indexer_url);
+            if transport
+                .mark_transfer_retrieved(&marker.proxy_url, &marker.transfer_id, &seed)
+                .await
+            {
+                if let Err(e) = self.files().remove(&key) {
+                    warn!(self.logger(), "Cannot remove a release marker: {e}");
+                }
+            }
+        }
     }
 
     /// Fetch, decrypt, prefetch and drive one proxy transfer.
@@ -800,8 +918,13 @@ impl Wallet {
             .await
         };
         match outcome {
-            Ok(_) => {
+            Ok((_, retrieval)) => {
                 self.persist_and_commit(txn)?;
+                // the marker travels in the same snapshot as the receive it releases: the host
+                // flushes first and only then posts it
+                if let Some(retrieval) = &retrieval {
+                    self.save_pending_retrieval(retrieval)?;
+                }
                 Ok(ReceiveOutcome::Handled)
             }
             Err(e) => {

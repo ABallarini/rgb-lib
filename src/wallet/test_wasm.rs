@@ -1445,6 +1445,125 @@ async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
     );
 }
 
+/// The proxy release waits for the snapshot that holds the handled receive: receiving never posts
+/// it, a failed post keeps its marker, and a wallet reloaded from the snapshot retries it after a
+/// successful save.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn proxy_release_waits_for_the_snapshot_and_is_retried() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use base64::Engine as _;
+    use js_sys::Reflect;
+
+    const PROXY_URL: &str = "http://recipient-proxy";
+    const INDEXER_URL: &str = "http://127.0.0.1:3002";
+
+    let (mut wallet, keys) = memory_wallet();
+    let script =
+        ScriptBuf::new_p2wpkh(&bdk_wallet::bitcoin::WPubkeyHash::from_slice(&[0x13; 20]).unwrap());
+    let recipient_id = crate::utils::recipient_id_from_script_buf(script, BitcoinNetwork::Regtest);
+    let batch_idx = insert_pending_proxy_receive(&wallet, &recipient_id, vec![0x44; 32]);
+    let sender_pk = hex::encode(crate::encryption::gen_ed25519().verifying_key().to_bytes());
+    let expected = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let db_data = txn.get_db_data(false).unwrap();
+        super::receive::pending_receives(&db_data).unwrap()[0]
+            .expected_transfer_id(&sender_pk)
+            .expect("the pending receive derives a proxy transfer ID")
+    };
+
+    // arbitrary payload with a matching declared hash: the driver refuses it after the download,
+    // which still handles the transfer (NACK) and so owes the proxy a release
+    let consignment_bytes = b"release ordering payload".to_vec();
+    let consignment_b64 = base64::engine::general_purpose::STANDARD.encode(&consignment_bytes);
+    let consignment_hash = hex::encode(crate::encryption::sha256_digest(&consignment_bytes));
+    let consignment_body = format!(
+        r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"{consignment_b64}","sender_transport_endpoint":"rpc://127.0.0.1:3000/json-rpc","sender_pk":"{sender_pk}","consignment_hash":"{consignment_hash}","batch":false}}}}"#
+    );
+
+    let global = js_sys::global();
+    let saved_fetch = Reflect::get(&global, &JsValue::from_str("fetch")).unwrap();
+    let retrieved_calls = Rc::new(Cell::new(0));
+    let fail_retrieved = Rc::new(Cell::new(true));
+    let fetch = {
+        let retrieved_calls = retrieved_calls.clone();
+        let fail_retrieved = fail_retrieved.clone();
+        let global = global.clone();
+        Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
+            let method = Reflect::get(&request, &JsValue::from_str("method"))
+                .ok()
+                .and_then(|method| method.as_string())
+                .unwrap_or_default();
+            let body = match method.as_str() {
+                "consignment.get" => consignment_body.clone(),
+                "ack.post" => r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#.to_string(),
+                "transfer.retrieved" => {
+                    retrieved_calls.set(retrieved_calls.get() + 1);
+                    if fail_retrieved.get() {
+                        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-400,"message":"unavailable"}}"#
+                            .to_string()
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string()
+                    }
+                }
+                _ => r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string(),
+            };
+            let response = Reflect::get(&global, &JsValue::from_str("Response")).unwrap();
+            let response = response.dyn_into::<js_sys::Function>().unwrap();
+            let response =
+                Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(&body)))
+                    .unwrap();
+            js_sys::Promise::resolve(&response)
+        })
+    };
+    Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
+
+    // receiving never posts the release: the caller has not saved the handled receive yet
+    let handled = wallet
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected)
+        .await
+        .expect("the unreadable consignment is refused and handled");
+    assert_eq!(handled, Some(batch_idx));
+    assert_eq!(
+        retrieved_calls.get(),
+        0,
+        "the receive released the proxy data before the caller saved"
+    );
+
+    // the host saved, and a wallet reloaded from that snapshot still owes the release
+    let snapshot = wallet
+        .snapshot()
+        .expect("the in-memory wallet snapshots")
+        .expect("the in-memory wallet produces a snapshot");
+    let restored = Wallet::from_snapshot(&snapshot, wallet_data(), keys)
+        .expect("restore the wallet from the snapshot");
+
+    // the proxy rejects the first post: the marker must survive for a later attempt
+    restored.release_pending_retrievals(INDEXER_URL).await;
+    assert_eq!(retrieved_calls.get(), 1);
+    restored.release_pending_retrievals(INDEXER_URL).await;
+    assert_eq!(
+        retrieved_calls.get(),
+        2,
+        "the failed release did not leave its marker for a retry"
+    );
+
+    // the next post succeeds and removes the marker, so a further call has nothing to release
+    fail_retrieved.set(false);
+    restored.release_pending_retrievals(INDEXER_URL).await;
+    assert_eq!(retrieved_calls.get(), 3);
+    restored.release_pending_retrievals(INDEXER_URL).await;
+    assert_eq!(
+        retrieved_calls.get(),
+        3,
+        "the accepted release kept its marker"
+    );
+
+    let _ = Reflect::set(&global, &JsValue::from_str("fetch"), &saved_fetch);
+}
+
 /// A receive applied by an earlier attempt, left in `WaitingBroadcast`, is resumed by the next
 /// call instead of being skipped because it already stores its proxy transfer ID. A terminal
 /// transfer is still skipped.

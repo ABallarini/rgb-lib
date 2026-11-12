@@ -556,6 +556,28 @@ pub trait ReceiveWallet: WalletOffline {
         }
         Ok(to_reject)
     }
+
+    /// The release a handled proxy receive leaves to its caller, once the receive is durable.
+    fn pending_retrieval(
+        &self,
+        mode: &ReceiveMode,
+        recipient_id: String,
+        recipient_seed: Vec<u8>,
+        handled: bool,
+    ) -> Option<PendingRetrieval> {
+        if !handled || !self.releases_received_transfer_data() {
+            return None;
+        }
+        let ReceiveMode::Proxy(data) = mode else {
+            return None;
+        };
+        Some(PendingRetrieval {
+            proxy_url: data.proxy_url.clone(),
+            transfer_id: data.transfer_id.clone(),
+            recipient_id,
+            recipient_seed,
+        })
+    }
 }
 
 /// Highest block height that is `min_confirmations` deep, given the chain tip.
@@ -1120,13 +1142,14 @@ pub(super) trait ReceiveTransport {
         recipient_seed: &[u8],
     ) -> Result<PostAckResponse, Error>;
 
-    /// Tell the recipient proxy the consignment has been handled. Failures are only logged.
+    /// Tell the recipient proxy the consignment has been handled, returning whether the proxy
+    /// accepted the release. Failures are only logged.
     async fn mark_transfer_retrieved(
         &self,
         proxy_url: &str,
         transfer_id: &str,
         recipient_seed: &[u8],
-    );
+    ) -> bool;
 
     /// Height of the best-chain tip, the anchor of the safe height a consignment is validated at.
     async fn tip_height(&self) -> Result<u32, Error>;
@@ -1193,9 +1216,10 @@ impl<W: WalletOnline + ?Sized> ReceiveTransport for NativeReceiveTransport<'_, W
         proxy_url: &str,
         transfer_id: &str,
         recipient_seed: &[u8],
-    ) {
+    ) -> bool {
         self.wallet
             .mark_transfer_retrieved(proxy_url, transfer_id, recipient_seed);
+        true
     }
 
     async fn tip_height(&self) -> Result<u32, Error> {
@@ -1227,6 +1251,25 @@ pub(super) fn drive_native<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// Post the releases the receive driver returned, after the caller's durable save succeeded.
+///
+/// Posting them before the commit would let the proxy delete the only copy of a consignment whose
+/// receive could still roll back; posting them after it means a crash in between leaves the proxy
+/// data in place, and the transfer still completes from the local copy.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn release_retrievals<T: ReceiveTransport + ?Sized>(
+    transport: &T,
+    retrievals: &[PendingRetrieval],
+) {
+    for retrieval in retrievals {
+        drive_native(transport.mark_transfer_retrieved(
+            &retrieval.proxy_url,
+            &retrieval.transfer_id,
+            &retrieval.recipient_seed,
+        ));
+    }
+}
+
 /// The per-consignment receive driver, shared by the native and (next) browser paths.
 ///
 /// A private extension trait, so the public [`WalletOnline`] surface stays unchanged.
@@ -1241,6 +1284,10 @@ pub(super) trait ReceiveDriver: ReceiveWallet {
     /// its metadata and marked the proxy endpoint used: those steps keep their retry/caching
     /// policy in the native caller. Everything from loading the file to posting the ACK or NACK
     /// is shared here. `chain` answers the witness and header lookups validation needs.
+    ///
+    /// A handled proxy receive also returns the `transfer.retrieved` its caller must post, once a
+    /// save that includes the handled receive is durable: the proxy may delete the only copy of the
+    /// consignment on that call, so it must never run before the commit.
     #[allow(clippy::too_many_arguments)]
     async fn drive_receive<T: ReceiveTransport + ?Sized>(
         &self,
@@ -1254,13 +1301,14 @@ pub(super) trait ReceiveDriver: ReceiveWallet {
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
-    ) -> Result<Option<DbBatchTransfer>, Error>;
+    ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error>;
 
     /// Resume an applied receive left in `WaitingSafeHeight`, without applying it again.
     ///
     /// The consignment is loaded and validated again at the current safe height; the ACK is
     /// posted only when the unsafe history it contains has reached that height. The transfer is
-    /// never re-applied, so its colorings are not duplicated.
+    /// never re-applied, so its colorings are not duplicated. The returned `transfer.retrieved`
+    /// follows the same rule as [`Self::drive_receive`].
     #[allow(dead_code)] // only the browser resume path calls it today
     #[allow(clippy::too_many_arguments)]
     async fn resume_receive<T: ReceiveTransport + ?Sized>(
@@ -1275,7 +1323,7 @@ pub(super) trait ReceiveDriver: ReceiveWallet {
         consignment_path: &Path,
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
-    ) -> Result<Option<DbBatchTransfer>, Error>;
+    ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error>;
 
     /// The phases of [`Self::drive_receive`], without releasing the proxy data.
     #[allow(clippy::too_many_arguments)]
@@ -1338,11 +1386,12 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
-    ) -> Result<Option<DbBatchTransfer>, Error> {
+    ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error> {
         let recipient_seed = batch_transfer
             .operation_secret_key
             .clone()
             .unwrap_or_default();
+        let release_id = recipient_id.clone();
         let outcome = self
             .drive_receive_inner(
                 transport,
@@ -1360,17 +1409,11 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
             .await?;
 
         // once the consignment has been handled (ACKed or refused), its data is saved locally and
-        // the proxy can delete it, while the transfer keeps counting towards the invoice quota
-        if outcome.is_some()
-            && self.releases_received_transfer_data()
-            && let ReceiveMode::Proxy(data) = &mode
-        {
-            transport
-                .mark_transfer_retrieved(&data.proxy_url, &data.transfer_id, &recipient_seed)
-                .await;
-        }
-
-        Ok(outcome)
+        // the proxy can delete it, while the transfer keeps counting towards the invoice quota.
+        // The caller posts this only after committing the handled receive.
+        let retrieval =
+            self.pending_retrieval(&mode, release_id, recipient_seed, outcome.is_some());
+        Ok((outcome, retrieval))
     }
 
     async fn resume_receive<T: ReceiveTransport + ?Sized>(
@@ -1385,21 +1428,29 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         consignment_path: &Path,
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
-    ) -> Result<Option<DbBatchTransfer>, Error> {
-        self.drive_receive_inner(
-            transport,
-            chain,
-            txn,
-            batch_transfer,
-            asset_transfer,
-            transfer,
-            recipient_id,
-            consignment_path,
-            mode,
-            updated_batch_transfer,
-            true,
-        )
-        .await
+    ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error> {
+        let recipient_seed = batch_transfer
+            .operation_secret_key
+            .clone()
+            .unwrap_or_default();
+        let release_id = recipient_id.clone();
+        let outcome = self
+            .drive_receive_inner(
+                transport,
+                chain,
+                txn,
+                batch_transfer,
+                asset_transfer,
+                transfer,
+                recipient_id,
+                consignment_path,
+                mode,
+                updated_batch_transfer,
+                true,
+            )
+            .await?;
+        let retrieval = self.pending_retrieval(mode, release_id, recipient_seed, outcome.is_some());
+        Ok((outcome, retrieval))
     }
 
     async fn drive_receive_inner<T: ReceiveTransport + ?Sized>(
@@ -2137,8 +2188,9 @@ mod tests {
             _proxy_url: &str,
             _transfer_id: &str,
             _recipient_seed: &[u8],
-        ) {
+        ) -> bool {
             self.calls.borrow_mut().push("retrieved");
+            true
         }
 
         async fn tip_height(&self) -> Result<u32, Error> {
@@ -2221,7 +2273,7 @@ mod tests {
                 _proxy_url: &str,
                 _transfer_id: &str,
                 _recipient_seed: &[u8],
-            ) {
+            ) -> bool {
                 unreachable!()
             }
 
@@ -2421,8 +2473,9 @@ mod tests {
     }
 
     /// An unreadable consignment is refused exactly like before the driver move: the NACK is
-    /// posted, the proxy data is released, the transfer is failed - and all of it inside the
-    /// caller's transaction, so a rollback leaves the transfer untouched.
+    /// posted, the transfer is failed - and all of it inside the caller's transaction, so a
+    /// rollback leaves the transfer untouched. The proxy release is only returned: posting it
+    /// before the caller's commit could delete the only copy of an uncommitted receive.
     #[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
     #[test]
     fn drive_receive_refuses_an_unreadable_consignment_and_rolls_back() {
@@ -2442,14 +2495,14 @@ mod tests {
         let calls = std::cell::RefCell::new(vec![]);
         let transport = FakeTransport { calls: &calls };
         let chain = DumbResolver;
-        let outcome = drive_native(wallet.drive_receive(
+        let (outcome, retrieval) = drive_native(wallet.drive_receive(
             &transport,
             &chain,
             &txn,
             &batch,
             &asset_transfer,
             &transfer,
-            recipient_id,
+            recipient_id.clone(),
             &dir.path().join("missing.rgbcons"),
             proxy_mode(),
             &mut updated,
@@ -2457,8 +2510,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.unwrap().status, TransferStatus::Failed);
-        // the NACK goes out before the proxy data is released
-        assert_eq!(calls.into_inner(), ["nack", "retrieved"]);
+        // the NACK goes out, but the release waits for the caller's save
+        assert_eq!(calls.borrow().as_slice(), ["nack"]);
+        let retrieval = retrieval.expect("the handled receive leaves its release to the caller");
+        assert_eq!(retrieval.proxy_url, "http://recipient-proxy");
+        assert_eq!(retrieval.transfer_id, "transfer-id");
+        assert_eq!(retrieval.recipient_id, recipient_id);
+        assert_eq!(retrieval.recipient_seed, vec![7u8; 32]);
         assert_eq!(
             txn.get_batch_transfer(batch.idx).unwrap().unwrap().status,
             TransferStatus::Failed
@@ -2470,6 +2528,11 @@ mod tests {
             txn.get_batch_transfer(batch.idx).unwrap().unwrap().status,
             TransferStatus::WaitingCounterparty
         );
+        drop(txn);
+
+        // the caller committed, so the release can go out now
+        release_retrievals(&transport, std::slice::from_ref(&retrieval));
+        assert_eq!(calls.into_inner(), ["nack", "retrieved"]);
     }
 
     /// The out-of-band ACK branch needs no transport: it records the ACK, moves the transfer to

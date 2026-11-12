@@ -6,7 +6,7 @@ use super::*;
 
 use super::receive::{
     NativeReceiveTransport, ReceiveDriver, broadcast_error, drive_native, parse_reject_list,
-    transfer_retrieved_signature,
+    release_retrievals, transfer_retrieved_signature,
 };
 
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
@@ -746,6 +746,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         batch_transfer: &DbBatchTransfer,
         db_data: &DbData,
         revoke_released: bool,
+        retrievals: &mut Vec<PendingRetrieval>,
     ) -> Result<TryFailBatchTransferOutcome, Error> {
         // an outgoing transfer is expired once its expiration has passed on the sender proxy's
         // clock too, as the proxy may release its TX until then
@@ -760,6 +761,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
             db_data,
             &[],
             true,
+            retrievals,
         ) {
             Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
                 Ok(None)
@@ -885,6 +887,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         batch_transfer_idx: Option<i32>,
         no_asset_only: bool,
         skip_sync: bool,
+        retrievals: &mut Vec<PendingRetrieval>,
     ) -> Result<FailTransfersOutcome, Error> {
         if !skip_sync {
             self.sync_wallet(
@@ -938,7 +941,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
             transfers_changed = true;
             // a deliberate fail (explicit batch idx) revokes any released signed TXs first
             if !matches!(
-                self.try_fail_batch_transfer(txn, &batch_transfer, &db_data, true)?,
+                self.try_fail_batch_transfer(txn, &batch_transfer, &db_data, true, retrievals)?,
                 TryFailBatchTransferOutcome::Failed
             ) {
                 cannot_fail = true;
@@ -967,7 +970,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
                 }
                 // expired transfers: the proxy operation has lapsed, no need to revoke released TXs
                 if !matches!(
-                    self.try_fail_batch_transfer(txn, batch_transfer, &db_data, false)?,
+                    self.try_fail_batch_transfer(txn, batch_transfer, &db_data, false, retrievals)?,
                     TryFailBatchTransferOutcome::Denied
                 ) {
                     transfers_changed = true;
@@ -1513,6 +1516,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         txn: &DbTxn,
         batch_transfer: &DbBatchTransfer,
         db_data: &DbData,
+        retrievals: &mut Vec<PendingRetrieval>,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger(), "Waiting consignment...");
 
@@ -1696,7 +1700,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         };
 
         let mode = ReceiveMode::Proxy(data);
-        self.process_received_consignment(
+        let (outcome, retrieval) = self.process_received_consignment(
             txn,
             batch_transfer,
             &asset_transfer,
@@ -1705,7 +1709,11 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
             &consignment_path,
             mode,
             &mut updated_batch_transfer,
-        )
+        )?;
+        if let Some(retrieval) = retrieval {
+            retrievals.push(retrieval);
+        }
+        Ok(outcome)
     }
 
     /// Find the transfer to an invoice on a recipient proxy and download its consignment.
@@ -1853,7 +1861,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
-    ) -> Result<Option<DbBatchTransfer>, Error> {
+    ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error> {
         let transport = NativeReceiveTransport::new(self);
         let chain = self.blockchain_resolver();
         drive_native(self.drive_receive(
@@ -1955,7 +1963,8 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
             let mode = ReceiveMode::OutOfBand {
                 media_file_paths: media_file_paths.clone(),
             };
-            let updated = self.process_received_consignment(
+            // out-of-band has no proxy to release
+            let (updated, _retrieval) = self.process_received_consignment(
                 txn,
                 &batch_transfer,
                 &asset_transfer,
@@ -2651,6 +2660,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         transfer: &DbBatchTransfer,
         db_data: &DbData,
         incoming: bool,
+        retrievals: &mut Vec<PendingRetrieval>,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         // a transfer from the previous proxy protocol can neither be received nor ACKed anymore,
         // and failing it right away, without waiting for the expiration, is safe: an incoming one
@@ -2664,7 +2674,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
             return Ok(Some(self.fail_batch_transfer(txn, transfer)?));
         }
         if incoming {
-            self.wait_consignment(txn, transfer, db_data)
+            self.wait_consignment(txn, transfer, db_data, retrievals)
         } else {
             self.wait_ack(txn, transfer, db_data)
         }
@@ -2677,6 +2687,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         db_data: &DbData,
         filter: &[RefreshFilter],
         skip_sync: bool,
+        retrievals: &mut Vec<PendingRetrieval>,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger(), "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming;
@@ -2694,7 +2705,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
                 if self.get_hub_fail_status(transfer.idx)? {
                     return Ok(Some(self.fail_batch_transfer(txn, transfer)?));
                 }
-                self.wait_counterparty(txn, transfer, db_data, incoming)
+                self.wait_counterparty(txn, transfer, db_data, incoming, retrievals)
             }
             TransferStatus::WaitingSafeHeight => self.wait_safe_height(txn, transfer, db_data),
             // a proxy recipient that ACKed polls the sender proxy for the TX (or expiration); an
@@ -2876,6 +2887,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
         asset_id: Option<String>,
         filter: Vec<RefreshFilter>,
         skip_sync: bool,
+        retrievals: &mut Vec<PendingRetrieval>,
     ) -> Result<RefreshResult, Error> {
         let mut db_data = txn.get_db_data(false)?;
 
@@ -2899,7 +2911,7 @@ pub trait WalletOnline: WalletOffline + ReceiveWallet {
             // a failed refresh must not leave its partial changes behind (e.g. the colorings of a
             // consignment validated before its ACK failed), as the next one would redo them
             match txn.with_savepoint(|txn| {
-                self.refresh_transfer(txn, transfer, &db_data, &filter, skip_sync)
+                self.refresh_transfer(txn, transfer, &db_data, &filter, skip_sync, retrievals)
             }) {
                 Ok(Some(updated_transfer)) => updated_status = Some(updated_transfer.status),
                 Err(e) => failure = Some(e),
@@ -5528,12 +5540,19 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
         );
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let outcome =
-            self.fail_transfers_impl(&txn, batch_transfer_idx, no_asset_only, skip_sync)?;
+        let mut retrievals: Vec<PendingRetrieval> = vec![];
+        let outcome = self.fail_transfers_impl(
+            &txn,
+            batch_transfer_idx,
+            no_asset_only,
+            skip_sync,
+            &mut retrievals,
+        )?;
         if outcome.transfers_changed {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        release_retrievals(&NativeReceiveTransport::new(self), &retrievals);
         info!(self.logger(), "Fail transfers completed");
         if outcome.cannot_fail {
             return Err(Error::CannotFailBatchTransfer);
@@ -5608,11 +5627,15 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
         if let Some(aid) = &asset_id {
             txn.check_asset_exists(aid.clone())?;
         }
-        let res = self.refresh_impl(&txn, asset_id, filter, skip_sync)?;
+        let mut retrievals: Vec<PendingRetrieval> = vec![];
+        let res = self.refresh_impl(&txn, asset_id, filter, skip_sync, &mut retrievals)?;
         if res.transfers_changed() {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
+        // the handled receives are durable now, so the proxies may drop their copies: a failure
+        // here only leaves the data on the proxy, never a deleted consignment with no local copy
+        release_retrievals(&NativeReceiveTransport::new(self), &retrievals);
         info!(self.logger(), "Refresh completed");
         Ok(res)
     }
