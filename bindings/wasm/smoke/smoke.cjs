@@ -286,6 +286,23 @@ async function main() {
     /cannot check the proxy URL: Invalid transport endpoint/,
   );
 
+  // overlapping calls: an async operation holds the instance, so a second call gets the busy
+  // error instead of aliasing the wallet; the first call then completes on its own error path,
+  // with the instance usable again. The endpoint is refused locally, so no network is used.
+  const inFlight = wallet.sync("http://127.0.0.1:1", 5).then(
+    () => assert.fail("a sync to a refused endpoint must not succeed"),
+    (e) => assert.match(String(e), /cannot sync the wallet/),
+  );
+  // one microtask is enough for the sync to start and suspend on its first fetch
+  await null;
+  assert.throws(() => wallet.getAddress(), /the wallet is busy with another operation/);
+  assert.throws(() => wallet.name(), /the wallet is busy with another operation/);
+  await inFlight;
+  assert.ok(
+    wallet.getAddress().startsWith("bcrt1"),
+    "the wallet is usable once the operation ends",
+  );
+
   console.log(`wallet id: ${id}`);
   console.log(`address: ${firstAddress}`);
   console.log(`restored address: ${nextAddress}`);

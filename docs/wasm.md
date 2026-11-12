@@ -107,7 +107,7 @@ wasm-pack build bindings/wasm --target nodejs --out-dir pkg-node
 node bindings/wasm/smoke/smoke.cjs
 ```
 
-The smoke covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`, `deleteTransfers`), the out-of-band `witnessReceive` invoice plus the `blindReceive` core error on a wallet without a colored UTXO, snapshot, restore, restore with a mismatched mnemonic, invalid-mnemonic error handling, `generateKeys`/`restoreKeys`, watch-only creation with address/snapshot/restore, the hub-free multisig subset (construction, id, descriptors, descriptor-derived address, snapshot, restore), invoice parsing, the invalid-consignment rejection and the offline rejection of an invalid `checkProxyUrl` endpoint. Node has no IndexedDB, so `load()` and `flush()` are not exercised there.
+The smoke covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`, `deleteTransfers`), the out-of-band `witnessReceive` invoice plus the `blindReceive` core error on a wallet without a colored UTXO, snapshot, restore, restore with a mismatched mnemonic, invalid-mnemonic error handling, `generateKeys`/`restoreKeys`, watch-only creation with address/snapshot/restore, the hub-free multisig subset (construction, id, descriptors, descriptor-derived address, snapshot, restore), invoice parsing, the invalid-consignment rejection, the offline rejection of an invalid `checkProxyUrl` endpoint and the re-entrant call guard (a second call while a `sync` is in flight throws `the wallet is busy with another operation`). Node has no IndexedDB, so `load()` and `flush()` are not exercised there.
 
 ### Browser lifecycle test
 
@@ -119,6 +119,14 @@ cargo test --lib --target wasm32-unknown-unknown \
 ```
 
 This needs Chrome and ChromeDriver. It runs the wallet lifecycle over a real IndexedDB: create, issue offline, flush, reload, restore, and verify the state and address index survived. It also runs the opt-in regtest Esplora smoke, which returns early unless `RGB_REGTEST_ESPLORA_URL` was baked in at compile time.
+
+The same job runs the bindings crate's own browser test for the operation guard:
+
+```sh
+cargo test --manifest-path bindings/wasm/Cargo.toml --lib --target wasm32-unknown-unknown
+```
+
+It holds the wallet borrowed, as an in-flight async call does, and checks that a second call on the same instance throws `the wallet is busy with another operation` for both wallet classes, then that the instance works again once the borrow is released.
 
 Optional network smoke (not part of required CI, needs a controlled regtest Esplora endpoint):
 
@@ -231,6 +239,8 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | `deleteSnapshot(name)` | Async. Delete the IndexedDB record for `name` and detach the instance, like the singlesig method. |
 
 The JSON reads use the `rgb-lib` serde field names (`snake_case`), so the host parses them as returned without a second mapping layer. `network` accepts `mainnet`, `testnet`, `testnet4`, `regtest` and `signet`.
+
+One operation per wallet instance at a time: every method holds the instance until it returns or, for an async one, until it settles, and a call that starts while another is still in flight throws the fixed `the wallet is busy with another operation` error. Await each call before starting the next one.
 
 `syncOnline` and `receiveTransfer` ACK a valid consignment at the same point the native driver does (after apply, before the database commit) and call `transfer.retrieved` once the transfer has been handled, so the proxy can delete it. The wallet transaction is in-memory, so no IndexedDB write happens inside it: the host must call `flush()` after either method to persist the new state. A failed receive drops the transaction and leaves the wallet unchanged; the downloaded consignment and its metadata stay in the wallet files and are reused on the next attempt.
 

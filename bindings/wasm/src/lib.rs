@@ -32,7 +32,8 @@
 //! returned here echoes it. Errors carry the failing operation and the `rgb-lib` message, which
 //! describes settings and state, never key material.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell, RefMut};
+use std::rc::Rc;
 
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -125,6 +126,23 @@ fn multisig_keys(keys: &str) -> Result<MultisigKeys, JsValue> {
 
 fn failure(context: &str, e: Error) -> JsValue {
     JsValue::from_str(&format!("{context}: {e}"))
+}
+
+/// The error of a call that starts while another call still holds the wallet.
+const WALLET_BUSY: &str = "the wallet is busy with another operation";
+
+fn wallet_busy() -> JsValue {
+    JsValue::from_str(WALLET_BUSY)
+}
+
+/// Take exclusive access to a wallet slot for the duration of one operation.
+///
+/// JavaScript can start a second call while an async one is suspended at an await, so a plain
+/// `borrow_mut` would panic there: the non-panicking `try_borrow_mut` returns the busy error
+/// instead.
+fn try_borrow_wallet<T>(slot: &RefCell<Option<T>>) -> Result<RefMut<'_, T>, JsValue> {
+    let slot = slot.try_borrow_mut().map_err(|_| wallet_busy())?;
+    RefMut::filter_map(slot, Option::as_mut).map_err(|_| wallet_busy())
 }
 
 /// Parse an RGB assignment from the core serde shape: `{"Fungible":1000}`, `"NonFungible"`,
@@ -274,7 +292,8 @@ impl WasmInvoice {
 /// A `rgb-lib` singlesig wallet over the in-memory backend.
 #[wasm_bindgen]
 pub struct RgbLibWallet {
-    wallet: Wallet,
+    /// Held for the whole of one call, so a second overlapping call gets the busy error.
+    wallet: Rc<RefCell<Option<Wallet>>>,
     name: String,
     /// This instance's id in the snapshot record; a flush writes it next to the bytes.
     writer: String,
@@ -282,6 +301,13 @@ pub struct RgbLibWallet {
     sequence: Cell<u64>,
     /// Set once this instance deleted its own snapshot: a later flush must not resurrect it.
     detached: Cell<bool>,
+}
+
+impl RgbLibWallet {
+    /// Take the wallet for one operation; a call made while another holds it gets the busy error.
+    fn borrow_wallet(&self) -> Result<RefMut<'_, Wallet>, JsValue> {
+        try_borrow_wallet(&self.wallet)
+    }
 }
 
 /// A fresh writer id at sequence 0: a wallet with no stored record yet.
@@ -303,7 +329,7 @@ impl RgbLibWallet {
             .map_err(|e| failure("cannot create the wallet", e))?;
         let (writer, sequence) = fresh_writer();
         Ok(Self {
-            wallet,
+            wallet: Rc::new(RefCell::new(Some(wallet))),
             name,
             writer,
             sequence,
@@ -334,7 +360,7 @@ impl RgbLibWallet {
         .map_err(|e| failure("cannot restore the wallet", e))?;
         let (writer, sequence) = fresh_writer();
         Ok(Self {
-            wallet,
+            wallet: Rc::new(RefCell::new(Some(wallet))),
             name,
             writer,
             sequence,
@@ -361,7 +387,7 @@ impl RgbLibWallet {
             .map_err(|e| failure("cannot create the watch-only wallet", e))?;
         let (writer, sequence) = fresh_writer();
         Ok(Self {
-            wallet,
+            wallet: Rc::new(RefCell::new(Some(wallet))),
             name,
             writer,
             sequence,
@@ -383,7 +409,7 @@ impl RgbLibWallet {
             .map_err(|e| failure("cannot restore the watch-only wallet", e))?;
         let (writer, sequence) = fresh_writer();
         Ok(Self {
-            wallet,
+            wallet: Rc::new(RefCell::new(Some(wallet))),
             name,
             writer,
             sequence,
@@ -412,7 +438,7 @@ impl RgbLibWallet {
         {
             Some(record) => Wallet::from_snapshot(&record.bytes, wallet_data, keys)
                 .map(|wallet| Self {
-                    wallet,
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
                     name,
                     writer: record.writer,
                     sequence: Cell::new(record.sequence),
@@ -425,7 +451,7 @@ impl RgbLibWallet {
                     .map_err(|e| failure("cannot create the wallet", e))?;
                 let (writer, sequence) = fresh_writer();
                 Ok(Self {
-                    wallet,
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
                     name,
                     writer,
                     sequence,
@@ -436,24 +462,30 @@ impl RgbLibWallet {
     }
 
     /// The wallet name, i.e. the key of its durable snapshot.
-    pub fn name(&self) -> String {
-        self.name.clone()
+    ///
+    /// Unlike the other reads this only touches the instance, but it still takes the guard so a
+    /// long operation cannot be observed half-way through.
+    pub fn name(&self) -> Result<String, JsValue> {
+        let _wallet = self.borrow_wallet()?;
+        Ok(self.name.clone())
     }
 
     /// The wallet identity: the master fingerprint of its keys.
-    pub fn id(&self) -> String {
-        self.wallet.get_keys().master_fingerprint
+    pub fn id(&self) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        Ok(wallet.get_keys().master_fingerprint)
     }
 
     /// Return the BTC balances (in sats) as JSON, from local data only.
     ///
     /// No chain sync is performed, so this reflects the last known state carried by the wallet.
     #[wasm_bindgen(js_name = getBtcBalance)]
-    pub fn get_btc_balance(&mut self) -> Result<String, JsValue> {
-        let balance = self
-            .wallet
+    pub fn get_btc_balance(&self) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let balance = wallet
             .get_btc_balance(None, true)
             .map_err(|e| failure("cannot get the BTC balance", e))?;
+        drop(wallet);
         json_result("cannot serialize the BTC balance", &balance)
     }
 
@@ -464,12 +496,9 @@ impl RgbLibWallet {
     /// `stop_gap` is the unused script count per keychain (default 20). No RGB state is touched
     /// here: use [`RgbLibWallet::sync_online`] to also receive pending RGB transfers.
     #[cfg(target_arch = "wasm32")]
-    pub async fn sync(
-        &mut self,
-        indexer_url: String,
-        stop_gap: Option<u32>,
-    ) -> Result<(), JsValue> {
-        self.wallet
+    pub async fn sync(&self, indexer_url: String, stop_gap: Option<u32>) -> Result<(), JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        wallet
             .sync_async(&indexer_url, stop_gap.map(|gap| gap as usize))
             .await
             .map_err(|e| failure("cannot sync the wallet", e))
@@ -490,16 +519,18 @@ impl RgbLibWallet {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = receiveTransfer)]
     pub async fn receive_transfer(
-        &mut self,
+        &self,
         proxy_url: String,
         indexer_url: String,
         transfer_id: String,
     ) -> Result<String, JsValue> {
-        let idx = self
-            .wallet
-            .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id)
-            .await
-            .map_err(|e| failure("cannot receive the transfer", e))?;
+        let idx = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id)
+                .await
+                .map_err(|e| failure("cannot receive the transfer", e))?
+        };
         json_result("cannot serialize the receive result", &idx)
     }
 
@@ -515,16 +546,18 @@ impl RgbLibWallet {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = syncOnline)]
     pub async fn sync_online(
-        &mut self,
+        &self,
         proxy_url: String,
         indexer_url: String,
         stop_gap: Option<u32>,
     ) -> Result<String, JsValue> {
-        let handled = self
-            .wallet
-            .sync_online_async(&proxy_url, &indexer_url, stop_gap.map(|gap| gap as usize))
-            .await
-            .map_err(|e| failure("cannot sync the wallet online", e))?;
+        let handled = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .sync_online_async(&proxy_url, &indexer_url, stop_gap.map(|gap| gap as usize))
+                .await
+                .map_err(|e| failure("cannot sync the wallet online", e))?
+        };
         json_result("cannot serialize the online sync result", &handled)
     }
 
@@ -539,7 +572,8 @@ impl RgbLibWallet {
         indexer_url: String,
         blocks: u16,
     ) -> Result<f64, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .fee_estimation_async(&indexer_url, blocks)
             .await
             .map_err(|e| failure("cannot estimate the fee", e))
@@ -549,7 +583,8 @@ impl RgbLibWallet {
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = getTipHeight)]
     pub async fn get_tip_height(&self, indexer_url: String) -> Result<u32, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .tip_height_async(&indexer_url)
             .await
             .map_err(|e| failure("cannot get the tip height", e))
@@ -558,30 +593,33 @@ impl RgbLibWallet {
     /// Return the RGB asset balance as JSON, from local data only.
     #[wasm_bindgen(js_name = getAssetBalance)]
     pub fn get_asset_balance(&self, asset_id: String) -> Result<String, JsValue> {
-        let balance = self
-            .wallet
+        let wallet = self.borrow_wallet()?;
+        let balance = wallet
             .get_asset_balance(asset_id)
             .map_err(|e| failure("cannot get the asset balance", e))?;
+        drop(wallet);
         json_result("cannot serialize the asset balance", &balance)
     }
 
     /// Return the RGB asset metadata as JSON.
     #[wasm_bindgen(js_name = getAssetMetadata)]
     pub fn get_asset_metadata(&self, asset_id: String) -> Result<String, JsValue> {
-        let metadata = self
-            .wallet
+        let wallet = self.borrow_wallet()?;
+        let metadata = wallet
             .get_asset_metadata(asset_id)
             .map_err(|e| failure("cannot get the asset metadata", e))?;
+        drop(wallet);
         json_result("cannot serialize the asset metadata", &metadata)
     }
 
     /// List the known RGB assets as JSON, grouped by schema.
     #[wasm_bindgen(js_name = listAssets)]
     pub fn list_assets(&self) -> Result<String, JsValue> {
-        let assets = self
-            .wallet
+        let wallet = self.borrow_wallet()?;
+        let assets = wallet
             .list_assets(vec![])
             .map_err(|e| failure("cannot list the assets", e))?;
+        drop(wallet);
         json_result("cannot serialize the asset list", &assets)
     }
 
@@ -592,10 +630,12 @@ impl RgbLibWallet {
             Some(asset_id) => AssetFilter::Id(asset_id),
             None => AssetFilter::AnyOrNone,
         };
-        let transfers = self
-            .wallet
-            .list_transfers(filter, TransferScope::All)
-            .map_err(|e| failure("cannot list the transfers", e))?;
+        let transfers = {
+            let wallet = self.borrow_wallet()?;
+            wallet
+                .list_transfers(filter, TransferScope::All)
+                .map_err(|e| failure("cannot list the transfers", e))?
+        };
         json_result("cannot serialize the transfer list", &transfers)
     }
 
@@ -603,35 +643,43 @@ impl RgbLibWallet {
     ///
     /// `settled_only` excludes allocations on pending RGB operations.
     #[wasm_bindgen(js_name = listUnspents)]
-    pub fn list_unspents(&mut self, settled_only: bool) -> Result<String, JsValue> {
-        let unspents = self
-            .wallet
-            .list_unspents(None, settled_only, true)
-            .map_err(|e| failure("cannot list the unspents", e))?;
+    pub fn list_unspents(&self, settled_only: bool) -> Result<String, JsValue> {
+        let unspents = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .list_unspents(None, settled_only, true)
+                .map_err(|e| failure("cannot list the unspents", e))?
+        };
         json_result("cannot serialize the unspent list", &unspents)
     }
 
     /// List the known Bitcoin transactions as JSON, newest first, from local data only.
     #[wasm_bindgen(js_name = listTransactions)]
-    pub fn list_transactions(&mut self) -> Result<String, JsValue> {
-        let transactions = self
-            .wallet
-            .list_transactions(None, true)
-            .map_err(|e| failure("cannot list the transactions", e))?;
+    pub fn list_transactions(&self) -> Result<String, JsValue> {
+        let transactions = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .list_transactions(None, true)
+                .map_err(|e| failure("cannot list the transactions", e))?
+        };
         json_result("cannot serialize the transaction list", &transactions)
     }
 
     /// Return the data that defines the wallet as JSON.
     #[wasm_bindgen(js_name = getWalletData)]
     pub fn get_wallet_data(&self) -> Result<String, JsValue> {
-        let wallet_data = self.wallet.get_wallet_data();
+        let wallet_data = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_wallet_data()
+        };
         json_result("cannot serialize the wallet data", &wallet_data)
     }
 
     /// Return a new receive address from the vanilla wallet.
     #[wasm_bindgen(js_name = getAddress)]
-    pub fn get_address(&mut self) -> Result<String, JsValue> {
-        self.wallet
+    pub fn get_address(&self) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        wallet
             .get_address()
             .map_err(|e| failure("cannot derive a receive address", e))
     }
@@ -645,7 +693,7 @@ impl RgbLibWallet {
     /// allocates on an existing colored UTXO; a wallet without one throws the core error.
     #[wasm_bindgen(js_name = blindReceive)]
     pub fn blind_receive(
-        &mut self,
+        &self,
         asset_id: Option<String>,
         assignment: String,
         expiration_timestamp: u64,
@@ -654,18 +702,20 @@ impl RgbLibWallet {
     ) -> Result<String, JsValue> {
         let assignment = parse_assignment(&assignment)?;
         let encryption = parse_encryption(encryption)?;
-        let receive_data = self
-            .wallet
-            .blind_receive(
-                None,
-                asset_id,
-                assignment,
-                expiration_timestamp,
-                vec![],
-                min_confirmations,
-                encryption,
-            )
-            .map_err(|e| failure("cannot create the blind receive", e))?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .blind_receive(
+                    None,
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    vec![],
+                    min_confirmations,
+                    encryption,
+                )
+                .map_err(|e| failure("cannot create the blind receive", e))?
+        };
         json_result("cannot serialize the receive data", &receive_data)
     }
 
@@ -675,7 +725,7 @@ impl RgbLibWallet {
     /// recipient is a new script and no colored UTXO is needed.
     #[wasm_bindgen(js_name = witnessReceive)]
     pub fn witness_receive(
-        &mut self,
+        &self,
         asset_id: Option<String>,
         assignment: String,
         expiration_timestamp: u64,
@@ -684,18 +734,20 @@ impl RgbLibWallet {
     ) -> Result<String, JsValue> {
         let assignment = parse_assignment(&assignment)?;
         let encryption = parse_encryption(encryption)?;
-        let receive_data = self
-            .wallet
-            .witness_receive(
-                None,
-                asset_id,
-                assignment,
-                expiration_timestamp,
-                vec![],
-                min_confirmations,
-                encryption,
-            )
-            .map_err(|e| failure("cannot create the witness receive", e))?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .witness_receive(
+                    None,
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    vec![],
+                    min_confirmations,
+                    encryption,
+                )
+                .map_err(|e| failure("cannot create the witness receive", e))?
+        };
         json_result("cannot serialize the receive data", &receive_data)
     }
 
@@ -712,7 +764,8 @@ impl RgbLibWallet {
         precision: u8,
         amounts: Vec<u64>,
     ) -> Result<String, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .issue_asset_nia(ticker, name, precision, amounts)
             .map(|asset| asset.asset_id)
             .map_err(|e| failure("cannot issue the asset", e))
@@ -729,7 +782,8 @@ impl RgbLibWallet {
         details: Option<String>,
         precision: u8,
     ) -> Result<String, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .issue_asset_uda(ticker, name, details, precision, None, vec![])
             .map(|asset| asset.asset_id)
             .map_err(|e| failure("cannot issue the asset", e))
@@ -747,7 +801,8 @@ impl RgbLibWallet {
         precision: u8,
         amounts: Vec<u64>,
     ) -> Result<String, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .issue_asset_cfa(name, details, precision, amounts, None)
             .map(|asset| asset.asset_id)
             .map_err(|e| failure("cannot issue the asset", e))
@@ -767,7 +822,8 @@ impl RgbLibWallet {
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
     ) -> Result<String, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .issue_asset_ifa(
                 ticker,
                 name,
@@ -785,7 +841,8 @@ impl RgbLibWallet {
     /// The wallet must have private keys; a watch-only wallet returns an error.
     #[wasm_bindgen(js_name = signPsbt)]
     pub fn sign_psbt(&self, psbt: String) -> Result<String, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .sign_psbt(psbt, None)
             .map_err(|e| failure("cannot sign the PSBT", e))
     }
@@ -793,7 +850,8 @@ impl RgbLibWallet {
     /// Finalize a signed PSBT and return the finalized PSBT.
     #[wasm_bindgen(js_name = finalizePsbt)]
     pub fn finalize_psbt(&self, psbt: String) -> Result<String, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .finalize_psbt(psbt, None)
             .map_err(|e| failure("cannot finalize the PSBT", e))
     }
@@ -808,14 +866,16 @@ impl RgbLibWallet {
         batch_transfer_idx: Option<i32>,
         no_asset_only: bool,
     ) -> Result<bool, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .delete_transfers(batch_transfer_idx, no_asset_only)
             .map_err(|e| failure("cannot delete the transfers", e))
     }
 
     /// Serialize the whole wallet state into bytes for the host to store.
     pub fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .snapshot()
             .map_err(|e| failure("cannot serialize the wallet", e))?
             .ok_or_else(|| JsValue::from_str("the wallet runs without a snapshot-capable backend"))
@@ -827,7 +887,8 @@ impl RgbLibWallet {
     /// snapshot envelope instead of a wallet directory. The password derives the key and is never
     /// stored or logged.
     pub fn backup(&self, password: String) -> Result<Vec<u8>, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .backup_bytes(&password)
             .map_err(|e| failure("cannot create the backup", e))
     }
@@ -837,24 +898,23 @@ impl RgbLibWallet {
     /// The backup must belong to the wallet keys already held here: the shared restore path
     /// validates them and rebuilds the database, BDK state and files from the backup snapshot. A
     /// wrong password, a different wallet or a corrupt archive is an error, never a fresh wallet.
+    /// The new wallet replaces the old one under the operation guard, so an overlapping call can
+    /// never observe a half-swapped instance; the snapshot sequence and writer stay unchanged, so
+    /// the next `flush` is still guarded against a newer stored record.
     #[wasm_bindgen(js_name = restoreBackup)]
-    pub fn restore_backup(
-        &mut self,
-        backup_bytes: Vec<u8>,
-        password: String,
-    ) -> Result<(), JsValue> {
+    pub fn restore_backup(&self, backup_bytes: Vec<u8>, password: String) -> Result<(), JsValue> {
+        // the key derivation is slow: do it before taking the guard
         let restored = core_restore_backup_bytes(&backup_bytes, &password)
             .map_err(|e| failure("cannot restore the backup", e))?;
         let snapshot = restored
             .wallet_snapshot()
             .map_err(|e| failure("cannot restore the backup", e))?;
-        let wallet = Wallet::from_snapshot(
-            &snapshot,
-            self.wallet.get_wallet_data(),
-            self.wallet.get_keys(),
-        )
-        .map_err(|e| failure("cannot restore the backup", e))?;
-        self.wallet = wallet;
+        let mut slot = self.wallet.try_borrow_mut().map_err(|_| wallet_busy())?;
+        let current = slot.as_ref().ok_or_else(wallet_busy)?;
+        let wallet =
+            Wallet::from_snapshot(&snapshot, current.get_wallet_data(), current.get_keys())
+                .map_err(|e| failure("cannot restore the backup", e))?;
+        *slot = Some(wallet);
         Ok(())
     }
 
@@ -866,12 +926,19 @@ impl RgbLibWallet {
     /// sequence for the next call. After `deleteSnapshot` this instance is detached and every flush
     /// fails instead of recreating the deleted record.
     pub async fn flush(&self) -> Result<(), JsValue> {
+        // held across the write: an overlapping flush or any other call gets the busy error
+        let wallet = self.borrow_wallet()?;
         if self.detached.get() {
             return Err(JsValue::from_str(
                 "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",
             ));
         }
-        let bytes = self.snapshot()?;
+        let bytes = wallet
+            .snapshot()
+            .map_err(|e| failure("cannot serialize the wallet", e))?
+            .ok_or_else(|| {
+                JsValue::from_str("the wallet runs without a snapshot-capable backend")
+            })?;
         let sequence = save_snapshot_record(&self.name, &bytes, &self.writer, self.sequence.get())
             .await
             .map_err(|e| failure("cannot persist the wallet", e))?;
@@ -889,6 +956,8 @@ impl RgbLibWallet {
     /// instance.
     #[wasm_bindgen(js_name = deleteSnapshot)]
     pub async fn delete_snapshot(&self, name: String) -> Result<(), JsValue> {
+        // held across the delete, so a flush cannot recreate the record while it is being removed
+        let _wallet = self.borrow_wallet()?;
         if name != self.name {
             return Err(JsValue::from_str(&format!(
                 "cannot delete the snapshot '{name}': this wallet stores its snapshot under '{}'",
@@ -910,7 +979,8 @@ impl RgbLibWallet {
 /// `goOnline`, voting, sends) need the native-only `_online` feature and are not exposed.
 #[wasm_bindgen]
 pub struct RgbLibMultisigWallet {
-    wallet: MultisigWallet,
+    /// Held for the whole of one call, so a second overlapping call gets the busy error.
+    wallet: Rc<RefCell<Option<MultisigWallet>>>,
     name: String,
     /// This instance's id in the snapshot record; a flush writes it next to the bytes.
     writer: String,
@@ -918,6 +988,13 @@ pub struct RgbLibMultisigWallet {
     sequence: Cell<u64>,
     /// Set once this instance deleted its own snapshot: a later flush must not resurrect it.
     detached: Cell<bool>,
+}
+
+impl RgbLibMultisigWallet {
+    /// Take the wallet for one operation; a call made while another holds it gets the busy error.
+    fn borrow_wallet(&self) -> Result<RefMut<'_, MultisigWallet>, JsValue> {
+        try_borrow_wallet(&self.wallet)
+    }
 }
 
 #[wasm_bindgen]
@@ -939,7 +1016,7 @@ impl RgbLibMultisigWallet {
             .map_err(|e| failure("cannot create the multisig wallet", e))?;
         let (writer, sequence) = fresh_writer();
         Ok(Self {
-            wallet,
+            wallet: Rc::new(RefCell::new(Some(wallet))),
             name,
             writer,
             sequence,
@@ -961,7 +1038,7 @@ impl RgbLibMultisigWallet {
             .map_err(|e| failure("cannot restore the multisig wallet", e))?;
         let (writer, sequence) = fresh_writer();
         Ok(Self {
-            wallet,
+            wallet: Rc::new(RefCell::new(Some(wallet))),
             name,
             writer,
             sequence,
@@ -988,7 +1065,7 @@ impl RgbLibMultisigWallet {
         {
             Some(record) => MultisigWallet::from_snapshot(&record.bytes, wallet_data, keys)
                 .map(|wallet| Self {
-                    wallet,
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
                     name,
                     writer: record.writer,
                     sequence: Cell::new(record.sequence),
@@ -1000,7 +1077,7 @@ impl RgbLibMultisigWallet {
                     .map_err(|e| failure("cannot create the multisig wallet", e))?;
                 let (writer, sequence) = fresh_writer();
                 Ok(Self {
-                    wallet,
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
                     name,
                     writer,
                     sequence,
@@ -1011,34 +1088,48 @@ impl RgbLibMultisigWallet {
     }
 
     /// The wallet name, i.e. the key of its durable snapshot.
-    pub fn name(&self) -> String {
-        self.name.clone()
+    ///
+    /// Takes the guard like every other call, so an overlapping operation is reported instead of
+    /// being observed half-way through.
+    pub fn name(&self) -> Result<String, JsValue> {
+        let _wallet = self.borrow_wallet()?;
+        Ok(self.name.clone())
     }
 
     /// The wallet identity, derived from the descriptors: a multisig group has no single master
     /// fingerprint.
-    pub fn id(&self) -> String {
-        self.wallet.get_wallet_id()
+    pub fn id(&self) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        Ok(wallet.get_wallet_id())
     }
 
     /// Return the data that defines the wallet as JSON.
     #[wasm_bindgen(js_name = getWalletData)]
     pub fn get_wallet_data(&self) -> Result<String, JsValue> {
-        let wallet_data = self.wallet.get_wallet_data();
+        let wallet_data = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_wallet_data()
+        };
         json_result("cannot serialize the wallet data", &wallet_data)
     }
 
     /// Return the cosigners and thresholds of the wallet as JSON.
     #[wasm_bindgen(js_name = getKeys)]
     pub fn get_keys(&self) -> Result<String, JsValue> {
-        let keys = self.wallet.get_keys();
+        let keys = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_keys()
+        };
         json_result("cannot serialize the multisig keys", &keys)
     }
 
     /// Return the colored and vanilla descriptors of the wallet as JSON.
     #[wasm_bindgen(js_name = getDescriptors)]
     pub fn get_descriptors(&self) -> Result<String, JsValue> {
-        let descriptors = self.wallet.get_descriptors();
+        let descriptors = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_descriptors()
+        };
         json_result("cannot serialize the descriptors", &descriptors)
     }
 
@@ -1047,13 +1138,15 @@ impl RgbLibMultisigWallet {
     /// Unlike the native, hub-coordinated `getAddress`, this neither reveals nor persists the
     /// index: every cosigner derives the same address for the same `index`.
     #[wasm_bindgen(js_name = getAddress)]
-    pub fn get_address(&self, index: u32) -> String {
-        self.wallet.peek_address(index)
+    pub fn get_address(&self, index: u32) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        Ok(wallet.peek_address(index))
     }
 
     /// Serialize the whole wallet state into bytes for the host to store.
     pub fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        self.wallet
+        let wallet = self.borrow_wallet()?;
+        wallet
             .snapshot()
             .map_err(|e| failure("cannot serialize the wallet", e))?
             .ok_or_else(|| JsValue::from_str("the wallet runs without a snapshot-capable backend"))
@@ -1065,12 +1158,19 @@ impl RgbLibMultisigWallet {
     /// names the stored sequence and its writer. Call `load` again to adopt the newer state. After
     /// `deleteSnapshot` this instance is detached and every flush fails.
     pub async fn flush(&self) -> Result<(), JsValue> {
+        // held across the write: an overlapping flush or any other call gets the busy error
+        let wallet = self.borrow_wallet()?;
         if self.detached.get() {
             return Err(JsValue::from_str(
                 "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",
             ));
         }
-        let bytes = self.snapshot()?;
+        let bytes = wallet
+            .snapshot()
+            .map_err(|e| failure("cannot serialize the wallet", e))?
+            .ok_or_else(|| {
+                JsValue::from_str("the wallet runs without a snapshot-capable backend")
+            })?;
         let sequence = save_snapshot_record(&self.name, &bytes, &self.writer, self.sequence.get())
             .await
             .map_err(|e| failure("cannot persist the wallet", e))?;
@@ -1086,6 +1186,8 @@ impl RgbLibMultisigWallet {
     /// `0` deliberately.
     #[wasm_bindgen(js_name = deleteSnapshot)]
     pub async fn delete_snapshot(&self, name: String) -> Result<(), JsValue> {
+        // held across the delete, so a flush cannot recreate the record while it is being removed
+        let _wallet = self.borrow_wallet()?;
         if name != self.name {
             return Err(JsValue::from_str(&format!(
                 "cannot delete the snapshot '{name}': this wallet stores its snapshot under '{}'",
@@ -1097,5 +1199,107 @@ impl RgbLibMultisigWallet {
             .map_err(|e| failure("cannot delete the wallet snapshot", e))?;
         self.detached.set(true);
         Ok(())
+    }
+}
+
+/// Re-entrancy guard coverage, run in a real browser by the `wasm_browser_lifecycle` CI job.
+///
+/// A JavaScript host can start a second call while an async method is suspended at an await. The
+/// guard must report that overlap as the busy error, never panic in `borrow_mut` or alias the
+/// wallet. An async method cannot be suspended on purpose here (no network in the test), so the
+/// borrow an in-flight operation holds is simulated directly and the public methods are observed
+/// around it.
+#[cfg(test)]
+mod tests {
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use super::*;
+    use rgb_lib::wallet::Cosigner;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A fixed BIP-39 phrase: every wallet below is built offline, nothing touches the chain.
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn singlesig(name: &str) -> RgbLibWallet {
+        RgbLibWallet::create(
+            name.to_string(),
+            MNEMONIC.to_string(),
+            "regtest".to_string(),
+        )
+        .expect("the wallet is created offline")
+    }
+
+    fn multisig() -> RgbLibMultisigWallet {
+        let cosigner = || {
+            let keys = core_generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+            Cosigner {
+                account_xpub_vanilla: keys.account_xpub_vanilla,
+                account_xpub_colored: keys.account_xpub_colored,
+                vanilla_keychain: None,
+                master_fingerprint: keys.master_fingerprint,
+            }
+        };
+        let keys = MultisigKeys::new(vec![cosigner(), cosigner()], 2, 2);
+        RgbLibMultisigWallet::create(
+            "busy-multisig".to_string(),
+            serde_json::to_string(&keys).expect("the multisig keys serialize"),
+            "regtest".to_string(),
+        )
+        .expect("the multisig wallet is created offline")
+    }
+
+    fn message(err: JsValue) -> String {
+        err.as_string().expect("the bindings throw a string")
+    }
+
+    /// The second call on a held instance reports the busy error; once the first operation ends
+    /// the same instance serves the next call.
+    #[wasm_bindgen_test]
+    fn overlapping_calls_are_rejected() {
+        let wallet = singlesig("busy-test");
+        // stand in for an async operation suspended at an await
+        let slot = Rc::clone(&wallet.wallet);
+        let held = slot.try_borrow_mut().expect("the fresh wallet is free");
+
+        for err in [
+            wallet.get_btc_balance().unwrap_err(),
+            wallet.snapshot().unwrap_err(),
+            wallet.name().unwrap_err(),
+            wallet.id().unwrap_err(),
+            wallet.get_wallet_data().unwrap_err(),
+            wallet.list_assets().unwrap_err(),
+            wallet.get_address().unwrap_err(),
+        ] {
+            assert_eq!(message(err), WALLET_BUSY);
+        }
+
+        drop(held);
+        // the first operation finished: the same instance is usable and its state advanced
+        assert_eq!(wallet.name().unwrap(), "busy-test");
+        assert_eq!(wallet.id().unwrap().len(), 8);
+        assert!(!wallet.get_btc_balance().unwrap().is_empty());
+        assert!(wallet.get_address().unwrap().starts_with("bcrt1"));
+    }
+
+    /// The multisig class carries the same guard.
+    #[wasm_bindgen_test]
+    fn overlapping_multisig_calls_are_rejected() {
+        let wallet = multisig();
+        let slot = Rc::clone(&wallet.wallet);
+        let held = slot.try_borrow_mut().expect("the fresh wallet is free");
+
+        for err in [
+            wallet.name().unwrap_err(),
+            wallet.id().unwrap_err(),
+            wallet.get_address(0).unwrap_err(),
+        ] {
+            assert_eq!(message(err), WALLET_BUSY);
+        }
+
+        drop(held);
+        assert_eq!(wallet.name().unwrap(), "busy-multisig");
+        assert!(wallet.get_address(0).unwrap().starts_with("bcrt1"));
+        assert!(!wallet.snapshot().unwrap().is_empty());
     }
 }
