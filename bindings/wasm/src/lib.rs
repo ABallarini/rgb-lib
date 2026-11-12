@@ -1214,13 +1214,18 @@ impl RgbLibMultisigWallet {
     }
 }
 
-/// Re-entrancy guard coverage, run in a real browser by the `wasm_browser_lifecycle` CI job.
+/// Browser coverage for the bindings, run by the `wasm_browser_lifecycle` CI job.
 ///
-/// A JavaScript host can start a second call while an async method is suspended at an await. The
-/// guard must report that overlap as the busy error, never panic in `borrow_mut` or alias the
-/// wallet. An async method cannot be suspended on purpose here (no network in the test), so the
-/// borrow an in-flight operation holds is simulated directly and the public methods are observed
-/// around it.
+/// The tests create real wallets over the in-memory backend, so the durable paths go through a
+/// real IndexedDB. The required CI job has no indexer and no proxy: network coverage uses a
+/// refused local URL and pins the sanitized error, while a real receive stays in the opt-in
+/// `regtest_proxy_receive_smoke` of the root crate.
+///
+/// The re-entrancy tests cover the operation guard: a JavaScript host can start a second call
+/// while an async method is suspended at an await, so the overlap must be the busy error and
+/// never a panic in `borrow_mut` or an aliased wallet. An async method cannot be suspended on
+/// purpose without a service, so the borrow an in-flight operation holds is simulated directly
+/// and the public methods are observed around it.
 #[cfg(test)]
 mod tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -1233,6 +1238,9 @@ mod tests {
     /// A fixed BIP-39 phrase: every wallet below is built offline, nothing touches the chain.
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
+    /// A local port with no listener, so a browser request fails with a connection error.
+    const REFUSED_URL: &str = "http://127.0.0.1:65534";
+
     fn singlesig(name: &str) -> RgbLibWallet {
         RgbLibWallet::create(
             name.to_string(),
@@ -1242,7 +1250,7 @@ mod tests {
         .expect("the wallet is created offline")
     }
 
-    fn multisig() -> RgbLibMultisigWallet {
+    fn multisig_keys() -> MultisigKeys {
         let cosigner = || {
             let keys = core_generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
             Cosigner {
@@ -1252,10 +1260,17 @@ mod tests {
                 master_fingerprint: keys.master_fingerprint,
             }
         };
-        let keys = MultisigKeys::new(vec![cosigner(), cosigner()], 2, 2);
+        MultisigKeys::new(vec![cosigner(), cosigner()], 2, 2)
+    }
+
+    fn multisig_keys_json() -> String {
+        serde_json::to_string(&multisig_keys()).expect("the multisig keys serialize")
+    }
+
+    fn multisig() -> RgbLibMultisigWallet {
         RgbLibMultisigWallet::create(
             "busy-multisig".to_string(),
-            serde_json::to_string(&keys).expect("the multisig keys serialize"),
+            multisig_keys_json(),
             "regtest".to_string(),
         )
         .expect("the multisig wallet is created offline")
@@ -1263,6 +1278,178 @@ mod tests {
 
     fn message(err: JsValue) -> String {
         err.as_string().expect("the bindings throw a string")
+    }
+
+    /// Whether `haystack` carries `needle`; used to assert no secret leaks into a snapshot or an
+    /// error, without repeating the secret in a failure message.
+    fn carries(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Create, flush and drop a wallet, then `load` it back: the sequence guard accepts both
+    /// writes and the restored wallet hands out the address derived after the last flush.
+    #[wasm_bindgen_test]
+    async fn durable_wallet_round_trip_over_indexed_db() {
+        const NAME: &str = "binding-durable-e2e";
+        core_delete_snapshot(NAME).await.unwrap();
+
+        let wallet = singlesig(NAME);
+        let first_address = wallet.get_address().unwrap();
+        let id = wallet.id().unwrap();
+        let snapshot = wallet.snapshot().unwrap();
+        assert!(!snapshot.is_empty());
+        assert!(
+            !carries(&snapshot, MNEMONIC.as_bytes()),
+            "the snapshot carries the mnemonic"
+        );
+        // the first write starts at sequence 0; the second proves the instance adopts its own
+        // committed sequence instead of being rejected as stale
+        wallet.flush().await.unwrap();
+        wallet.flush().await.unwrap();
+        let next_address = wallet.get_address().unwrap();
+        assert_ne!(next_address, first_address);
+        drop(wallet);
+
+        let loaded = RgbLibWallet::load(
+            NAME.to_string(),
+            MNEMONIC.to_string(),
+            "regtest".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.id().unwrap(), id);
+        assert_eq!(
+            loaded.get_address().unwrap(),
+            next_address,
+            "the loaded wallet did not resume at the stored address index"
+        );
+
+        loaded.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+    }
+
+    /// Deleting the record detaches the instance: its flush is refused, and a new `load` under
+    /// the same name starts from a fresh wallet instead of resurrecting the deleted snapshot.
+    #[wasm_bindgen_test]
+    async fn deleting_the_snapshot_detaches_and_restarts_fresh() {
+        const NAME: &str = "binding-delete-e2e";
+        core_delete_snapshot(NAME).await.unwrap();
+
+        let wallet = singlesig(NAME);
+        let first_address = wallet.get_address().unwrap();
+        wallet.flush().await.unwrap();
+
+        wallet.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+
+        let err = message(wallet.flush().await.unwrap_err());
+        assert_eq!(
+            err,
+            "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+
+        // no record exists, so load creates a fresh wallet at sequence 0 and the first address
+        let fresh = RgbLibWallet::load(
+            NAME.to_string(),
+            MNEMONIC.to_string(),
+            "regtest".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh.get_address().unwrap(), first_address);
+        fresh.flush().await.unwrap();
+        fresh.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+    }
+
+    /// A refused indexer is a sanitized error, never a panic, and the wallet stays usable.
+    #[wasm_bindgen_test]
+    async fn refused_indexer_is_a_sanitized_error_and_keeps_the_wallet_usable() {
+        let wallet = singlesig("binding-sync-e2e");
+        let err = message(
+            wallet
+                .sync(REFUSED_URL.to_string(), Some(2))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            err.starts_with("cannot sync the wallet: Indexer error:"),
+            "unexpected sync error: {err}"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+        assert_eq!(wallet.name().unwrap(), "binding-sync-e2e");
+        assert!(wallet.get_address().unwrap().starts_with("bcrt1"));
+    }
+
+    /// With no pending transfer, both online methods reject with their documented prefix and a
+    /// sanitized transport error; no proxy or indexer service exists in the required job.
+    #[wasm_bindgen_test]
+    async fn receive_and_online_sync_without_a_transfer_fail_cleanly() {
+        let wallet = singlesig("binding-online-e2e");
+        // a transfer ID no pending invoice of this fresh wallet matches
+        let transfer_id = "0".repeat(64);
+        let err = message(
+            wallet
+                .receive_transfer(
+                    REFUSED_URL.to_string(),
+                    REFUSED_URL.to_string(),
+                    transfer_id,
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            err.starts_with("cannot receive the transfer:"),
+            "unexpected receive error: {err}"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+
+        // syncOnline scans first, so the refused indexer is the clean documented failure
+        let err = message(
+            wallet
+                .sync_online(REFUSED_URL.to_string(), REFUSED_URL.to_string(), Some(2))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            err.starts_with("cannot sync the wallet online:"),
+            "unexpected online sync error: {err}"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+        assert!(wallet.get_address().unwrap().starts_with("bcrt1"));
+    }
+
+    /// The hub-free multisig class carries the same durable round trip: descriptors and id survive
+    /// a flush and load, and the loaded instance adopts the stored sequence.
+    #[wasm_bindgen_test]
+    async fn multisig_durable_round_trip_over_indexed_db() {
+        const NAME: &str = "binding-multisig-e2e";
+        core_delete_snapshot(NAME).await.unwrap();
+        let keys = multisig_keys_json();
+
+        let wallet =
+            RgbLibMultisigWallet::create(NAME.to_string(), keys.clone(), "regtest".to_string())
+                .unwrap();
+        let address = wallet.get_address(7).unwrap();
+        let id = wallet.id().unwrap();
+        let descriptors = wallet.get_descriptors().unwrap();
+        wallet.flush().await.unwrap();
+        drop(wallet);
+
+        let loaded = RgbLibMultisigWallet::load(NAME.to_string(), keys, "regtest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(loaded.id().unwrap(), id);
+        assert_eq!(loaded.get_descriptors().unwrap(), descriptors);
+        assert_eq!(loaded.get_address(7).unwrap(), address);
+        // load adopted the stored sequence, so the next guarded write is accepted
+        loaded.flush().await.unwrap();
+
+        loaded.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
     }
 
     /// The second call on a held instance reports the busy error; once the first operation ends

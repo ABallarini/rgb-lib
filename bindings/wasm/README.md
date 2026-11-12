@@ -51,6 +51,8 @@ node bindings/wasm/smoke/smoke.cjs
 
 The smoke script has no IndexedDB or indexer, so it covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`), the out-of-band `witnessReceive` invoice and the `blindReceive` core error without a colored UTXO, snapshot and restore, the encrypted backup round trip (bytes out, public metadata, restore, wrong password), key generation and restore, watch-only creation/restore, the hub-free multisig subset, invoice parsing, the invalid-consignment rejection, the offline rejection of an invalid `checkProxyUrl` endpoint and the re-entrant call guard (a second call while a `sync` is in flight throws `the wallet is busy with another operation`); `flush()`/`load()`, the online `sync`/`getTipHeight`/`getFeeEstimation` and a reachable proxy are covered by the browser demo and the opt-in regtest smoke.
 
+CI runs the binding's own `wasm-bindgen-test` suite in headless Chrome: `create`, `getAddress`, `flush`, drop and `load` restore the wallet at the next address, `deleteSnapshot` removes the record and a later `flush` on the detached instance throws, the hub-free multisig wallet survives a flush/load round trip, and a refused local indexer and a transfer with no pending proxy invoice reject with sanitized errors while the wallet stays usable; a real proxy receive needs the opt-in regtest smoke, so it is not part of required CI.
+
 ## API
 
 | Item | Description |

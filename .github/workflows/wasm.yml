@@ -62,9 +62,12 @@ jobs:
 
   # Required browser proof: the wallet lifecycle test creates a wallet over the in-memory backend,
   # snapshots it, persists the snapshot in IndexedDB, restores the wallet from the stored bytes and
-  # checks the state survived. It needs a real browser, so it cannot run in the local gate
-  # (`scripts/wasm_gate.sh`), which stops at the compile checks. The job also compiles the opt-in
-  # regtest Esplora smoke test, which returns early without `RGB_REGTEST_ESPLORA_URL`.
+  # checks the state survived. The bindings crate runs its own suite in the same job: create, flush,
+  # load and delete over IndexedDB, a multisig round trip, and the sanitized errors of a refused
+  # indexer and a missing proxy transfer. It needs a real browser, so it cannot run in the local
+  # gate (`scripts/wasm_gate.sh`), which stops at the compile checks. The job also compiles the
+  # opt-in regtest Esplora smoke test, which returns early without `RGB_REGTEST_ESPLORA_URL`, and a
+  # real proxy receive stays in the opt-in regtest smoke.
   wasm_browser_lifecycle:
     timeout-minutes: 30
     runs-on: ubuntu-latest
@@ -92,16 +95,18 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/wasm-logs"
           cargo test --lib --target wasm32-unknown-unknown --no-default-features --features wallet,esplora_async 2>&1 \
             | tee "${RUNNER_TEMP}/wasm-logs/browser-lifecycle.log"
-      - name: Run the re-entrant call guard test in headless Chrome
+      - name: Run the bindings browser E2E tests in headless Chrome
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           WASM_BINDGEN_TEST_TIMEOUT: 300
-        # the bindings crate is its own workspace: a second call on an instance still holding the
-        # wallet must throw the busy error, so the guard and its two classes are pinned here
+        # the bindings crate is its own workspace: the operation guard plus the durable lifecycle
+        # (create/getAddress/flush/load/deleteSnapshot), the multisig round trip and the refused-URL
+        # errors run here. No indexer or proxy service is started.
         run: |
           set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/wasm-logs"
           cargo test --manifest-path bindings/wasm/Cargo.toml --lib --target wasm32-unknown-unknown 2>&1 \
-            | tee "${RUNNER_TEMP}/wasm-logs/bindings-reentrancy.log"
+            | tee "${RUNNER_TEMP}/wasm-logs/bindings-e2e.log"
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
