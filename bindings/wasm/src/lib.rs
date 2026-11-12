@@ -510,9 +510,10 @@ impl RgbLibWallet {
     /// endpoint used for the chain answers the validation needs and for broadcasting a released
     /// signed TX, and `transfer_id` the proxy transfer ID. The transfer must belong to a pending
     /// incoming invoice of this wallet: a repeated call on an already handled transfer is a no-op
-    /// and a transfer not addressed to this wallet throws. The whole receive, including the ACK
-    /// and `transfer.retrieved`, happens in one wallet transaction; a failure rolls it back. Call
-    /// `flush()` afterwards to persist the new state.
+    /// and a transfer not addressed to this wallet throws. The whole receive, including the ACK,
+    /// happens in one wallet transaction; a failure rolls it back. This call flushes the new state
+    /// before releasing the proxy data, so a failed flush leaves the release pending for the next
+    /// call instead of deleting the only copy of the consignment.
     ///
     /// Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already
     /// handled before this call.
@@ -524,13 +525,15 @@ impl RgbLibWallet {
         indexer_url: String,
         transfer_id: String,
     ) -> Result<String, JsValue> {
-        let idx = {
-            let mut wallet = self.borrow_wallet()?;
-            wallet
-                .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id)
-                .await
-                .map_err(|e| failure("cannot receive the transfer", e))?
-        };
+        let mut wallet = self.borrow_wallet()?;
+        let idx = wallet
+            .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id)
+            .await
+            .map_err(|e| failure("cannot receive the transfer", e))?;
+        // the release marker is in the snapshot only once this resolves: post after it
+        self.flush_wallet(&wallet).await?;
+        wallet.release_pending_retrievals(&indexer_url).await;
+        drop(wallet);
         json_result("cannot serialize the receive result", &idx)
     }
 
@@ -539,8 +542,9 @@ impl RgbLibWallet {
     /// Runs the read-only BDK full scan, then lists the transfers of each pending incoming invoice
     /// on `proxy_url`, receiving and ACKing each one through the same shared driver as
     /// [`RgbLibWallet::receive_transfer`]. Only `Pending` transfers addressed to this wallet are
-    /// considered and an already handled one is skipped, so a repeated call is idempotent. Call
-    /// `flush()` afterwards to persist the new state.
+    /// considered and an already handled one is skipped, so a repeated call is idempotent. This
+    /// call flushes the new state before releasing the proxy data of the handled transfers; a
+    /// failed flush returns its error and leaves every release pending for the next call.
     ///
     /// Returns JSON: the array of `batch_transfer_idx` handled by this call, in processing order.
     #[cfg(target_arch = "wasm32")]
@@ -551,13 +555,15 @@ impl RgbLibWallet {
         indexer_url: String,
         stop_gap: Option<u32>,
     ) -> Result<String, JsValue> {
-        let handled = {
-            let mut wallet = self.borrow_wallet()?;
-            wallet
-                .sync_online_async(&proxy_url, &indexer_url, stop_gap.map(|gap| gap as usize))
-                .await
-                .map_err(|e| failure("cannot sync the wallet online", e))?
-        };
+        let mut wallet = self.borrow_wallet()?;
+        let handled = wallet
+            .sync_online_async(&proxy_url, &indexer_url, stop_gap.map(|gap| gap as usize))
+            .await
+            .map_err(|e| failure("cannot sync the wallet online", e))?;
+        // same order as receiveTransfer, for every release the handled transfers left behind
+        self.flush_wallet(&wallet).await?;
+        wallet.release_pending_retrievals(&indexer_url).await;
+        drop(wallet);
         json_result("cannot serialize the online sync result", &handled)
     }
 
@@ -928,6 +934,12 @@ impl RgbLibWallet {
     pub async fn flush(&self) -> Result<(), JsValue> {
         // held across the write: an overlapping flush or any other call gets the busy error
         let wallet = self.borrow_wallet()?;
+        self.flush_wallet(&wallet).await
+    }
+
+    /// Flush while the caller already holds the operation guard, so a receive and its snapshot
+    /// write cannot be interleaved with another call.
+    async fn flush_wallet(&self, wallet: &Wallet) -> Result<(), JsValue> {
         if self.detached.get() {
             return Err(JsValue::from_str(
                 "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",

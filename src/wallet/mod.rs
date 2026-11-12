@@ -102,6 +102,11 @@ pub(crate) use indexer::Indexer;
     feature = "_online",
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
+pub(crate) use objects::PendingRetrieval;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use objects::ProxyReceiveData;
 #[cfg(any(
     feature = "_online",
