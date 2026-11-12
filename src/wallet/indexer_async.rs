@@ -37,7 +37,7 @@ use bdk_esplora::esplora_client::{
 };
 use rgbstd::bitcoin::constants::ChainHash;
 use rgbstd::vm::WitnessPos;
-use wasm_bindgen::{JsCast, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
 use crate::{error::IndexerError, utils::INDEXER_RETRIES, utils::INDEXER_TIMEOUT};
 
@@ -52,56 +52,73 @@ use super::*;
 /// matched by their normalized URL, so a trailing slash on `base` makes no difference. A browser
 /// without `AbortSignal.any` or `AbortSignal.timeout` gets a plain `fetch` with `no-store` and no
 /// deadline: the request is then bounded only by the network stack.
-#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-function normalizeBase(value) {
-    return String(value).replace(/\/+$/, '');
-}
+fn install_esplora_request_timeout(base: &str, timeout_millis: u32) -> Result<(), IndexerError> {
+    let global = js_sys::global();
+    let key = |name: &str| JsValue::from_str(name);
+    let internal = |details: &str| IndexerError::Internal {
+        details: details.to_string(),
+    };
 
-function timeoutFor(url) {
-    const timeouts = globalThis.__rgbLibEsploraTimeouts;
-    if (!timeouts) return undefined;
-    const target = normalizeBase(url);
-    for (const [base, millis] of timeouts) {
-        if (target === base || target.startsWith(base + '/')) return millis;
+    let timeouts = js_sys::Reflect::get(&global, &key("__rgbLibEsploraTimeouts"))
+        .map_err(|_| internal("cannot read the Esplora timeout registry"))?;
+    let timeouts = if timeouts.is_undefined() || timeouts.is_null() {
+        let map: JsValue = js_sys::Object::new().into();
+        js_sys::Reflect::set(&global, &key("__rgbLibEsploraTimeouts"), &map)
+            .map_err(|_| internal("cannot create the Esplora timeout registry"))?;
+        map
+    } else {
+        timeouts
+    };
+    let normalized = base.trim_end_matches('/');
+    js_sys::Reflect::set(
+        &timeouts,
+        &JsValue::from_str(normalized),
+        &JsValue::from_f64(f64::from(timeout_millis)),
+    )
+    .map_err(|_| internal("cannot register the Esplora timeout"))?;
+
+    let wrapped = js_sys::Reflect::get(&global, &key("__rgbLibEsploraWrapped"))
+        .map_err(|_| internal("cannot read the fetch wrapper state"))?;
+    if wrapped.is_truthy() {
+        return Ok(());
     }
-    return undefined;
-}
+    let inner = js_sys::Reflect::get(&global, &key("fetch"))
+        .map_err(|_| internal("cannot read the browser fetch function"))?;
+    js_sys::Reflect::set(&global, &key("__rgbLibOriginalFetch"), &inner)
+        .map_err(|_| internal("cannot store the original fetch function"))?;
 
-function deadlineSignal(input, init, millis) {
-    const AbortSignalImpl = globalThis.AbortSignal;
-    if (!AbortSignalImpl || !AbortSignalImpl.any || !AbortSignalImpl.timeout) {
-        // no combinable deadline in this browser: fetch without one, as before
-        return undefined;
-    }
-    const signals = [];
-    if (input && input.signal) signals.push(input.signal);
-    if (init && init.signal) signals.push(init.signal);
-    signals.push(AbortSignalImpl.timeout(millis));
-    return AbortSignalImpl.any(signals);
-}
-
-export function installEsploraRequestTimeout(base, timeoutMillis) {
-    const g = globalThis;
-    if (!g.__rgbLibEsploraTimeouts) g.__rgbLibEsploraTimeouts = new Map();
-    g.__rgbLibEsploraTimeouts.set(normalizeBase(base), timeoutMillis);
-    if (g.fetch && g.fetch.__rgbLibEsploraWrapped) return;
-    const inner = g.fetch;
-    const wrapped = function (input, init) {
-        const raw = typeof input === 'string' ? input : input && (input.url || input.href);
-        const millis = timeoutFor(raw || '');
-        const signal = millis === undefined ? undefined : deadlineSignal(input, init, millis);
-        // cloning keeps the caller's method, headers and body; only cache mode and signal change
+    // Kept as a string rather than an inline wasm-bindgen module: inline modules are emitted as
+    // ESM snippets, which the Node package build cannot `require`.
+    let wrapper = js_sys::Function::new_with_args(
+        "input, init",
+        r#"
+        const g = globalThis;
+        const registry = g.__rgbLibEsploraTimeouts || {};
+        const raw = typeof input === 'string' ? input : (input && (input.url || input.href)) || '';
+        const target = String(raw).replace(/\/+$/, '');
+        let millis;
+        for (const base of Object.keys(registry)) {
+            if (target === base || target.startsWith(base + '/')) { millis = registry[base]; break; }
+        }
+        let signal;
+        const A = g.AbortSignal;
+        if (millis !== undefined && A && A.any && A.timeout) {
+            const signals = [];
+            if (input && input.signal) signals.push(input.signal);
+            if (init && init.signal) signals.push(init.signal);
+            signals.push(A.timeout(millis));
+            signal = A.any(signals);
+        }
         const options = Object.assign({}, init, { cache: 'no-store' });
         if (signal !== undefined) options.signal = signal;
-        return inner.call(g, new Request(input, options));
-    };
-    wrapped.__rgbLibEsploraWrapped = true;
-    g.fetch = wrapped;
-}
-"#)]
-extern "C" {
-    #[wasm_bindgen(js_name = installEsploraRequestTimeout)]
-    fn install_esplora_request_timeout(base: &str, timeout_millis: u32);
+        return g.__rgbLibOriginalFetch.call(g, new Request(input, options));
+        "#,
+    );
+    js_sys::Reflect::set(&global, &key("fetch"), wrapper.as_ref())
+        .map_err(|_| internal("cannot install the fetch wrapper"))?;
+    js_sys::Reflect::set(&global, &key("__rgbLibEsploraWrapped"), &JsValue::TRUE)
+        .map_err(|_| internal("cannot mark the fetch wrapper installed"))?;
+    Ok(())
 }
 
 /// Browser timer for the client's retry backoff.
@@ -214,7 +231,7 @@ impl EsploraTransport {
         // bounded to u32 milliseconds: the native default is 10 s, far below the i32 `setTimeout`
         // and `AbortSignal.timeout` limits, and a caller cannot ask for an unbounded one
         let timeout_millis = u32::try_from(timeout_secs.saturating_mul(1000)).unwrap_or(u32::MAX);
-        install_esplora_request_timeout(indexer_url, timeout_millis);
+        install_esplora_request_timeout(indexer_url, timeout_millis)?;
         let builder = EsploraAsyncBuilder::new(indexer_url)
             .max_retries(INDEXER_RETRIES.into())
             .timeout(timeout_secs);

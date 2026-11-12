@@ -803,6 +803,13 @@ pub enum Error {
 #[cfg(feature = "wallet")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
+    #[error("Indexer internal error: {details}")]
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", feature = "esplora_async")),
+        allow(dead_code)
+    )]
+    Internal { details: String },
+
     #[cfg(feature = "bitcoind")]
     #[error("Bitcoind error: {0}")]
     Bitcoind(#[from] BitcoindRpcError),
