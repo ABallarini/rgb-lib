@@ -192,6 +192,39 @@ impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W>
     }
 }
 
+// Test-only hook: make the fetch path fail after the consignment and its metadata were cached, so a
+// second attempt can prove it reuses them instead of contacting the proxy again.
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_fail_after_cache(fail: bool) {
+    FAIL_AFTER_CACHE.with(|cell| cell.set(fail));
+}
+
+#[cfg(test)]
+fn fail_after_cache() -> bool {
+    FAIL_AFTER_CACHE.with(|cell| cell.get())
+}
+
+#[cfg(not(test))]
+fn fail_after_cache() -> bool {
+    false
+}
+
+/// A receive an earlier attempt already downloaded, decrypted and saved.
+///
+/// The consignment bytes are the cached plaintext, so the reuse path never decodes, decrypts or
+/// validates them a second time: it feeds the same prefetch and driver path as a fresh download.
+pub(super) struct CachedReceive {
+    candidate: super::receive::PendingReceive,
+    data: ProxyReceiveData,
+    consignment_bytes: Vec<u8>,
+    consignment_path: PathBuf,
+}
+
 /// The outcome of handling one proxy transfer, before it is turned into a result for the host.
 enum ReceiveOutcome {
     /// the shared driver handled it, committing the new state
@@ -252,6 +285,71 @@ async fn prefetch_chain_answers(
 }
 
 impl Wallet {
+    /// The cached consignment of an earlier, failed receive attempt for this proxy transfer ID.
+    ///
+    /// The download path writes the decrypted consignment and its [`ReceivedConsignmentMeta`] before
+    /// the database transaction runs, so a failure in the prefetch or in the driver leaves a cache
+    /// the next attempt can use. A cache is reused only when the metadata names this transfer ID and
+    /// the pending receive it belongs to derives the same ID from the cached sender key. A missing
+    /// or unreadable cache is treated as absent, so the caller falls back to the proxy.
+    pub(super) fn cached_receive(
+        &self,
+        db_data: &DbData,
+        proxy_url: &str,
+        transfer_id: &str,
+    ) -> Result<Option<CachedReceive>, Error> {
+        for candidate in pending_receives(db_data)? {
+            let Some(recipient_id) = candidate.transfer.recipient_id.clone() else {
+                continue;
+            };
+            let consignment_path = self.get_receive_consignment_path(&recipient_id);
+            let consignment_key = self.wallet_key(&consignment_path)?;
+            let meta_key =
+                self.wallet_key(&self.get_receive_consignment_meta_path(&recipient_id))?;
+            if !self.files().exists(&consignment_key)? || !self.files().exists(&meta_key)? {
+                continue;
+            }
+            let Ok(meta_bytes) = self.files().read(&meta_key) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<ReceivedConsignmentMeta>(&meta_bytes) else {
+                continue;
+            };
+            if meta.transfer_id.as_deref() != Some(transfer_id)
+                || candidate
+                    .expected_transfer_id(&meta.sender_pubkey)
+                    .as_deref()
+                    != Some(transfer_id)
+            {
+                continue;
+            }
+            let Ok(consignment_bytes) = self.files().read(&consignment_key) else {
+                continue;
+            };
+            let Ok(sender_proxy) =
+                self.convert_transport_endpoint_url(&meta.sender_transport_endpoint)
+            else {
+                continue;
+            };
+            let data = ProxyReceiveData {
+                proxy_url: proxy_url.to_string(),
+                transfer_id: transfer_id.to_string(),
+                sender_proxy,
+                sender_pubkey: meta.sender_pubkey,
+                consignment_hash: meta.consignment_hash,
+                recipient_encryption: candidate.transfer.recipient_encryption,
+                batch: meta.batch,
+            };
+            return Ok(Some(CachedReceive {
+                candidate,
+                data,
+                consignment_bytes,
+                consignment_path,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Receive one proxy transfer by its ID, decrypting it, validating it and ACKing it.
     ///
     /// The caller supplies the recipient proxy URL (where the consignment lives) and the Esplora
@@ -391,108 +489,142 @@ impl Wallet {
     ) -> Result<ReceiveOutcome, Error> {
         // a re-run after the ACK may find the proxy data already deleted: the local record of the
         // transfer ID is what makes the call idempotent, so check it before any network access
-        if already_handled(&self.db_data()?, transfer_id).is_some() {
+        let db_data = self.db_data()?;
+        if already_handled(&db_data, transfer_id).is_some() {
             return Ok(ReceiveOutcome::AlreadyHandled);
         }
 
-        let client = ProxyFetchClient::new(proxy_url)?;
-        let response = client.get_consignment(transfer_id).await?;
-        if let Some(err) = response.error {
-            return Err(map_proxy_error(err));
-        }
-        let Some(result) = response.result else {
-            return Err(Error::NoConsignment);
-        };
+        // a previous attempt may have cached the consignment and its metadata before failing in the
+        // prefetch or in the driver: reuse them instead of asking a proxy that may have deleted the
+        // data in the meantime. A missing or unreadable cache falls back to the fetch path below.
+        let (candidate, data, consignment_bytes, consignment_path) =
+            match self.cached_receive(&db_data, proxy_url, transfer_id)? {
+                Some(cached) => {
+                    debug!(
+                        self.logger(),
+                        "Reusing cached consignment for {transfer_id}"
+                    );
+                    (
+                        cached.candidate,
+                        cached.data,
+                        cached.consignment_bytes,
+                        cached.consignment_path,
+                    )
+                }
+                None => {
+                    let client = ProxyFetchClient::new(proxy_url)?;
+                    let response = client.get_consignment(transfer_id).await?;
+                    if let Some(err) = response.error {
+                        return Err(map_proxy_error(err));
+                    }
+                    let Some(result) = response.result else {
+                        return Err(Error::NoConsignment);
+                    };
 
-        let db_data = self.db_data()?;
-        let Some(candidate) = pending_receives(&db_data)?
-            .into_iter()
-            .find(|c| c.expected_transfer_id(&result.sender_pk).as_deref() == Some(transfer_id))
-        else {
-            return Ok(if already_handled(&db_data, transfer_id).is_some() {
-                ReceiveOutcome::AlreadyHandled
-            } else {
-                ReceiveOutcome::NotOurs
-            });
-        };
+                    let Some(candidate) = pending_receives(&db_data)?.into_iter().find(|c| {
+                        c.expected_transfer_id(&result.sender_pk).as_deref() == Some(transfer_id)
+                    }) else {
+                        return Ok(if already_handled(&db_data, transfer_id).is_some() {
+                            ReceiveOutcome::AlreadyHandled
+                        } else {
+                            ReceiveOutcome::NotOurs
+                        });
+                    };
 
+                    let recipient_id = candidate
+                        .transfer
+                        .recipient_id
+                        .clone()
+                        .expect("matched receive has a recipient ID");
+                    let recipient_seed = candidate
+                        .batch
+                        .operation_secret_key
+                        .clone()
+                        .unwrap_or_default();
+                    let sender_proxy =
+                        self.convert_transport_endpoint_url(&result.sender_transport_endpoint)?;
+                    let data = ProxyReceiveData {
+                        proxy_url: proxy_url.to_string(),
+                        transfer_id: transfer_id.to_string(),
+                        sender_proxy,
+                        sender_pubkey: result.sender_pk.clone(),
+                        consignment_hash: result.consignment_hash.clone(),
+                        recipient_encryption: candidate.transfer.recipient_encryption,
+                        batch: result.batch,
+                    };
+                    let mode = ReceiveMode::Proxy(data.clone());
+
+                    // decode and (if needed) decrypt the consignment; a malformed payload is
+                    // refused like one that fails decryption or verification
+                    let decoded = general_purpose::STANDARD
+                        .decode(&result.consignment)
+                        .map_err(|e| Error::InvalidEncryptedBlob {
+                            details: e.to_string(),
+                        });
+                    let consignment_bytes = decoded.and_then(|raw| {
+                        self.decrypt_blob_with_shared_key(
+                            raw,
+                            data.recipient_encryption,
+                            &recipient_seed,
+                            &data.sender_pubkey,
+                            &data.consignment_hash,
+                        )
+                    });
+                    let consignment_bytes = match consignment_bytes {
+                        Ok(bytes) => bytes,
+                        Err(e @ Error::IO { .. }) => return Err(e),
+                        Err(_) => {
+                            let txn = self.database().begin_transaction()?;
+                            let mut updated: DbBatchTransferActMod = candidate.batch.clone().into();
+                            {
+                                let transport = WasmReceiveTransport::new(self, indexer_url);
+                                self.refuse_consignment_via(
+                                    &transport,
+                                    &txn,
+                                    &mode,
+                                    &recipient_id,
+                                    &recipient_seed,
+                                    &mut updated,
+                                )
+                                .await?;
+                            }
+                            self.persist_and_commit(txn)?;
+                            return Ok(ReceiveOutcome::Handled);
+                        }
+                    };
+
+                    let consignment_path = self.get_receive_consignment_path(&recipient_id);
+                    let consignment_key = self.wallet_key(&consignment_path)?;
+                    self.files()
+                        .atomic_write(&consignment_key, &consignment_bytes)?;
+                    let meta = ReceivedConsignmentMeta {
+                        proxy_url: Some(proxy_url.to_string()),
+                        transfer_id: Some(transfer_id.to_string()),
+                        sender_transport_endpoint: result.sender_transport_endpoint.clone(),
+                        sender_pubkey: result.sender_pk.clone(),
+                        consignment_hash: result.consignment_hash.clone(),
+                        batch: result.batch,
+                    };
+                    let meta_str = serde_json::to_string(&meta).map_err(InternalError::from)?;
+                    let meta_key =
+                        self.wallet_key(&self.get_receive_consignment_meta_path(&recipient_id))?;
+                    self.files().atomic_write(&meta_key, meta_str.as_bytes())?;
+
+                    if fail_after_cache() {
+                        return Err(Error::Internal {
+                            details: s!("injected failure after caching the consignment"),
+                        });
+                    }
+
+                    (candidate, data, consignment_bytes, consignment_path)
+                }
+            };
         let recipient_id = candidate
             .transfer
             .recipient_id
             .clone()
             .expect("matched receive has a recipient ID");
-        let recipient_seed = candidate
-            .batch
-            .operation_secret_key
-            .clone()
-            .unwrap_or_default();
-        let sender_proxy =
-            self.convert_transport_endpoint_url(&result.sender_transport_endpoint)?;
-        let data = ProxyReceiveData {
-            proxy_url: proxy_url.to_string(),
-            transfer_id: transfer_id.to_string(),
-            sender_proxy,
-            sender_pubkey: result.sender_pk.clone(),
-            consignment_hash: result.consignment_hash.clone(),
-            recipient_encryption: candidate.transfer.recipient_encryption,
-            batch: result.batch,
-        };
         let mode = ReceiveMode::Proxy(data.clone());
-
-        // decode and (if needed) decrypt the consignment; a malformed payload is refused like one
-        // that fails decryption or verification
-        let decoded = general_purpose::STANDARD
-            .decode(&result.consignment)
-            .map_err(|e| Error::InvalidEncryptedBlob {
-                details: e.to_string(),
-            });
-        let consignment_bytes = decoded.and_then(|raw| {
-            self.decrypt_blob_with_shared_key(
-                raw,
-                data.recipient_encryption,
-                &recipient_seed,
-                &data.sender_pubkey,
-                &data.consignment_hash,
-            )
-        });
-        let consignment_bytes = match consignment_bytes {
-            Ok(bytes) => bytes,
-            Err(e @ Error::IO { .. }) => return Err(e),
-            Err(_) => {
-                let txn = self.database().begin_transaction()?;
-                let mut updated: DbBatchTransferActMod = candidate.batch.clone().into();
-                {
-                    let transport = WasmReceiveTransport::new(self, indexer_url);
-                    self.refuse_consignment_via(
-                        &transport,
-                        &txn,
-                        &mode,
-                        &recipient_id,
-                        &recipient_seed,
-                        &mut updated,
-                    )
-                    .await?;
-                }
-                self.persist_and_commit(txn)?;
-                return Ok(ReceiveOutcome::Handled);
-            }
-        };
-
-        let consignment_path = self.get_receive_consignment_path(&recipient_id);
-        let consignment_key = self.wallet_key(&consignment_path)?;
-        self.files()
-            .atomic_write(&consignment_key, &consignment_bytes)?;
-        let meta = ReceivedConsignmentMeta {
-            proxy_url: Some(proxy_url.to_string()),
-            transfer_id: Some(transfer_id.to_string()),
-            sender_transport_endpoint: result.sender_transport_endpoint.clone(),
-            sender_pubkey: result.sender_pk.clone(),
-            consignment_hash: result.consignment_hash.clone(),
-            batch: result.batch,
-        };
-        let meta_str = serde_json::to_string(&meta).map_err(InternalError::from)?;
-        let meta_key = self.wallet_key(&self.get_receive_consignment_meta_path(&recipient_id))?;
-        self.files().atomic_write(&meta_key, meta_str.as_bytes())?;
 
         // parse once for the prefetch set; a malformed consignment still runs the driver, which
         // refuses it with the same error a native load would report

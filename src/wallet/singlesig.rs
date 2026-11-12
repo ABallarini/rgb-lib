@@ -404,22 +404,35 @@ impl Wallet {
     /// This is the only durable-write boundary for a wasm wallet: the in-memory backend keeps
     /// every change in memory until this call, which serializes the wallet with [`Wallet::snapshot`]
     /// and delegates the write to
-    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot). The future
-    /// resolves once the IndexedDB transaction commits.
+    /// [`persistence::save_snapshot_record`](crate::wallet::persistence::save_snapshot_record).
+    /// The record is written only when the stored sequence does not exceed `expected_sequence`, so
+    /// a stale instance cannot overwrite a newer snapshot. The future resolves once the IndexedDB
+    /// transaction commits and returns the new sequence to pass to the next call.
     ///
-    /// Call it after a logical unit of work. Two overlapping flushes for one wallet id are
-    /// serialized by IndexedDB and the last committed write wins, with no ordering guarantee. An
-    /// error leaves the in-memory state unchanged, so the wallet stays usable and a later flush can
-    /// retry.
+    /// Pass the writer id and sequence this instance last loaded or wrote (`0` for a wallet with no
+    /// record yet). A rejected stale write names the stored sequence and its writer; the instance
+    /// must reload instead of retrying. An error leaves the in-memory state unchanged, so the
+    /// wallet stays usable.
     ///
     /// Native builds expose no `flush`: their SQLite backend writes every change itself, so a
     /// native flush would be a no-op.
     #[cfg(target_arch = "wasm32")]
-    pub async fn flush(&self, wallet_id: &str) -> Result<(), Error> {
+    pub async fn flush(
+        &self,
+        wallet_id: &str,
+        writer: &str,
+        expected_sequence: u64,
+    ) -> Result<u64, Error> {
         let bytes = self.snapshot()?.ok_or_else(|| Error::Internal {
             details: "a wasm memory wallet must produce a snapshot".to_string(),
         })?;
-        crate::wallet::persistence::save_snapshot(wallet_id, &bytes).await
+        crate::wallet::persistence::save_snapshot_record(
+            wallet_id,
+            &bytes,
+            writer,
+            expected_sequence,
+        )
+        .await
     }
 
     /// Rebuild a wallet from the bytes returned by [`Wallet::snapshot`], over the in-memory
@@ -434,7 +447,8 @@ impl Wallet {
     /// Constructors are synchronous, so the host restores the snapshot asynchronously with
     /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
     /// this. The host owns the durable flush with
-    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot).
+    /// [`Wallet::flush`](crate::wallet::Wallet::flush), passing the writer id and the sequence it
+    /// last loaded or wrote.
     #[cfg(any(test, target_arch = "wasm32"))]
     pub fn from_snapshot(
         snapshot: &[u8],
