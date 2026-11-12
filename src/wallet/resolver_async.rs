@@ -30,6 +30,45 @@ use crate::bitcoin::block::Header;
 const MAX_PREFETCH_WITNESSES: usize = 512;
 /// Upper bound on the block headers one consignment may cause the browser to fetch.
 const MAX_PREFETCH_HEADERS: usize = 128;
+/// Wall-clock budget for one whole prefetch, in milliseconds.
+///
+/// The count caps alone still let a slow endpoint hold the browser for `(512 + 128)` requests,
+/// each up to its own transport deadline. This bounds the whole run instead: once it is spent the
+/// prefetch stops asking and fails, so the caller never starts a validation on a partial snapshot.
+const PREFETCH_DEADLINE_MS: u64 = 60_000;
+
+/// Milliseconds on the platform clock, for the prefetch deadline.
+///
+/// Only differences matter, so the epoch is irrelevant: the browser's `Date.now` on wasm32,
+/// `SystemTime` natively. A clock that cannot be read counts as `0`, which only makes a deadline
+/// start earlier.
+fn now_millis() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// Fail once the prefetch budget is spent, before the next request is issued.
+fn check_deadline(
+    deadline_millis: u64,
+    now: &impl Fn() -> u64,
+) -> Result<(), WitnessResolverError> {
+    if now() >= deadline_millis {
+        return Err(WitnessResolverError::ResolverIssue(
+            None,
+            s!("chain prefetch exceeded its deadline"),
+        ));
+    }
+    Ok(())
+}
 
 /// The chain answers a validation or consumption run needs, fetched asynchronously.
 ///
@@ -70,13 +109,39 @@ impl PrefetchedChain {
     ///
     /// Call this before beginning the DB transaction the validation or consumption then runs in.
     /// The chain net is checked first, so a resolver pointing at another chain fails before any
-    /// witness is stored.
+    /// witness is stored. The whole prefetch is bounded by [`PREFETCH_DEADLINE_MS`], checked
+    /// before every request.
     pub(crate) async fn fetch<R: AsyncChainResolver>(
         resolver: &R,
         chain_net: ChainNet,
         witness_ids: impl IntoIterator<Item = RgbTxid>,
         heights: impl IntoIterator<Item = NonZeroU32>,
     ) -> Result<Self, WitnessResolverError> {
+        let deadline_millis = now_millis().saturating_add(PREFETCH_DEADLINE_MS);
+        Self::fetch_until(
+            resolver,
+            chain_net,
+            witness_ids,
+            heights,
+            deadline_millis,
+            now_millis,
+        )
+        .await
+    }
+
+    /// [`fetch`](Self::fetch) with the deadline and clock supplied by the caller.
+    ///
+    /// The clock seam is what lets the tests force an expiry without sleeping; production code
+    /// always reaches this through `fetch`.
+    async fn fetch_until<R: AsyncChainResolver, C: Fn() -> u64>(
+        resolver: &R,
+        chain_net: ChainNet,
+        witness_ids: impl IntoIterator<Item = RgbTxid>,
+        heights: impl IntoIterator<Item = NonZeroU32>,
+        deadline_millis: u64,
+        now: C,
+    ) -> Result<Self, WitnessResolverError> {
+        check_deadline(deadline_millis, &now)?;
         resolver.check_chain_net(chain_net).await?;
         let witness_ids: Vec<RgbTxid> = witness_ids.into_iter().collect();
         let heights: Vec<NonZeroU32> = heights.into_iter().collect();
@@ -88,11 +153,13 @@ impl PrefetchedChain {
         }
         let mut witnesses = BTreeMap::new();
         for witness_id in witness_ids {
+            check_deadline(deadline_millis, &now)?;
             let status = resolver.resolve_witness(witness_id).await?;
             witnesses.insert(witness_id, status);
         }
         let mut headers = BTreeMap::new();
         for height in heights {
+            check_deadline(deadline_millis, &now)?;
             let header = resolver.get_block_header(height).await?;
             headers.insert(height, header);
         }
@@ -136,7 +203,7 @@ const _: () = {
 // The tests need a runtime to drive the fetch future, and the crate only has one natively.
 #[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -316,6 +383,13 @@ mod tests {
         }
     }
 
+    /// A clock that advances one tick per read, so a test can pick which request overruns the
+    /// budget without sleeping.
+    fn ticking_clock() -> impl Fn() -> u64 {
+        let tick = AtomicU64::new(0);
+        move || tick.fetch_add(1, Ordering::SeqCst)
+    }
+
     #[test]
     fn prefetched_answer_is_served_through_the_sync_trait() {
         let tx = witness_tx();
@@ -472,6 +546,87 @@ mod tests {
             ResolveWitness::check_chain_net(&prefetched, ChainNet::BitcoinMainnet),
             Err(WitnessResolverError::WrongChainNet)
         );
+    }
+
+    #[test]
+    fn a_prefetch_with_no_budget_left_makes_no_request() {
+        let chain_net = ChainNet::BitcoinRegtest;
+        let resolver = FakeChain::new(chain_net);
+
+        // the clock is already at the deadline: even the chain-net check must not be issued
+        let error = block_on(PrefetchedChain::fetch_until(
+            &resolver,
+            chain_net,
+            [witness_tx().compute_txid()],
+            [height(1)],
+            1_000,
+            || 1_000,
+        ))
+        .expect_err("the budget is already spent");
+
+        assert_matches!(error, WitnessResolverError::ResolverIssue(None, _));
+        assert_eq!(
+            resolver.calls(),
+            (vec![], vec![], vec![]),
+            "no request is made once the deadline has passed"
+        );
+    }
+
+    #[test]
+    fn the_deadline_is_checked_before_every_request() {
+        let first = witness_tx().compute_txid();
+        let second = other_witness_txid();
+        let chain_net = ChainNet::BitcoinRegtest;
+        let mut resolver = FakeChain::new(chain_net);
+        resolver.witnesses.insert(first, WitnessStatus::Unresolved);
+        resolver.witnesses.insert(second, WitnessStatus::Unresolved);
+        resolver.headers.insert(height(1), header(1));
+
+        // each clock read advances one tick: the chain-net check and the first witness fit in the
+        // two-tick budget, the second witness starts past it
+        let clock = ticking_clock();
+
+        let error = block_on(PrefetchedChain::fetch_until(
+            &resolver,
+            chain_net,
+            [first, second],
+            [height(1)],
+            2,
+            clock,
+        ))
+        .expect_err("the budget expires mid-prefetch");
+
+        assert_matches!(error, WitnessResolverError::ResolverIssue(None, _));
+        assert_eq!(
+            resolver.calls(),
+            (vec![chain_net], vec![first], vec![]),
+            "the expired request is never issued and later ones are not tried"
+        );
+    }
+
+    #[test]
+    fn an_expired_header_is_never_asked_for() {
+        let txid = witness_tx().compute_txid();
+        let chain_net = ChainNet::BitcoinRegtest;
+        let mut resolver = FakeChain::new(chain_net);
+        resolver.witnesses.insert(txid, WitnessStatus::Unresolved);
+        resolver.headers.insert(height(1), header(1));
+
+        let clock = ticking_clock();
+
+        // chain-net and the witness fit; the header starts past the budget
+        let error = block_on(PrefetchedChain::fetch_until(
+            &resolver,
+            chain_net,
+            [txid],
+            [height(1)],
+            2,
+            clock,
+        ))
+        .expect_err("the header does not fit in the budget");
+
+        assert_matches!(error, WitnessResolverError::ResolverIssue(None, _));
+        assert_eq!(resolver.calls(), (vec![chain_net], vec![txid], vec![]));
     }
 
     #[test]

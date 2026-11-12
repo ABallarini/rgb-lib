@@ -370,6 +370,20 @@ The root crate with `esplora_async` compiles the browser transport, resolver and
 
 The bindings crate enables `wallet,esplora_async`, so the generated package contains the transport and the three read-only methods. No native blocking transport is in the wasm graph: `bitcoind`, `electrum` and `esplora` are native-only, and the graph check rejects their crates.
 
+### Request bounds
+
+`esplora-client` ignores `Builder::timeout` on wasm32, so `EsploraTransport` installs a `fetch` wrapper before it builds its client: every request under the indexer URL gets `AbortSignal.any([request.signal, AbortSignal.timeout(10000)])` and `cache: 'no-store'`, which also stops the browser serving stale chain data from an Esplora `cache-control: max-age`.
+
+The deadline is the same 10 s constant the native Esplora and Electrum clients use (`INDEXER_TIMEOUT`), and the wrapper normalizes a trailing slash so a base URL with or without it is one entry; a stalled request therefore settles as a transport error instead of hanging, and the client's retry policy does not retry that error.
+
+A browser without `AbortSignal.any` or `AbortSignal.timeout` falls back to a plain `fetch` with `no-store` and no per-request deadline; `sync`, `getTipHeight` and `getFeeEstimation` are then bounded only by the network stack.
+
+One RGB chain prefetch (the witness and header answers a proxy receive validates against) has its own wall-clock budget of 60 s, checked before every request, on top of the 512-witness and 128-header count caps; it fails with a resolver error once the budget is spent and never returns a partial snapshot.
+
+The prefetch runs before the database transaction opens, so no transaction is held across the network wait.
+
+Remaining caveat: the retry backoff sleeper still needs `window.setTimeout`, so the online sync path stays browser-page-only; the wrapper patches `globalThis.fetch`, so the cache mode and deadline would apply in a Worker or Node, but the sleeper has to move to `globalThis.setTimeout` before that path works there.
+
 ### What is not assembled
 
 The remaining RGB online flow (`RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, proxy invoice reservation, transfers, send, media upload, hub coordination) is gated by the native-only `_online` feature. `esplora_async` deliberately does not enable it: the browser receive path is an additive async method in `wasm_online`/`receive_wasm`, not the native online trait.
@@ -441,7 +455,7 @@ The rule is simple: a backend supplies storage, runtime or transport primitives.
 
 | Command | Verified by |
 | ------- | ----------- |
-| Root wasm checks, `wasm_graph_check.sh`, `wasm_gate.sh` | Local gate, 216 native tests |
+| Root wasm checks, `wasm_graph_check.sh`, `wasm_gate.sh` | Local gate, 217 native tests |
 | `wasm-pack build ... --target web` and `--target nodejs` | CI `wasm_bindings` job |
 | `node bindings/wasm/smoke/smoke.cjs` | CI `wasm_bindings` job |
 | Browser lifecycle `cargo test ... wallet,esplora_async` | CI `wasm_browser_lifecycle` job |
