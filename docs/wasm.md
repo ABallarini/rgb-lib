@@ -120,13 +120,11 @@ cargo test --lib --target wasm32-unknown-unknown \
 
 This needs Chrome and ChromeDriver. It runs the wallet lifecycle over a real IndexedDB: create, issue offline, flush, reload, restore, and verify the state and address index survived. It also runs the opt-in regtest Esplora smoke, which returns early unless `RGB_REGTEST_ESPLORA_URL` was baked in at compile time.
 
-The same job runs the bindings crate's own browser test for the operation guard:
+The same job runs the bindings crate's own browser suite. Besides the operation guard, it covers the durable path in a real IndexedDB: `create`, `getAddress`, `flush`, drop and `load` restore the wallet and hand out the next address, `deleteSnapshot` removes the record and a later `flush` on the detached instance throws, the hub-free multisig wallet survives a flush/load round trip, and a refused local indexer and a transfer with no pending proxy invoice reject with sanitized errors while the wallet stays usable. Those network cases use a refused URL: a real proxy receive and the opt-in regtest Esplora smoke are not part of required CI.
 
 ```sh
 cargo test --manifest-path bindings/wasm/Cargo.toml --lib --target wasm32-unknown-unknown
 ```
-
-It holds the wallet borrowed, as an in-flight async call does, and checks that a second call on the same instance throws `the wallet is busy with another operation` for both wallet classes, then that the instance works again once the borrow is released.
 
 Optional network smoke (not part of required CI, needs a controlled regtest Esplora endpoint):
 
