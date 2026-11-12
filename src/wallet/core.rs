@@ -957,6 +957,17 @@ pub trait WalletCore {
             .failed_witness_receive_grace_secs
     }
 
+    /// The browser wallet has no online options, so it keeps no grace period for failed witness
+    /// receives: their scripts and pending flags are reconciled away on the next sync.
+    #[cfg(all(
+        not(feature = "_online"),
+        feature = "esplora_async",
+        target_arch = "wasm32"
+    ))]
+    fn failed_witness_receive_grace_secs(&self) -> u32 {
+        0
+    }
+
     #[cfg(feature = "_online")]
     /// The configured EVM RPC URLs, keyed by chain ID
     fn evm_rpc_urls(&self) -> &HashMap<u64, String> {
@@ -1012,7 +1023,10 @@ pub trait WalletCore {
     /// registered, by [`Self::update_db_colored_txos_from_bdk`].
     ///
     /// Returns the kept scripts, mapped to whether their receive is still pending.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     fn reconcile_pending_witness(&self, txn: &DbTxn) -> Result<HashMap<String, bool>, Error> {
         let pending_witness_scripts = txn.iter_pending_witness_scripts()?;
         let pending_witness_txos = txn.iter_pending_witness_txos()?;
@@ -1245,7 +1259,10 @@ pub trait WalletCore {
     /// `pending_witness_scripts` are the pending witness scripts returned by
     /// [`Self::reconcile_pending_witness`]: a TXO paying one of them is flagged as pending witness
     /// only if its receive is still pending, and the script is dropped as it has been paid.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     fn update_db_colored_txos_from_bdk(
         &mut self,
         txn: &DbTxn,
@@ -1280,6 +1297,20 @@ pub trait WalletCore {
         }
 
         Ok(())
+    }
+
+    /// Run the DB-side sync bookkeeping shared by the native and browser full scans.
+    ///
+    /// Reconciles the pending witness state with the receives it belongs to, then registers the
+    /// colored TXOs the BDK wallet knows and the DB does not. `include_spent` matches the native
+    /// full scan, which passes `false`.
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    fn sync_db_txos_from_bdk(&mut self, txn: &DbTxn, include_spent: bool) -> Result<(), Error> {
+        let pending_witness_scripts = self.reconcile_pending_witness(txn)?;
+        self.update_db_colored_txos_from_bdk(txn, include_spent, &pending_witness_scripts)
     }
 
     #[cfg(feature = "_online")]

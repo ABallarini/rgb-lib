@@ -295,6 +295,75 @@ fn add_unspent_colored_txo(wallet: &impl WalletCore) {
         .unwrap();
 }
 
+/// The bookkeeping `sync_async` runs in its transaction: a stale pending-witness TXO and script are
+/// reconciled away, and a colored TXO the full scan just found is registered in the DB.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+fn sync_bookkeeping_reconciles_witness_and_registers_colored_txo() {
+    use crate::database::entities::pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod;
+    use bdk_wallet::bitcoin::{Amount, TxOut, absolute, transaction};
+
+    let (mut wallet, _keys) = memory_wallet();
+    let stale = Outpoint {
+        txid: "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+        vout: 1,
+    };
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        txn.set_txo(DbTxoActMod {
+            txid: ActiveValue::Set(stale.txid.clone()),
+            vout: ActiveValue::Set(stale.vout),
+            btc_amount: ActiveValue::Set("0".to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(true),
+            pending_witness: ActiveValue::Set(true),
+            ..Default::default()
+        })
+        .unwrap();
+        txn.set_pending_witness_script(DbPendingWitnessScriptActMod {
+            script: ActiveValue::Set("0014000000000000000000000000000000000000000000".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let address = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 0)
+        .address;
+    let tx = BdkTransaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    let txid = tx.compute_txid().to_string();
+    wallet.bdk_wallet_mut().apply_unconfirmed_txs([(tx, 0)]);
+
+    let txn = wallet.database().begin_transaction().unwrap();
+    wallet.sync_db_txos_from_bdk(&txn, false).unwrap();
+
+    let stale = txn.get_txo(&stale).unwrap().expect("stale TXO disappeared");
+    assert!(
+        !stale.pending_witness,
+        "a payment without a pending receive must lose its pending-witness flag"
+    );
+    assert!(
+        txn.iter_pending_witness_scripts().unwrap().is_empty(),
+        "a pending witness script without a receive must be dropped"
+    );
+    let colored = txn
+        .get_txo(&Outpoint { txid, vout: 0 })
+        .unwrap()
+        .expect("the colored TXO seen by BDK was not registered");
+    assert!(colored.exists);
+    txn.commit().unwrap();
+}
+
 /// Turn a guarded save into a JS promise that never rejects, so two writes can be in flight at
 /// once: it resolves to `ok <writer> <sequence>` or `error <message>`.
 fn guarded_save_promise(
@@ -1374,6 +1443,159 @@ async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
         transfer.proxy_transfer_id.as_deref(),
         Some(expected.as_str())
     );
+}
+
+/// A receive applied by an earlier attempt, left in `WaitingBroadcast`, is resumed by the next
+/// call instead of being skipped because it already stores its proxy transfer ID. A terminal
+/// transfer is still skipped.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn second_sync_resumes_a_waiting_receive() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use js_sys::Reflect;
+
+    const PROXY_URL: &str = "http://recipient-proxy";
+    const INDEXER_URL: &str = "http://127.0.0.1:3002";
+
+    let (mut wallet, _keys) = memory_wallet();
+    let script =
+        ScriptBuf::new_p2wpkh(&bdk_wallet::bitcoin::WPubkeyHash::from_slice(&[0x12; 20]).unwrap());
+    let recipient_id = crate::utils::recipient_id_from_script_buf(script, BitcoinNetwork::Regtest);
+    let batch_idx = insert_pending_proxy_receive(&wallet, &recipient_id, vec![0x44; 32]);
+    let transfer_id = "waiting-broadcast-transfer".to_string();
+    let transfer_idx = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let (asset_transfer_idx, transfer_idx) = {
+            let db_data = txn.get_db_data(false).unwrap();
+            let asset_transfer = db_data
+                .asset_transfers
+                .iter()
+                .find(|at| at.batch_transfer_idx == batch_idx)
+                .expect("the pending receive has an asset transfer");
+            let transfer = db_data
+                .transfers
+                .iter()
+                .find(|t| t.asset_transfer_idx == asset_transfer.idx)
+                .expect("the pending receive has a transfer");
+            (asset_transfer.idx, transfer.idx)
+        };
+        let mut batch: DbBatchTransferActMod =
+            txn.get_batch_transfer(batch_idx).unwrap().unwrap().into();
+        batch.status = ActiveValue::Set(TransferStatus::WaitingBroadcast);
+        txn.update_batch_transfer(&mut batch).unwrap();
+        let mut transfer: DbTransferActMod = txn
+            .get_db_data(false)
+            .unwrap()
+            .transfers
+            .into_iter()
+            .find(|t| t.idx == transfer_idx)
+            .unwrap()
+            .into();
+        transfer.proxy_transfer_id = ActiveValue::Set(Some(transfer_id.clone()));
+        transfer.consignment_hash = ActiveValue::Set(Some("00".to_string()));
+        transfer.asset_transfer_idx = ActiveValue::Set(asset_transfer_idx);
+        txn.update_transfer(&mut transfer).unwrap();
+        let endpoint_idx = txn
+            .set_transport_endpoint(DbTransportEndpointActMod {
+                transport_type: ActiveValue::Set(TransportType::JsonRpc),
+                endpoint: ActiveValue::Set(PROXY_URL.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        txn.set_transfer_transport_endpoint(DbTransferTransportEndpointActMod {
+            transfer_idx: ActiveValue::Set(transfer_idx),
+            transport_endpoint_idx: ActiveValue::Set(endpoint_idx),
+            used: ActiveValue::Set(true),
+            kind: ActiveValue::Set(TransportEndpointKind::RecipientProxy),
+            ..Default::default()
+        })
+        .unwrap();
+        txn.commit().unwrap();
+        transfer_idx
+    };
+    let _ = transfer_idx;
+    let meta = ReceivedConsignmentMeta {
+        proxy_url: Some(PROXY_URL.to_string()),
+        transfer_id: Some(transfer_id.clone()),
+        sender_transport_endpoint: "rpc://sender-proxy".to_string(),
+        sender_pubkey: hex::encode([0x55; 32]),
+        consignment_hash: "00".to_string(),
+        batch: false,
+    };
+    let meta_path = wallet.get_receive_consignment_meta_path(&recipient_id);
+    wallet
+        .files()
+        .atomic_write(
+            &wallet.wallet_key(&meta_path).unwrap(),
+            serde_json::to_vec(&meta).unwrap().as_slice(),
+        )
+        .unwrap();
+
+    let global = js_sys::global();
+    let saved_fetch = Reflect::get(&global, &JsValue::from_str("fetch")).unwrap();
+    let acks = Rc::new(Cell::new(0));
+    let fetch = {
+        let acks = acks.clone();
+        let global = global.clone();
+        Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
+            let method = Reflect::get(&request, &JsValue::from_str("method"))
+                .ok()
+                .and_then(|method| method.as_string())
+                .unwrap_or_default();
+            let body = match method.as_str() {
+                "ack.post" => {
+                    acks.set(acks.get() + 1);
+                    // no signed TX yet: the transfer stays in WaitingBroadcast
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#.to_string()
+                }
+                "server.info" => {
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"test","uptime":0,"retention_grace_secs":"86400"}}"#
+                        .to_string()
+                }
+                "transfer.list" => format!(
+                    r#"{{"jsonrpc":"2.0","id":null,"result":{{"{transfer_id}":"Pending"}}}}"#
+                ),
+                _ => r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string(),
+            };
+            let response = Reflect::get(&global, &JsValue::from_str("Response")).unwrap();
+            let response = response.dyn_into::<js_sys::Function>().unwrap();
+            let response =
+                Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(&body)))
+                    .unwrap();
+            js_sys::Promise::resolve(&response)
+        })
+    };
+    Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
+
+    let first = wallet
+        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL)
+        .await;
+    let second = wallet
+        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL)
+        .await;
+    assert_eq!(first.unwrap(), vec![batch_idx]);
+    assert_eq!(second.unwrap(), vec![batch_idx]);
+    assert_eq!(
+        acks.get(),
+        2,
+        "a non-terminal receive must be ACKed again instead of being skipped"
+    );
+
+    // a terminal status is still skipped without touching the proxy
+    let txn = wallet.database().begin_transaction().unwrap();
+    let mut batch: DbBatchTransferActMod =
+        txn.get_batch_transfer(batch_idx).unwrap().unwrap().into();
+    batch.status = ActiveValue::Set(TransferStatus::Settled);
+    txn.update_batch_transfer(&mut batch).unwrap();
+    txn.commit().unwrap();
+    let third = wallet
+        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL)
+        .await;
+    let _ = Reflect::set(&global, &JsValue::from_str("fetch"), &saved_fetch);
+    assert!(third.unwrap().is_empty());
+    assert_eq!(acks.get(), 2, "a settled receive must not be ACKed again");
 }
 
 /// Insert one pending incoming proxy receive; no transport endpoint is needed for the cache test.

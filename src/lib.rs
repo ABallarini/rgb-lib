@@ -568,6 +568,11 @@ use crate::no_wallet::validation::{
     unreachable_indexer_details, validate_consignment_internal, validate_deterministic,
     validate_with_claims,
 };
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+use crate::database::entities::pending_witness_script::Model as DbPendingWitnessScript;
 #[cfg(feature = "wallet")]
 use crate::database::entities::{
     asset::{ActiveModel as DbAssetActMod, Model as DbAsset},
@@ -633,7 +638,6 @@ use crate::{
         },
     },
     database::entities::{
-        pending_witness_script::Model as DbPendingWitnessScript,
         reserved_txo::ActiveModel as DbReservedTxoActMod,
         wallet_transaction::ActiveModel as DbWalletTransactionActMod,
     },
