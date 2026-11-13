@@ -838,7 +838,10 @@ impl SqliteTxn {
     /// TXO with index `txo_idx` an allocation it holds or is due to receive (receives, changes and
     /// issuances), from transfers that haven't failed, other than the asset transfer with index
     /// `exclude_asset_transfer_idx`.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     fn txo_incoming_colorings_query(
         txo_idx: i32,
         asset_id: Option<&str>,
@@ -864,7 +867,14 @@ impl SqliteTxn {
     /// TXO with index `txo_idx` holds or is due to receive (receives, changes and issuances), from
     /// transfers that haven't failed, other than the asset transfer with index
     /// `exclude_asset_transfer_idx`, counted by the DB without loading the colorings.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn count_txo_incoming_colorings(
         &self,
         txo_idx: i32,
@@ -879,7 +889,14 @@ impl SqliteTxn {
     /// The total amount of the asset with ID `asset_id` the TXO with index `txo_idx` holds or is
     /// due to receive (receives, changes and issuances), from transfers that haven't failed, other
     /// than the asset transfer with index `exclude_asset_transfer_idx`.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn txo_incoming_amount(
         &self,
         txo_idx: i32,
@@ -898,7 +915,14 @@ impl SqliteTxn {
     /// The number of mint rights of the asset with ID `asset_id` the TXO with index `txo_idx`
     /// holds or is due to receive, from transfers that haven't failed, other than the asset
     /// transfer with index `exclude_asset_transfer_idx`.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn count_txo_incoming_mint_rights(
         &self,
         txo_idx: i32,
@@ -936,7 +960,14 @@ impl SqliteTxn {
     /// with index `exclude_transfer_idx`, with the asset ID of their asset transfer: incoming
     /// transfers waiting for the counterparty without colorings yet, each reserving the slot of
     /// the single allocation that pays it (see `unpaid_invoices`).
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn get_utxo_unpaid_invoices(
         &self,
         outpoint: &Outpoint,
@@ -1468,7 +1499,14 @@ impl DbTxn {
 
     /// The number of allocations of the asset with ID `asset_id`, or of any asset if `None`, the
     /// TXO with index `txo_idx` holds or is due to receive, from transfers that haven't failed.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn count_txo_incoming_colorings(
         &self,
         txo_idx: i32,
@@ -1482,7 +1520,14 @@ impl DbTxn {
 
     /// The total amount of the asset with ID `asset_id` the TXO with index `txo_idx` holds or is
     /// due to receive.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn txo_incoming_amount(
         &self,
         txo_idx: i32,
@@ -1497,7 +1542,14 @@ impl DbTxn {
 
     /// The number of mint rights of the asset with ID `asset_id` the TXO with index `txo_idx`
     /// holds or is due to receive.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn count_txo_incoming_mint_rights(
         &self,
         txo_idx: i32,
@@ -1512,7 +1564,14 @@ impl DbTxn {
 
     /// The incoming colorings matching the query of `count_txo_incoming_colorings`, loaded from
     /// either backend.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     fn incoming_colorings<'a>(
         &'a self,
         txo_idx: i32,
@@ -1541,7 +1600,14 @@ impl DbTxn {
 
     /// The unpaid blind invoices on the UTXO at `outpoint`, other than the one of the transfer
     /// with index `exclude_transfer_idx`.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(feature = "_online")),
+        allow(dead_code)
+    )] // used by the browser receive loop once wired
     pub(crate) fn get_utxo_unpaid_invoices(
         &self,
         outpoint: &Outpoint,

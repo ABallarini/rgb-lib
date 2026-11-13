@@ -127,16 +127,26 @@ pub(crate) use objects::ReceivedConsignmentMeta;
 #[cfg(feature = "_online")]
 pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots,
-    CleanAckOutcome, ConsignmentPayment, ExtraAllocations, FailTransfersOutcome, LocalRecipient,
-    LocalRecipientData, LocalWitnessData, MainTransition, OnlineData, PaymentSeal,
-    PendingMintLocks, PrepareRgbPsbtResult, PrepareTransferPsbtResult, RefreshResultTrait,
-    SelectedInputs, SentMint, TakenSlots, TryFailBatchTransferOutcome,
+    CleanAckOutcome, ExtraAllocations, FailTransfersOutcome, LocalRecipient, LocalRecipientData,
+    LocalWitnessData, MainTransition, OnlineData, PendingMintLocks, PrepareRgbPsbtResult,
+    PrepareTransferPsbtResult, RefreshResultTrait, SelectedInputs, SentMint,
+    TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     AssetTransferColoringInfo, InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails,
     LocalAssetData, LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent, ReceiveDataInternal,
     TransferData, TransferEndData,
 };
+// receive types shared with the browser driver
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(unused_imports)
+)] // used by the browser receive loop once wired
+pub(crate) use objects::{ConsignmentPayment, PaymentSeal, TakenSlots};
 #[cfg(feature = "_online")]
 pub(crate) use offline::TRANSFER_DATA_FILE;
 #[cfg(feature = "rgb_fs_store_migration")]

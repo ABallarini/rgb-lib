@@ -2649,7 +2649,10 @@ pub enum ReceiveMatcher {
 
 /// The allocation slots taken on a UTXO receiving a consignment, besides the ones of the transfer
 /// it pays.
-#[cfg(feature = "_online")]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)] // the browser receive loop that uses it is not wired yet
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TakenSlots {
     /// allocations of the asset received held or due
@@ -2887,14 +2890,20 @@ impl ChangeSlots {
 
 /// The seal at which a consignment pays this recipient: a concealed one (blind receives) or one
 /// revealed on a vout of the bundle witness TX (witness receives), never both.
-#[cfg(feature = "_online")]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)] // the browser receive loop that uses it is not wired yet
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaymentSeal {
     Concealed(SecretSeal),
     WitnessVout(u32),
 }
 
-#[cfg(feature = "_online")]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)] // the browser receive loop that uses it is not wired yet
 impl PaymentSeal {
     /// the vout of the bundle witness TX being paid, for witness receives
     pub(crate) fn vout(&self) -> Option<u32> {
@@ -2916,7 +2925,10 @@ impl PaymentSeal {
 }
 
 /// A destination at which a consignment pays this recipient, see `find_payments`.
-#[cfg(feature = "_online")]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)] // the browser receive loop that uses it is not wired yet
 pub struct ConsignmentPayment<'c> {
     /// the bundle paying the recipient
     pub(crate) bundle: &'c WitnessBundle,
