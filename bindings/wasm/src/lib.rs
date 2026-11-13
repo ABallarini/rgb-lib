@@ -33,9 +33,10 @@
 //! describes settings and state, never key material.
 
 use std::cell::{Cell, RefCell, RefMut};
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use rgb_lib::{
@@ -46,8 +47,9 @@ use rgb_lib::{
     },
     no_wallet::validate_consignment_offchain as core_validate_consignment_offchain,
     wallet::{
-        AssetFilter, DatabaseType, Invoice as CoreInvoice, MultisigKeys, MultisigWallet,
-        RgbWalletOpsOffline, SinglesigKeys, TransferScope, Wallet, WalletData,
+        AssetFilter, DatabaseType, EvmReceiveConfig, EvmReceiveOptions, Invoice as CoreInvoice,
+        MultisigKeys, MultisigWallet, RgbWalletOpsOffline, SinglesigKeys, TransferScope, Wallet,
+        WalletData,
         backup_info_bytes as core_backup_info_bytes,
         persistence::{
             delete_snapshot as core_delete_snapshot, load_snapshot_record, new_writer_id,
@@ -136,6 +138,66 @@ fn multisig_keys(keys: &str) -> Result<MultisigKeys, JsValue> {
 
 fn failure(context: &str, e: Error) -> JsValue {
     JsValue::from_str(&format!("{context}: {e}"))
+}
+
+/// One EVM endpoint, as the host passes it.
+#[derive(Deserialize)]
+struct EvmConfigArg {
+    #[serde(alias = "rpc_url")]
+    rpc_url: String,
+    #[serde(alias = "max_mint_lock_blocks")]
+    max_mint_lock_blocks: u64,
+}
+
+impl From<EvmConfigArg> for EvmReceiveConfig {
+    fn from(arg: EvmConfigArg) -> Self {
+        Self {
+            rpc_url: arg.rpc_url,
+            max_mint_lock_blocks: arg.max_mint_lock_blocks,
+        }
+    }
+}
+
+/// The `evm` argument: one endpoint for every chain, or one per chain ID.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EvmArg {
+    Single(EvmConfigArg),
+    ByChain(HashMap<String, EvmConfigArg>),
+}
+
+/// Parse the optional EVM configuration of a receive.
+///
+/// A value that is not an object (or a chain-ID map of objects) throws a sanitized error; no
+/// endpoint is ever echoed back.
+fn parse_evm(evm: Option<JsValue>) -> Result<Option<EvmReceiveOptions>, JsValue> {
+    let Some(evm) = evm else {
+        return Ok(None);
+    };
+    if evm.is_undefined() || evm.is_null() {
+        return Ok(None);
+    }
+    let json = js_sys::JSON::stringify(&evm)
+        .map_err(|_| JsValue::from_str("cannot read the EVM configuration"))?
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("cannot read the EVM configuration"))?;
+    let arg: EvmArg = serde_json::from_str(&json)
+        .map_err(|e| JsValue::from_str(&format!("cannot parse the EVM configuration: {e}")))?;
+    match arg {
+        EvmArg::Single(config) => Ok(Some(EvmReceiveOptions::single(config.into()))),
+        EvmArg::ByChain(by_chain) => {
+            let mut chains = HashMap::with_capacity(by_chain.len());
+            for (chain_id, config) in by_chain {
+                let chain_id: u64 = chain_id.parse().map_err(|_| {
+                    JsValue::from_str(&format!(
+                        "invalid EVM chain ID '{chain_id}': use an unsigned decimal number"
+                    ))
+                })?;
+                chains.insert(chain_id, config.into());
+            }
+            Ok(Some(EvmReceiveOptions::by_chain(chains)))
+        }
+    }
 }
 
 /// The error of a call that starts while another call still holds the wallet.
@@ -518,12 +580,15 @@ impl RgbLibWallet {
     ///
     /// `proxy_url` is the recipient proxy holding the consignment, `indexer_url` the Esplora
     /// endpoint used for the chain answers the validation needs and for broadcasting a released
-    /// signed TX, and `transfer_id` the proxy transfer ID. The transfer must belong to a pending
-    /// incoming invoice of this wallet: a repeated call on an already handled transfer is a no-op
-    /// and a transfer not addressed to this wallet throws. The whole receive, including the ACK,
-    /// happens in one wallet transaction; a failure rolls it back. This call flushes the new state
-    /// before releasing the proxy data, so a failed flush leaves the release pending for the next
-    /// call instead of deleting the only copy of the consignment.
+    /// signed TX, and `transfer_id` the proxy transfer ID. `evm` is an optional
+    /// `{ rpcUrl, maxMintLockBlocks }` object or a map from decimal chain ID to that object, and is
+    /// required to receive a BFA mint: a mint without it throws `No EVM RPC URL configured for
+    /// chain ID ...` and never includes the endpoint URL in an error. The transfer must belong to
+    /// a pending incoming invoice of this wallet: a repeated call on an already handled transfer
+    /// is a no-op and a transfer not addressed to this wallet throws. The whole receive, including
+    /// the ACK, happens in one wallet transaction; a failure rolls it back. This call flushes the
+    /// new state before releasing the proxy data, so a failed flush leaves the release pending for
+    /// the next call instead of deleting the only copy of the consignment.
     ///
     /// Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already
     /// handled before this call.
@@ -534,10 +599,12 @@ impl RgbLibWallet {
         proxy_url: String,
         indexer_url: String,
         transfer_id: String,
+        evm: Option<JsValue>,
     ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
         let mut wallet = self.borrow_wallet()?;
         let idx = wallet
-            .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id)
+            .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id, evm)
             .await
             .map_err(|e| failure("cannot receive the transfer", e))?;
         // the release marker is in the snapshot only once this resolves: post after it
@@ -551,7 +618,8 @@ impl RgbLibWallet {
     ///
     /// Runs the read-only BDK full scan, then lists the transfers of each pending incoming invoice
     /// on `proxy_url`, receiving and ACKing each one through the same shared driver as
-    /// [`RgbLibWallet::receive_transfer`]. Only `Pending` transfers addressed to this wallet are
+    /// [`RgbLibWallet::receive_transfer`]. `evm` has the same shape as in
+    /// [`RgbLibWallet::receive_transfer`] and is required to receive a BFA mint. Only `Pending` transfers addressed to this wallet are
     /// considered and an already handled one is skipped, so a repeated call is idempotent. This
     /// call flushes the new state before releasing the proxy data of the handled transfers; a
     /// failed flush returns its error and leaves every release pending for the next call.
@@ -563,11 +631,18 @@ impl RgbLibWallet {
         &self,
         proxy_url: String,
         indexer_url: String,
+        evm: Option<JsValue>,
         stop_gap: Option<u32>,
     ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
         let mut wallet = self.borrow_wallet()?;
         let handled = wallet
-            .sync_online_async(&proxy_url, &indexer_url, stop_gap.map(|gap| gap as usize))
+            .sync_online_async(
+                &proxy_url,
+                &indexer_url,
+                evm,
+                stop_gap.map(|gap| gap as usize),
+            )
             .await
             .map_err(|e| failure("cannot sync the wallet online", e))?;
         // same order as receiveTransfer, for every release the handled transfers left behind

@@ -1496,7 +1496,7 @@ async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
     // the first attempt downloads and caches, then fails before the database transaction
     set_fail_after_cache(true);
     let first = wallet
-        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected)
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected, None)
         .await;
     set_fail_after_cache(false);
     assert!(matches!(first, Err(Error::Internal { .. })));
@@ -1518,7 +1518,7 @@ async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
     // the proxy now says the consignment is gone: only the cache can complete the receive
     no_consignment.set(true);
     let second = wallet
-        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected)
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected, None)
         .await;
     let _ = Reflect::set(&global, &JsValue::from_str("fetch"), &saved_fetch);
 
@@ -1618,7 +1618,7 @@ async fn proxy_release_waits_for_the_snapshot_and_is_retried() {
 
     // receiving never posts the release: the caller has not saved the handled receive yet
     let handled = wallet
-        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected)
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &expected, None)
         .await
         .expect("the unreadable consignment is refused and handled");
     assert_eq!(handled, Some(batch_idx));
@@ -1780,10 +1780,10 @@ async fn second_sync_resumes_a_waiting_receive() {
     Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
 
     let first = wallet
-        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL)
+        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL, None)
         .await;
     let second = wallet
-        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL)
+        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL, None)
         .await;
     assert_eq!(first.unwrap(), vec![batch_idx]);
     assert_eq!(second.unwrap(), vec![batch_idx]);
@@ -1801,7 +1801,7 @@ async fn second_sync_resumes_a_waiting_receive() {
     txn.update_batch_transfer(&mut batch).unwrap();
     txn.commit().unwrap();
     let third = wallet
-        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL)
+        .receive_pending_proxy_transfers(PROXY_URL, INDEXER_URL, None)
         .await;
     let _ = Reflect::set(&global, &JsValue::from_str("fetch"), &saved_fetch);
     assert!(third.unwrap().is_empty());

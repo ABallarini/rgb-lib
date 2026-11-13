@@ -25,6 +25,8 @@ rgb-lib = { version = "0.3.0-beta.7", path = "../../", default-features = false,
 ] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# JSON bridge for structured optional arguments (`evm`), already in the wasm graph.
+js-sys = "0.3"
 
 # JSON return values for the structured `rgb-lib` objects; already in the root wallet graph.
 serde = "1"

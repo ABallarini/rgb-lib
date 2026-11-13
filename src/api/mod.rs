@@ -1,12 +1,30 @@
+// The ABI and claim-prefetch modules build in wallet-only targets to keep their pure logic
+// testable, where nothing consumes most of their surface yet.
+#![cfg_attr(
+    all(
+        feature = "wallet",
+        not(feature = "_validation"),
+        not(all(target_arch = "wasm32", feature = "esplora_async"))
+    ),
+    allow(dead_code)
+)]
+
 #[cfg(feature = "_validation")]
 pub(crate) mod evm;
+
 // Protocol definitions, request builders and pure decoders shared by the native blocking client
 // and the browser `fetch` one, so payloads and error mapping cannot drift between the transports.
 #[cfg(any(
+    feature = "wallet",
     feature = "_validation",
     all(target_arch = "wasm32", feature = "esplora_async")
 ))]
 pub(crate) mod evm_abi;
+// EVM claim prefetch: the browser fetches the mint locks before the receive transaction opens.
+// The module also builds natively without the `fetch` client, so its pure logic is testable with
+// a fake EVM client.
+#[cfg(feature = "wallet")]
+pub(crate) mod evm_claims;
 // Browser EVM transport: `reqwest`'s `fetch` backend, wasm32 only, over the shared ABI code.
 #[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
 pub(crate) mod evm_fetch;

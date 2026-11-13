@@ -11,6 +11,7 @@ use super::*;
 pub(crate) const FUNDS_IN_BLOCK_SELECTOR: &str = "0x2ce06e2d";
 /// Selector of `circulatingSupply()` on a bridge contract (`MinimalBridge`)
 #[cfg(any(
+    feature = "wallet",
     feature = "_online",
     all(target_arch = "wasm32", feature = "esplora_async")
 ))]
@@ -46,6 +47,7 @@ pub(crate) enum CallBlock {
     Number(u64),
     /// The latest block (`latest` tag), whichever it is when the node answers the call
     #[cfg(any(
+        feature = "wallet",
         feature = "_online",
         all(target_arch = "wasm32", feature = "esplora_async")
     ))]
@@ -58,6 +60,7 @@ impl CallBlock {
         match self {
             Self::Number(block) => format!("0x{block:x}"),
             #[cfg(any(
+                feature = "wallet",
                 feature = "_online",
                 all(target_arch = "wasm32", feature = "esplora_async")
             ))]
@@ -155,11 +158,6 @@ impl RejectListLog {
     /// it's seen, while an allow counts only once finalized: an opout is rejected if its finalized
     /// decision is a reject or if any non-finalized entry rejects it, and allowed if its finalized
     /// decision is an allow and no non-finalized entry rejects it.
-    // only the native validation path reads a reject list until BFA receive is wired on wasm
-    #[cfg_attr(
-        all(target_arch = "wasm32", not(feature = "_validation")),
-        allow(dead_code)
-    )]
     pub(crate) fn decisions(&self) -> (HashSet<Opout>, HashSet<Opout>) {
         let (finalized, pending) = self.entries.split_at(self.finalized);
         let finalized = finalized
@@ -345,6 +343,7 @@ pub(crate) fn mint_lock_status_from(
 
 /// The call data of `circulatingSupply()`.
 #[cfg(any(
+    feature = "wallet",
     feature = "_online",
     all(target_arch = "wasm32", feature = "esplora_async")
 ))]
@@ -355,6 +354,7 @@ pub(crate) fn circulating_supply_calldata() -> String {
 /// Decode the result of `circulatingSupply`, returning `None` when the contract doesn't account
 /// it (an address with no code returns no data).
 #[cfg(any(
+    feature = "wallet",
     feature = "_online",
     all(target_arch = "wasm32", feature = "esplora_async")
 ))]
@@ -405,6 +405,7 @@ mod tests {
     fn call_block_param() {
         assert_eq!(CallBlock::from(0x1a4).param(), "0x1a4");
         #[cfg(any(
+            feature = "wallet",
             feature = "_online",
             all(target_arch = "wasm32", feature = "esplora_async")
         ))]
@@ -478,6 +479,7 @@ mod tests {
     }
 
     #[cfg(any(
+        feature = "wallet",
         feature = "_online",
         all(target_arch = "wasm32", feature = "esplora_async")
     ))]
@@ -529,6 +531,7 @@ mod tests {
         assert_eq!(call.data, "0xabcd");
         assert_eq!(block, "0x10");
         #[cfg(any(
+            feature = "wallet",
             feature = "_online",
             all(target_arch = "wasm32", feature = "esplora_async")
         ))]

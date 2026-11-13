@@ -2305,6 +2305,7 @@ dependencies = [
 name = "rgb-lib-wasm"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "rgb-lib",
  "serde",
  "serde_json",

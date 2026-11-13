@@ -52,6 +52,8 @@ pub(crate) mod test_wasm;
 #[cfg(all(test, target_arch = "wasm32", feature = "esplora_async"))]
 pub(crate) mod test_wasm_online;
 
+#[cfg(feature = "wallet")]
+pub use crate::api::evm_claims::{EvmReceiveConfig, EvmReceiveOptions};
 pub use crate::database::enums::TypeOfTransition;
 #[cfg(feature = "_validation")]
 pub use crate::no_wallet::{BitcoindAuth, IndexerConfig, IndexerProtocol};
@@ -110,6 +112,11 @@ pub(crate) use indexer::Indexer;
     feature = "_online",
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
+pub(crate) use objects::PendingMintLocks;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use objects::PendingRetrieval;
 #[cfg(any(
     feature = "_online",
@@ -135,9 +142,8 @@ pub(crate) use objects::ReceivedConsignmentMeta;
 pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots,
     CleanAckOutcome, ExtraAllocations, FailTransfersOutcome, LocalRecipient, LocalRecipientData,
-    LocalWitnessData, MainTransition, OnlineData, PendingMintLocks, PrepareRgbPsbtResult,
-    PrepareTransferPsbtResult, RefreshResultTrait, SelectedInputs, SentMint,
-    TryFailBatchTransferOutcome,
+    LocalWitnessData, MainTransition, OnlineData, PrepareRgbPsbtResult, PrepareTransferPsbtResult,
+    RefreshResultTrait, SelectedInputs, SentMint, TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     AssetTransferColoringInfo, InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails,

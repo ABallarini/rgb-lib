@@ -141,12 +141,9 @@ impl WalletOffline for Wallet {}
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
 impl ReceiveWallet for Wallet {
-    // BFA mint receive over the browser transport is a later step: a mint consignment is refused
-    // rather than left waiting for a lock the browser cannot check
-    #[cfg(all(target_arch = "wasm32", not(feature = "_online")))]
-    fn accepts_received_mints(&self) -> bool {
-        false
-    }
+    // A browser mint receive is accepted when the caller supplies the EVM configuration: the
+    // prefetch turns a missing endpoint into `NoEvmRpcUrl` before the transaction opens, so
+    // reaching the driver without one is impossible.
 }
 
 #[cfg(feature = "_online")]

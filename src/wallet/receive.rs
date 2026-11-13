@@ -26,12 +26,14 @@ use super::*;
 #[cfg(feature = "_online")]
 use super::online::{broadcast_deadline, min_sender_retention_grace};
 // validation steps shared with the standalone validation API
+use crate::api::evm_claims::PrefetchedClaims;
 use crate::api::jsonrpc::{PostAckResponse, transfer_retrieved_message};
+#[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+use crate::no_wallet::validation::DynClaimResolver;
 use crate::no_wallet::validation::{
-    OffchainResolver, ResolveRejectList, pending_claims, validate_deterministic,
+    OffchainResolver, PendingClaims, ResolveRejectList, pending_claims, resolve_claims,
+    validate_deterministic,
 };
-#[cfg(feature = "_online")]
-use crate::no_wallet::validation::{PendingClaims, resolve_claims};
 use rgbstd::validation::Validity;
 
 use crate::error::IndexerError;
@@ -197,13 +199,19 @@ pub trait ReceiveWallet: WalletOffline {
         consignment_path.with_extension("mint_locks.json")
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     fn consignment_file_digest(&self, consignment_path: &Path) -> Result<String, Error> {
         let bytes = self.files().read(&self.wallet_key(consignment_path)?)?;
         Ok(hex::encode(sha256_digest(&bytes)))
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     fn save_pending_mint_locks(
         &self,
         consignment_path: &Path,
@@ -228,7 +236,10 @@ pub trait ReceiveWallet: WalletOffline {
     /// RPC endpoint missing or on another chain) is left to the processing of the consignment.
     #[cfg(feature = "_online")]
     fn waiting_for_mint_locks(&self, consignment_path: &Path) -> Result<bool, Error> {
-        let key = self.wallet_key(&self.get_receive_mint_locks_path(consignment_path))?;
+        // a path outside the wallet has no saved locks: the caller handles it normally
+        let Ok(key) = self.wallet_key(&self.get_receive_mint_locks_path(consignment_path)) else {
+            return Ok(false);
+        };
         let Some(pending_mint_locks) = self
             .files()
             .read(&key)
@@ -265,6 +276,52 @@ pub trait ReceiveWallet: WalletOffline {
                     return Ok(false);
                 }
                 unconfirmed += 1;
+            }
+        }
+        if unconfirmed == 0 {
+            return Ok(false);
+        }
+        info!(
+            self.logger(),
+            "{unconfirmed} mint lock(s) not found or not confirmed on the external chain yet, \
+             will retry"
+        );
+        Ok(true)
+    }
+
+    /// The browser counterpart of [`Self::waiting_for_mint_locks`]: the lock statuses were
+    /// fetched before the transaction opened, so nothing here reaches the network.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+    fn waiting_for_mint_locks_prefetched(
+        &self,
+        consignment_path: &Path,
+        prefetched: &PrefetchedClaims,
+    ) -> Result<bool, Error> {
+        // a path outside the wallet has no saved locks: the caller handles it normally
+        let Ok(key) = self.wallet_key(&self.get_receive_mint_locks_path(consignment_path)) else {
+            return Ok(false);
+        };
+        let Some(pending_mint_locks) = self
+            .files()
+            .read(&key)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PendingMintLocks>(&bytes).ok())
+        else {
+            return Ok(false);
+        };
+        if self.consignment_file_digest(consignment_path).ok()
+            != Some(pending_mint_locks.consignment_digest)
+            || pending_mint_locks.evm_chain_id != prefetched.chain_id()
+        {
+            return Ok(false);
+        }
+        let mut unconfirmed = 0;
+        for claim in &pending_mint_locks.claims {
+            match prefetched.lock_status(claim) {
+                Some(crate::api::evm_abi::MintLockStatus::Confirmed) => {}
+                Some(crate::api::evm_abi::MintLockStatus::Pending) => unconfirmed += 1,
+                // an expired lock, or one the prefetch doesn't cover, is processed normally
+                Some(crate::api::evm_abi::MintLockStatus::Expired) | None => return Ok(false),
             }
         }
         if unconfirmed == 0 {
@@ -1097,6 +1154,199 @@ pub(super) fn release_retrievals<T: ReceiveTransport + ?Sized>(
     }
 }
 
+/// The external-chain answers a receive needs after its claims were resolved.
+///
+/// The native driver owns the blocking client the answers come from; the browser one carries the
+/// answers prefetched before its transaction opened. Either way the receive code below asks the
+/// same questions in the same order.
+pub(crate) struct ResolvedClaims {
+    /// Operation IDs of the claims not confirmed yet.
+    unconfirmed: Vec<OpId>,
+    /// Bridge the claims were checked against.
+    location: BridgeLocation,
+    /// Maximum number of blocks after the latest one a received mint may commit to.
+    max_mint_lock_blocks: u64,
+    #[cfg(feature = "_online")]
+    evm_client: EvmClient,
+    #[cfg(feature = "_online")]
+    bridge_contract: EvmAddress,
+    #[cfg(all(not(feature = "_online"), target_arch = "wasm32"))]
+    lock_recorded: HashMap<OpId, bool>,
+    #[cfg(all(not(feature = "_online"), target_arch = "wasm32"))]
+    latest_block: u64,
+    #[cfg(all(not(feature = "_online"), target_arch = "wasm32"))]
+    circulating_supply: Option<u64>,
+}
+
+impl ResolvedClaims {
+    /// Whether the paying claim's lock is recorded as of the latest block, finalized or not.
+    fn mint_lock_recorded(&self, claim: &Claim) -> Result<bool, Error> {
+        #[cfg(feature = "_online")]
+        {
+            let Claim::Lock {
+                amount,
+                before_block,
+                ..
+            } = claim;
+            self.evm_client.mint_lock_recorded(
+                &self.bridge_contract,
+                &LockId::from(claim),
+                *amount,
+                *before_block,
+            )
+        }
+        #[cfg(all(not(feature = "_online"), target_arch = "wasm32"))]
+        {
+            let Claim::Lock { opid, .. } = claim;
+            Ok(self.lock_recorded.get(opid).copied().unwrap_or(false))
+        }
+    }
+
+    /// Number of the latest block of the external chain.
+    fn latest_block(&self) -> Result<u64, Error> {
+        #[cfg(feature = "_online")]
+        {
+            self.evm_client.block_number()
+        }
+        #[cfg(all(not(feature = "_online"), target_arch = "wasm32"))]
+        {
+            Ok(self.latest_block)
+        }
+    }
+
+    /// Circulating supply accounted by the bridge, if it accounts one.
+    fn circulating_supply(&self, logger: &Logger) -> Option<u64> {
+        #[cfg(feature = "_online")]
+        {
+            match self.evm_client.circulating_supply(&self.bridge_contract) {
+                Ok(Some(supply)) => Some(supply),
+                Ok(None) => {
+                    debug!(
+                        logger,
+                        "The bridge contract doesn't account the circulating supply"
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        logger,
+                        "Cannot read the circulating supply from the bridge contract: {e}"
+                    );
+                    None
+                }
+            }
+        }
+        #[cfg(all(not(feature = "_online"), target_arch = "wasm32"))]
+        {
+            let _ = logger;
+            self.circulating_supply
+        }
+    }
+}
+
+/// Resolve the claims of a receive through the wallet's configured EVM endpoint.
+///
+/// A missing or misconfigured endpoint is a local issue, not one with the consignment: `None` is
+/// returned so the caller keeps the transfer pending and retries at the next refresh.
+#[cfg(feature = "_online")]
+fn resolve_native_claims<W: ReceiveWallet + ?Sized>(
+    wallet: &W,
+    pending: &mut PendingConsignment<true>,
+    pending_claims: &PendingClaims,
+) -> Result<Option<ResolvedClaims>, Error> {
+    let BridgeLocation::Evm(EvmContract { chain_id, address }) = &pending_claims.bridge_location;
+    let (chain_id, address) = (*chain_id, *address);
+    let Some(evm_rpc_url) = wallet.evm_rpc_url(chain_id) else {
+        warn!(
+            wallet.logger(),
+            "Cannot resolve mint locks: no EVM RPC URL configured for chain ID {chain_id}, will \
+             retry"
+        );
+        return Ok(None);
+    };
+    let evm_client = EvmClient::new(evm_rpc_url)?;
+    let mint_resolver = MintClaimResolver::new(&evm_client);
+    let claim_resolver =
+        match CheckedClaimResolver::with(&mint_resolver, pending_claims.bridge_location.clone()) {
+            Ok(claim_resolver) => claim_resolver,
+            Err(ClaimResolverError::WrongChainId { expected, actual }) => {
+                warn!(
+                    wallet.logger(),
+                    "Cannot resolve mint locks: the EVM RPC endpoint configured for chain ID \
+                 {expected} is on chain ID {actual}, will retry"
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+    debug!(
+        wallet.logger(),
+        "Resolving claims {:?} at bridge location {:?}",
+        pending_claims.claims,
+        claim_resolver.location()
+    );
+
+    let unconfirmed = resolve_claims(pending, &claim_resolver, &pending_claims.claims, |opid| {
+        mint_resolver.is_expired(opid)
+    })?;
+    drop(claim_resolver);
+    drop(mint_resolver);
+
+    let max_mint_lock_blocks = wallet
+        .evm_chain(chain_id)
+        .expect("configured along with the EVM RPC URL")
+        .max_mint_lock_blocks;
+    Ok(Some(ResolvedClaims {
+        unconfirmed,
+        location: pending_claims.bridge_location.clone(),
+        max_mint_lock_blocks,
+        evm_client,
+        bridge_contract: address,
+    }))
+}
+
+/// Resolve the claims of a browser receive from the answers fetched before the transaction.
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "esplora_async",
+    not(feature = "_online")
+))]
+fn resolve_prefetched_claims(
+    pending: &mut PendingConsignment<true>,
+    pending_claims: &PendingClaims,
+    prefetched: Option<&PrefetchedClaims>,
+) -> Result<ResolvedClaims, Error> {
+    let BridgeLocation::Evm(EvmContract { chain_id, .. }) = &pending_claims.bridge_location;
+    let prefetched = prefetched.ok_or(Error::NoEvmRpcUrl {
+        chain_id: *chain_id,
+    })?;
+    let claim_resolver = CheckedClaimResolver::with(
+        DynClaimResolver(prefetched),
+        pending_claims.bridge_location.clone(),
+    )?;
+    let unconfirmed = resolve_claims(pending, &claim_resolver, &pending_claims.claims, |opid| {
+        prefetched.is_expired(opid)
+    })?;
+    let lock_recorded = pending_claims
+        .claims
+        .iter()
+        .filter_map(|claim| {
+            let Claim::Lock { opid, .. } = claim;
+            prefetched
+                .is_lock_recorded(claim)
+                .map(|recorded| (*opid, recorded))
+        })
+        .collect();
+    Ok(ResolvedClaims {
+        unconfirmed,
+        location: pending_claims.bridge_location.clone(),
+        max_mint_lock_blocks: prefetched.max_mint_lock_blocks(),
+        lock_recorded,
+        latest_block: prefetched.latest_block(),
+        circulating_supply: prefetched.circulating_supply(),
+    })
+}
+
 /// The per-consignment receive driver, shared by the native and (next) browser paths.
 ///
 /// A private extension trait, so the public [`WalletOnline`] surface stays unchanged.
@@ -1128,6 +1378,7 @@ pub(crate) trait ReceiveDriver: ReceiveWallet {
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        prefetched_claims: Option<&PrefetchedClaims>,
     ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error>;
 
     /// Resume an applied receive left in `WaitingSafeHeight`, without applying it again.
@@ -1150,6 +1401,7 @@ pub(crate) trait ReceiveDriver: ReceiveWallet {
         consignment_path: &Path,
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        prefetched_claims: Option<&PrefetchedClaims>,
     ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error>;
 
     /// The phases of [`Self::drive_receive`], without releasing the proxy data.
@@ -1167,6 +1419,7 @@ pub(crate) trait ReceiveDriver: ReceiveWallet {
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
         resume: bool,
+        prefetched_claims: Option<&PrefetchedClaims>,
     ) -> Result<Option<DbBatchTransfer>, Error>;
 
     /// Sign and post the ACK (or the NACK a retention-grace failure calls for).
@@ -1218,6 +1471,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         consignment_path: &Path,
         mode: ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        prefetched_claims: Option<&PrefetchedClaims>,
     ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error> {
         let recipient_seed = batch_transfer
             .operation_secret_key
@@ -1237,6 +1491,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                 &mode,
                 updated_batch_transfer,
                 false,
+                prefetched_claims,
             )
             .await?;
 
@@ -1260,6 +1515,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         consignment_path: &Path,
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        prefetched_claims: Option<&PrefetchedClaims>,
     ) -> Result<(Option<DbBatchTransfer>, Option<PendingRetrieval>), Error> {
         let recipient_seed = batch_transfer
             .operation_secret_key
@@ -1279,6 +1535,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                 mode,
                 updated_batch_transfer,
                 true,
+                prefetched_claims,
             )
             .await?;
         let retrieval = self.pending_retrieval(mode, release_id, recipient_seed, outcome.is_some());
@@ -1298,6 +1555,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         mode: &ReceiveMode,
         updated_batch_transfer: &mut DbBatchTransferActMod,
         resume: bool,
+        prefetched_claims: Option<&PrefetchedClaims>,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         let mut stock = self.rgb_stock(txn)?;
         // the recipient's per-operation Ed25519 secret seed (for ACK signing / decryption)
@@ -1331,6 +1589,16 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         // a consignment waiting for mint locks has been validated as far as it can be without them
         #[cfg(feature = "_online")]
         if self.waiting_for_mint_locks(consignment_path)? {
+            return Ok(None);
+        }
+        #[cfg(all(
+            target_arch = "wasm32",
+            feature = "esplora_async",
+            not(feature = "_online")
+        ))]
+        if let Some(prefetched) = prefetched_claims
+            && self.waiting_for_mint_locks_prefetched(consignment_path, prefetched)?
+        {
             return Ok(None);
         }
         let consignment = match self.load_received_consignment(consignment_path) {
@@ -1418,17 +1686,6 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
             Err(Error::InvalidConsignment) => refuse!(),
             Err(e) => return Err(e),
         };
-        // claims live on an external chain, which the browser cannot query yet: a consignment
-        // carrying a mint is refused rather than left waiting for it
-        #[cfg(not(feature = "_online"))]
-        if pending_claims.is_some() {
-            error!(
-                self.logger(),
-                "Consignment carries a mint, which the browser wallet doesn't support yet"
-            );
-            return Err(Error::UnsupportedMint { asset_schema });
-        }
-
         // locate the payment to us, now that the consignment structure has been validated
         let spent = receive_checks::known_spent_opouts(&prepared.consignment);
         let mut payments: Vec<_> =
@@ -1627,21 +1884,20 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
             fallback: chain,
         };
 
-        #[allow(unused_mut)] // mutated by the native claims handling only
+        #[allow(unused_mut)] // mutated by the claims handling only
         let mut bridge_circulating_supply: Option<u64> = None;
-        #[cfg(feature = "_online")]
-        if let Some(PendingClaims {
-            bridge_location,
-            claims,
-        }) = pending_claims
-        {
+        if let Some(pending_claims) = &pending_claims {
+            let PendingClaims {
+                bridge_location,
+                claims,
+            } = pending_claims;
             // the RPC endpoint configured for the chain the mint locks live on is checked to
             // actually be on it before being asked about the claims. A missing or misconfigured
             // endpoint is a local issue, not one with the consignment: keep it and retry at the
             // next refresh, without blocking the other transfers, until the transfer expires or,
             // once the mint has been checked (when it no longer expires by a timestamp), until its
             // lock is found expired
-            let BridgeLocation::Evm(EvmContract { chain_id, address }) = &bridge_location;
+            let BridgeLocation::Evm(EvmContract { chain_id, address }) = bridge_location;
             let (chain_id, address) = (*chain_id, *address);
             received_mint = paying_claim.as_ref().map(|claim| {
                 let Claim::Lock {
@@ -1659,49 +1915,31 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                     bridge_contract: address.to_string(),
                 }
             });
-            let Some(evm_rpc_url) = self.evm_rpc_url(chain_id) else {
-                warn!(
-                    self.logger(),
-                    "Cannot resolve mint locks: no EVM RPC URL configured for chain ID \
-                     {chain_id}, will retry"
-                );
-                return Ok(None);
-            };
-            let evm_client = EvmClient::new(evm_rpc_url)?;
-            let mint_resolver = MintClaimResolver::new(&evm_client);
-            let claim_resolver = match CheckedClaimResolver::with(&mint_resolver, bridge_location) {
-                Ok(claim_resolver) => claim_resolver,
-                Err(ClaimResolverError::WrongChainId { expected, actual }) => {
-                    warn!(
-                        self.logger(),
-                        "Cannot resolve mint locks: the EVM RPC endpoint configured for chain \
-                         ID {expected} is on chain ID {actual}, will retry"
-                    );
-                    return Ok(None);
-                }
-                Err(e) => return Err(e.into()),
-            };
-            debug!(
-                self.logger(),
-                "Resolving claims {:?} at bridge location {:?}",
-                claims,
-                claim_resolver.location()
-            );
-
             // confirm each pending claim that has a matching lock recorded by the bridge contract
             // as of the latest finalized block of the external chain, included before the block
             // it commits to. A mint whose lock wasn't is refused right away, as it will never be
             // confirmed
-            let unconfirmed = match resolve_claims(&mut pending, &claim_resolver, &claims, |opid| {
-                mint_resolver.is_expired(opid)
-            }) {
-                Ok(unconfirmed) => unconfirmed,
+            #[cfg(feature = "_online")]
+            let resolved = match resolve_native_claims(self, &mut pending, pending_claims) {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => return Ok(None),
                 Err(e @ Error::MintLockExpired { .. }) => {
                     error!(self.logger(), "{e}");
                     refuse!();
                 }
                 Err(e) => return Err(e),
             };
+            #[cfg(not(feature = "_online"))]
+            let resolved =
+                match resolve_prefetched_claims(&mut pending, pending_claims, prefetched_claims) {
+                    Ok(resolved) => resolved,
+                    Err(e @ Error::MintLockExpired { .. }) => {
+                        error!(self.logger(), "{e}");
+                        refuse!();
+                    }
+                    Err(e) => return Err(e),
+                };
+            let unconfirmed = &resolved.unconfirmed;
 
             let paying_opid = paying_claim.as_ref().map(|Claim::Lock { opid, .. }| *opid);
             if let Some(opid) = &paying_opid
@@ -1738,14 +1976,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                     && !checked_mint
                     && !others_unconfirmed
                 {
-                    if !committed_mint
-                        && evm_client.mint_lock_recorded(
-                            &address,
-                            &LockId::from(paying_claim),
-                            received_mint.amount,
-                            received_mint.before_block,
-                        )?
-                    {
+                    if !committed_mint && resolved.mint_lock_recorded(paying_claim)? {
                         debug!(self.logger(), "Mint lock already recorded");
                         committed_mint = true;
                     }
@@ -1754,11 +1985,8 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                         // expired, keeping the receiving UTXO unspendable: refuse one committing
                         // to a block further than configured, before anyone has a reason to make
                         // the lock
-                        let max_mint_lock_blocks = self
-                            .evm_chain(chain_id)
-                            .expect("configured along with the EVM RPC URL")
-                            .max_mint_lock_blocks;
-                        let latest_block = evm_client.block_number()?;
+                        let max_mint_lock_blocks = resolved.max_mint_lock_blocks;
+                        let latest_block = resolved.latest_block()?;
                         if received_mint.before_block
                             > latest_block.saturating_add(max_mint_lock_blocks)
                         {
@@ -1839,7 +2067,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                     .collect();
                 self.save_pending_mint_locks(
                     consignment_path,
-                    claim_resolver.location(),
+                    &resolved.location,
                     unconfirmed_claims,
                 )?;
                 info!(
@@ -1853,7 +2081,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
 
             // the bridge accounts all the confirmed mints, saved as the asset's known circulating
             // supply once the consignment is accepted
-            bridge_circulating_supply = self.read_bridge_circulating_supply(&evm_client, &address);
+            bridge_circulating_supply = resolved.circulating_supply(self.logger());
         }
 
         // phase 2 and the checks on what the consignment pays
@@ -2705,6 +2933,7 @@ mod tests {
             &dir.path().join("missing.rgbcons"),
             proxy_mode(),
             &mut updated,
+            None,
         ))
         .unwrap();
 

@@ -24,11 +24,11 @@ The implementation is shared with the native wallet: the browser binding is a th
 | Multisig hub paths | Not available on wasm |
 | BDK online access (sync with DB reconciliation, tip height, fee estimation) | Supported over the async Esplora transport (`sync`, `getTipHeight`, `getFeeEstimation`) |
 | RGB receive over a proxy (download, decrypt, validate, ACK/NACK, resume `WaitingSafeHeight`/`WaitingBroadcast`, `transfer.retrieved`) | Supported and exported (`receiveTransfer`, `syncOnline`) over the Fetch proxy client and the prefetched async chain resolver |
-| BFA mint receive | Not wired yet: the shared EVM ABI/request code and the browser `EvmFetchClient` compile (see [Indexers and HTTP](#indexers-and-http)), but no receive path calls them, so a mint consignment is refused and `getReceivedMint` returns `null` |
+| BFA mint receive | Supported when the caller supplies an EVM endpoint (`receiveTransfer`/`syncOnline` `evm` argument): claims, mint locks and EVM reject lists are prefetched before the transaction, and `getReceivedMint` reports the checked mint (`MintLockExpired`, `MintLockNotFound`, `NoEvmRpcUrl` and chain mismatches are typed errors) |
 | Proxy health check | Supported and exported (`checkProxyUrl`): read-only `server.info` over the Fetch proxy client |
 | RGB transfers, send, proxy invoice reservation, media upload, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
 | Out-of-band consignment import and ACK | Native-only: `provide_out_of_band_consignment` and `provide_out_of_band_ack` take `Online` and may broadcast |
-| Async Esplora and Fetch transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive, and the Fetch EVM client is compiled but not wired into BFA receive |
+| Async Esplora and Fetch transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive; the Fetch EVM client serves claim, mint-lock and reject-list prefetch for BFA receive |
 | Backups | Encrypted byte backup/restore supported; path-based filesystem backups native only |
 | Legacy file migrations | Native only |
 | Web Worker | Not required; optional future seam only |
@@ -199,8 +199,8 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | `witnessReceive(asset_id?, assignment, expiration_timestamp, min_confirmations, encryption?)` | JSON. The same out-of-band `ReceiveData` for a new witness script recipient; no colored UTXO is needed. |
 | `getBtcBalance()` | JSON. Vanilla and colored BTC balances from local data; no chain sync. |
 | `sync(indexer_url, stop_gap?)` | Async. BDK full scan against an Esplora endpoint: both keychains, `stop_gap` unused scripts per keychain (default 20). Applies the update and, in the same database transaction, reconciles the pending witness state and registers the newly seen colored TXOs, like the native full scan. Nothing is broadcast and no consignment is received; call `flush()` for durable storage. |
-| `syncOnline(proxy_url, indexer_url, stop_gap?)` | Async. Runs the `sync` scan, then lists the transfers of each pending incoming proxy invoice and receives and ACKs each one addressed to this wallet. A receive left in `WaitingSafeHeight` or `WaitingBroadcast` is resumed; a `Settled` or `Failed` one is skipped. It flushes the handled receives before posting their `transfer.retrieved`, so a failed post is retried by the next call. Returns JSON: the handled `batch_transfer_idx` values. A repeated call is idempotent; a failure rolls back only the transfer it happened on. Call `flush()` afterwards. |
-| `receiveTransfer(proxy_url, indexer_url, transfer_id)` | Async. Receives, validates and ACKs one proxy transfer by ID and broadcasts a released signed TX. The whole receive is one wallet transaction: a failure rolls it back. It flushes the handled receive before posting `transfer.retrieved`, and retries a pending release on the next call. Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already handled. A transfer not addressed to this wallet throws. Call `flush()` afterwards. |
+| `syncOnline(proxy_url, indexer_url, evm?, stop_gap?)` | Async. Runs the `sync` scan, then lists the transfers of each pending incoming proxy invoice and receives and ACKs each one addressed to this wallet. A receive left in `WaitingSafeHeight` or `WaitingBroadcast` is resumed; a `Settled` or `Failed` one is skipped. `evm` is `{ rpcUrl, maxMintLockBlocks }` or a map from decimal chain ID to that object, and is required to receive a BFA mint. It flushes the handled receives before posting their `transfer.retrieved`, so a failed post is retried by the next call. Returns JSON: the handled `batch_transfer_idx` values. A repeated call is idempotent; a failure rolls back only the transfer it happened on. Call `flush()` afterwards. |
+| `receiveTransfer(proxy_url, indexer_url, transfer_id, evm?)` | Async. Receives, validates and ACKs one proxy transfer by ID and broadcasts a released signed TX. `evm` has the same shape as in `syncOnline`; a BFA mint without it throws `No EVM RPC URL configured for chain ID …`. The whole receive is one wallet transaction: a failure rolls it back. It flushes the handled receive before posting `transfer.retrieved`, and retries a pending release on the next call. Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already handled. A transfer not addressed to this wallet throws. Call `flush()` afterwards. |
 | `getTipHeight(indexer_url)` | Async. Best-chain tip height reported by the Esplora endpoint. |
 | `getFeeEstimation(indexer_url, blocks)` | Async. Fee estimate in sat/vB for confirmation within `blocks` (`1..=1008`), interpolated like the native Esplora indexer; an endpoint without fee history throws `Cannot estimate fees`. |
 | `getAssetBalance(asset_id)` | JSON. Settled, future and spendable balance of an RGB asset. |
@@ -373,9 +373,24 @@ The root crate with `esplora_async` compiles the browser transport, resolver and
 `EvmFetchClient` is built from the same `evm_abi` selectors, calldata builders and result decoders as the native
 blocking `EvmClient`, so the two transports cannot drift. It applies a 15 s deadline per request, caps a response body
 at 1 MiB, retries only HTTP 502/503/504 and non-timeout transport errors, maps a reverted `eth_call` to `None` and
-reports a chain-ID mismatch as the typed `EvmChainIdMismatch` error without ever including the endpoint URL. Nothing
-calls it yet: the BFA mint receive path is still native-only, so the client and the shared ABI code compile into the
-wasm build but are not assembled into a receive.
+reports a chain-ID mismatch as the typed `EvmChainIdMismatch` error without ever including the endpoint URL.
+
+## BFA mint receive
+
+A BFA consignment carries claims (mint locks) living on the EVM chain its bridge commits to, and may declare an EVM
+reject list. Both are resolved before the wallet transaction opens: `EvmReceiveOptions`/`EvmReceiveConfig` name the
+endpoint and the maximum lock horizon, and the browser fetches the chain ID (checked against the bridge), the finalized
+block, each claim's lock status as of it, whether the paying lock is already recorded, the latest block, the circulating
+supply and the reject-list entries. A missing endpoint is `NoEvmRpcUrl`, a node on another chain is
+`EvmChainIdMismatch`, a too-long claim set or reject list is refused, and the whole prefetch has a claim-count cap and a
+wall-clock deadline. The shared receive driver then resolves the claims with that prefetched resolver: a lock not
+finalized yet leaves the consignment waiting (`PendingMintLocks`, no colorings), an expired lock fails it with
+`MintLockExpired`, and a paying mint is checked once and saved so `getReceivedMint` can report its `lock_id`, `amount`
+and `before_block`. The ACK/NACK/retrieval ordering, the single-allocation rule and the per-UTXO slot limits are the
+native ones, because the same driver runs both paths.
+
+Still deferred on wasm: `mintBegin`/`mintEnd`, send, link and burn, which need the native `_online` flow; the browser can
+currently receive and check a mint posted by a counterparty, not create one.
 
 The bindings crate enables `wallet,esplora_async`, so the generated package contains the transport and the three read-only methods. No native blocking transport is in the wasm graph: `bitcoind`, `electrum` and `esplora` are native-only, and the graph check rejects their crates.
 

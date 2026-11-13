@@ -21,13 +21,15 @@ use super::receive::{
 };
 use super::resolver_async::PrefetchedChain;
 use super::*;
+use crate::api::evm_claims::{EvmReceiveOptions, PrefetchedClaims};
 use crate::api::fetch::ProxyFetchClient;
 use crate::api::jsonrpc::{
     PostAckResponse, ProxyTransferState, list_transfers_message, map_proxy_error,
 };
 use crate::encryption::sha256_digest;
 use crate::no_wallet::validation::{
-    RejectList, RejectListSource, ResolveRejectList, genesis_reject_list_source,
+    PendingClaims, RejectList, RejectListSource, ResolveRejectList, genesis_reject_list_source,
+    pending_claims, validate_deterministic,
 };
 use base64::{Engine as _, engine::general_purpose};
 
@@ -59,6 +61,7 @@ impl ResolveRejectList for PrefetchedRejectLists {
 async fn prefetch_reject_lists(
     wallet: &Wallet,
     consignment: Option<&RgbTransfer>,
+    evm: Option<&EvmReceiveOptions>,
 ) -> Result<PrefetchedRejectLists, Error> {
     let mut lists = HashMap::new();
     let Some(consignment) = consignment else {
@@ -81,30 +84,87 @@ async fn prefetch_reject_lists(
             }
             lists.insert(source, reject_list);
         }
-        RejectListSource::Evm(_) => {
-            return Err(Error::Internal {
-                details: s!("EVM reject lists are not supported in the browser"),
-            });
+        RejectListSource::Evm(contract) => {
+            let config =
+                evm.and_then(|evm| evm.config(contract.chain_id))
+                    .ok_or(Error::NoEvmRpcUrl {
+                        chain_id: contract.chain_id,
+                    })?;
+            let reject_list = PrefetchedClaims::fetch_reject_list(config, contract).await?;
+            lists.insert(source, reject_list);
         }
     }
     Ok(PrefetchedRejectLists { lists })
 }
 
+/// The claims the consignment's deterministic validation leaves to confirm, read before the
+/// transaction opens: the driver validates it again, but this is the only chance to ask the EVM
+/// node without holding the transaction across the network.
+fn consignment_pending_claims(
+    wallet: &Wallet,
+    consignment: &RgbTransfer,
+    tip_height: u32,
+    min_confirmations: u8,
+) -> Option<PendingClaims> {
+    let asset_schema: AssetSchema = consignment.schema_id().try_into().ok()?;
+    let validation_config = ValidationConfig {
+        chain_net: wallet.chain_net(),
+        build_ops_dag: asset_schema.supports_reject_list(),
+        safe_height: std::num::NonZeroU32::new(super::receive::safe_height(
+            tip_height,
+            min_confirmations,
+        )),
+    };
+    let mut pending = validate_deterministic(consignment, asset_schema, &validation_config).ok()?;
+    pending_claims(&mut pending, asset_schema).ok().flatten()
+}
+
+/// Fetch the EVM answers a receive will need, or fail with the configured endpoint that is
+/// missing, before the transaction opens.
+async fn prefetch_claims(
+    wallet: &Wallet,
+    consignment: &RgbTransfer,
+    tip_height: u32,
+    min_confirmations: u8,
+    evm: Option<&EvmReceiveOptions>,
+) -> Result<Option<PrefetchedClaims>, Error> {
+    let Some(pending) =
+        consignment_pending_claims(wallet, consignment, tip_height, min_confirmations)
+    else {
+        return Ok(None);
+    };
+    let BridgeLocation::Evm(EvmContract { chain_id, .. }) = &pending.bridge_location;
+    let config = evm
+        .and_then(|evm| evm.config(*chain_id))
+        .ok_or(Error::NoEvmRpcUrl {
+            chain_id: *chain_id,
+        })?;
+    Ok(Some(PrefetchedClaims::fetch(config, &pending).await?))
+}
+
 /// [`ReceiveTransport`] over the browser's `fetch` client.
 struct WasmReceiveTransport<'a, W: WalletOffline + ?Sized> {
     wallet: &'a W,
-    /// Esplora endpoint that answers the chain queries (tip height, broadcast).
+    /// Esplora endpoint that answers the broadcast and any chain query not prefetched.
     indexer_url: &'a str,
+    /// Tip height fetched before the transaction opened.
+    tip_height: u32,
     /// Reject lists prefetched before the transaction opened.
     reject_lists: &'a PrefetchedRejectLists,
 }
 
 #[allow(dead_code)]
 impl<'a, W: WalletOffline + ?Sized> WasmReceiveTransport<'a, W> {
-    fn new(wallet: &'a W, indexer_url: &'a str, reject_lists: &'a PrefetchedRejectLists) -> Self {
+    fn new(
+        wallet: &'a W,
+        indexer_url: &'a str,
+        tip_height: u32,
+        reject_lists: &'a PrefetchedRejectLists,
+    ) -> Self {
         Self {
             wallet,
             indexer_url,
+            tip_height,
             reject_lists,
         }
     }
@@ -243,9 +303,7 @@ impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W>
     }
 
     async fn tip_height(&self) -> Result<u32, Error> {
-        EsploraTransport::new(self.indexer_url)?
-            .get_latest_block_height()
-            .await
+        Ok(self.tip_height)
     }
 
     async fn broadcast(&self, tx: BdkTransaction) -> Result<(), Error> {
@@ -468,9 +526,10 @@ impl Wallet {
         proxy_url: &str,
         indexer_url: &str,
         transfer_id: &str,
+        evm: Option<EvmReceiveOptions>,
     ) -> Result<Option<i32>, Error> {
         match self
-            .receive_proxy_transfer(proxy_url, indexer_url, transfer_id)
+            .receive_proxy_transfer(proxy_url, indexer_url, transfer_id, evm.as_ref())
             .await?
         {
             ReceiveOutcome::Handled | ReceiveOutcome::AlreadyHandled | ReceiveOutcome::Waiting => {
@@ -502,10 +561,11 @@ impl Wallet {
         &mut self,
         proxy_url: &str,
         indexer_url: &str,
+        evm: Option<EvmReceiveOptions>,
         stop_gap: Option<usize>,
     ) -> Result<Vec<i32>, Error> {
         self.sync_async(indexer_url, stop_gap).await?;
-        self.receive_pending_proxy_transfers(proxy_url, indexer_url)
+        self.receive_pending_proxy_transfers(proxy_url, indexer_url, evm.as_ref())
             .await
     }
 
@@ -516,6 +576,7 @@ impl Wallet {
         &mut self,
         proxy_url: &str,
         indexer_url: &str,
+        evm: Option<&EvmReceiveOptions>,
     ) -> Result<Vec<i32>, Error> {
         let pending = pending_receives(&self.db_data()?)?;
         let client = ProxyFetchClient::new(proxy_url)?;
@@ -568,7 +629,7 @@ impl Wallet {
 
             for transfer_id in transfers {
                 match self
-                    .receive_proxy_transfer(proxy_url, indexer_url, &transfer_id)
+                    .receive_proxy_transfer(proxy_url, indexer_url, &transfer_id, evm)
                     .await?
                 {
                     ReceiveOutcome::Handled => {
@@ -600,6 +661,7 @@ impl Wallet {
         &mut self,
         indexer_url: &str,
         candidate: PendingReceive,
+        evm: Option<&EvmReceiveOptions>,
     ) -> Result<ReceiveOutcome, Error> {
         let status = candidate.batch.status;
         if !matches!(
@@ -623,12 +685,26 @@ impl Wallet {
 
         // the safe-height check resolves the unsafe history again, so prefetch those answers
         // before the database transaction opens
+        let tip_height = EsploraTransport::new(indexer_url)?
+            .get_latest_block_height()
+            .await?;
         let mut reject_lists = PrefetchedRejectLists::default();
+        let mut prefetched_claims = None;
         let prefetched = if status == TransferStatus::WaitingSafeHeight {
             let key = self.wallet_key(&consignment_path)?;
             let bytes = self.files().read(&key)?;
             let questions = RgbTransfer::load(bytes.as_slice()).ok();
-            reject_lists = prefetch_reject_lists(self, questions.as_ref()).await?;
+            reject_lists = prefetch_reject_lists(self, questions.as_ref(), evm).await?;
+            if let Some(questions) = &questions {
+                prefetched_claims = prefetch_claims(
+                    self,
+                    questions,
+                    tip_height,
+                    candidate.batch.min_confirmations,
+                    evm,
+                )
+                .await?;
+            }
             Some(prefetch_chain_answers(self, indexer_url, questions.as_ref()).await?)
         } else {
             None
@@ -643,7 +719,7 @@ impl Wallet {
             .unwrap_or_default();
         let mut updated_batch_transfer: DbBatchTransferActMod = candidate.batch.clone().into();
         let outcome = {
-            let transport = WasmReceiveTransport::new(self, indexer_url, &reject_lists);
+            let transport = WasmReceiveTransport::new(self, indexer_url, tip_height, &reject_lists);
             match prefetched {
                 Some(chain) => {
                     self.resume_receive(
@@ -657,6 +733,7 @@ impl Wallet {
                         &consignment_path,
                         &mode,
                         &mut updated_batch_transfer,
+                        prefetched_claims.as_ref(),
                     )
                     .await
                 }
@@ -774,7 +851,7 @@ impl Wallet {
                 continue;
             };
             let empty_lists = PrefetchedRejectLists::default();
-            let transport = WasmReceiveTransport::new(self, indexer_url, &empty_lists);
+            let transport = WasmReceiveTransport::new(self, indexer_url, 0, &empty_lists);
             if transport
                 .mark_transfer_retrieved(&marker.proxy_url, &marker.transfer_id, &seed)
                 .await
@@ -792,6 +869,7 @@ impl Wallet {
         proxy_url: &str,
         indexer_url: &str,
         transfer_id: &str,
+        evm: Option<&EvmReceiveOptions>,
     ) -> Result<ReceiveOutcome, Error> {
         // a re-run after the ACK may find the proxy data already deleted: the local record of the
         // transfer ID is what makes the call idempotent, so check it before any network access
@@ -804,7 +882,7 @@ impl Wallet {
             candidate.transfer.proxy_transfer_id.as_deref() == Some(transfer_id)
                 && candidate.batch.status != TransferStatus::WaitingCounterparty
         }) {
-            return self.resume_proxy_receive(indexer_url, candidate).await;
+            return self.resume_proxy_receive(indexer_url, candidate, evm).await;
         }
 
         // a previous attempt may have cached the consignment and its metadata before failing in the
@@ -815,7 +893,7 @@ impl Wallet {
             && cached.candidate.batch.status != TransferStatus::WaitingCounterparty
         {
             return self
-                .resume_proxy_receive(indexer_url, cached.candidate.clone())
+                .resume_proxy_receive(indexer_url, cached.candidate.clone(), evm)
                 .await;
         }
         let (candidate, data, consignment_bytes, consignment_path) = match cached {
@@ -899,7 +977,7 @@ impl Wallet {
                         {
                             let empty_lists = PrefetchedRejectLists::default();
                             let transport =
-                                WasmReceiveTransport::new(self, indexer_url, &empty_lists);
+                                WasmReceiveTransport::new(self, indexer_url, 0, &empty_lists);
                             self.refuse_consignment_via(
                                 &transport,
                                 &txn,
@@ -952,7 +1030,23 @@ impl Wallet {
         // parse once for the prefetch set; a malformed consignment still runs the driver, which
         // refuses it with the same error a native load would report
         let questions = RgbTransfer::load(consignment_bytes.as_slice()).ok();
-        let reject_lists = prefetch_reject_lists(self, questions.as_ref()).await?;
+        let tip_height = EsploraTransport::new(indexer_url)?
+            .get_latest_block_height()
+            .await?;
+        let reject_lists = prefetch_reject_lists(self, questions.as_ref(), evm).await?;
+        let prefetched_claims = match &questions {
+            Some(questions) => {
+                prefetch_claims(
+                    self,
+                    questions,
+                    tip_height,
+                    candidate.batch.min_confirmations,
+                    evm,
+                )
+                .await?
+            }
+            None => None,
+        };
         let prefetched = prefetch_chain_answers(self, indexer_url, questions.as_ref()).await?;
 
         let txn = self.database().begin_transaction()?;
@@ -979,7 +1073,7 @@ impl Wallet {
 
         let mut updated_batch_transfer: DbBatchTransferActMod = candidate.batch.clone().into();
         let outcome = {
-            let transport = WasmReceiveTransport::new(self, indexer_url, &reject_lists);
+            let transport = WasmReceiveTransport::new(self, indexer_url, tip_height, &reject_lists);
             self.drive_receive(
                 &transport,
                 &prefetched,
@@ -991,6 +1085,7 @@ impl Wallet {
                 &consignment_path,
                 mode,
                 &mut updated_batch_transfer,
+                prefetched_claims.as_ref(),
             )
             .await
         };

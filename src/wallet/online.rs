@@ -2350,6 +2350,7 @@ pub trait WalletOnline: WalletOffline + receive::ReceiveWallet {
             consignment_path,
             mode,
             updated_batch_transfer,
+            None,
         ))?;
         Ok(outcome)
     }

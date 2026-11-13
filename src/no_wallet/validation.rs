@@ -941,7 +941,7 @@ pub(crate) enum ClaimResolution<'a> {
 
 /// A claim resolver provided as a trait object, as rgb-ops only implements [`ResolveClaim`]
 /// for references to sized resolvers.
-struct DynClaimResolver<'a>(&'a dyn ResolveClaim);
+pub(crate) struct DynClaimResolver<'a>(pub(crate) &'a dyn ResolveClaim);
 
 impl ResolveClaim for DynClaimResolver<'_> {
     fn evm_chain_id(&self) -> Result<u64, ClaimResolverError> {

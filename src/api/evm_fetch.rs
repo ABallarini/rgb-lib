@@ -37,13 +37,11 @@ const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024;
 const RPC_RETRIES: u32 = 2;
 
 /// Async JSON-RPC client for an EVM node over the browser `fetch` API.
-#[allow(dead_code)] // receive wiring is not assembled yet; the methods are exercised by the ABI tests
 pub(crate) struct EvmFetchClient {
     client: Client,
     rpc_url: String,
 }
 
-#[allow(dead_code)]
 impl EvmFetchClient {
     /// Build the client; constructing it contacts no server.
     pub(crate) fn new(rpc_url: &str) -> Result<Self, Error> {
@@ -213,17 +211,6 @@ impl EvmFetchClient {
         )
     }
 
-    /// Check that the node serves the chain the bridge lives on, failing with a typed
-    /// [`Error::EvmChainIdMismatch`] otherwise.
-    pub(crate) async fn check_chain_id(&self, expected: u64) -> Result<(), Error> {
-        let actual = self.chain_id().await?;
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(Error::EvmChainIdMismatch { expected, actual })
-        }
-    }
-
     /// Number of the latest block (`eth_blockNumber`).
     pub(crate) async fn block_number(&self) -> Result<u64, Error> {
         parse_block_number(&self.rpc::<_, String>("eth_blockNumber", NO_PARAMS).await?)
@@ -272,6 +259,22 @@ impl EvmFetchClient {
             .funds_in_block(contract, lock_id, amount, finalized_block)
             .await?;
         Ok(mint_lock_status_from(record, before_block, finalized_block))
+    }
+
+    /// Whether the bridge contract at `contract` records, as of the latest block, a lock of
+    /// `amount` with ID `lock_id` included before `before_block`, finalized or not.
+    pub(crate) async fn mint_lock_recorded(
+        &self,
+        contract: &EvmAddress,
+        lock_id: &LockId,
+        amount: u64,
+        before_block: u64,
+    ) -> Result<bool, Error> {
+        Ok(matches!(
+            self.funds_in_block(contract, lock_id, amount, CallBlock::Latest)
+                .await?,
+            Some(block) if block < before_block
+        ))
     }
 
     /// The circulating supply accounted by the bridge contract at `contract` as of the latest

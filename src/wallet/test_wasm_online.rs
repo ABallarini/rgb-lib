@@ -357,18 +357,18 @@ async fn regtest_proxy_receive_smoke() {
 
     // the online sync lists the pending invoices and receives what the proxy holds for them
     wallet
-        .sync_online_async(proxy_url, esplora_url, None)
+        .sync_online_async(proxy_url, esplora_url, None, None)
         .await
         .expect("online sync with a pending proxy receive");
 
     // receiving the named transfer again is idempotent: it must return the same batch transfer
     let first = wallet
-        .receive_transfer_async(proxy_url, esplora_url, transfer_id)
+        .receive_transfer_async(proxy_url, esplora_url, transfer_id, None)
         .await
         .expect("receive the prepared proxy transfer")
         .expect("the prepared transfer belongs to a batch transfer");
     let second = wallet
-        .receive_transfer_async(proxy_url, esplora_url, transfer_id)
+        .receive_transfer_async(proxy_url, esplora_url, transfer_id, None)
         .await
         .expect("re-receive is idempotent");
     assert_eq!(second, Some(first));
