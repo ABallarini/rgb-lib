@@ -996,14 +996,13 @@ mod tests {
             .unwrap();
         let transfer_data = WalletPath::new("transfers/txid/asset/transfer_data.txt").unwrap();
         files.write(&transfer_data, b"data").unwrap();
-        assert_eq!(
+        assert!(
             dir.path()
                 .join("transfers")
                 .join("txid")
                 .join("asset")
                 .join("transfer_data.txt")
-                .is_file(),
-            true
+                .is_file()
         );
         assert_eq!(
             files.list(&WalletPath::new("transfers").unwrap()).unwrap(),

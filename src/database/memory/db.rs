@@ -202,6 +202,7 @@ pub struct InMemoryDb {
     pub(crate) counters: std::sync::Arc<MemoryOpCounters>,
 }
 
+#[allow(dead_code)]
 impl InMemoryDb {
     pub fn new() -> Self {
         Self {
@@ -1705,7 +1706,8 @@ pub(crate) struct InMemoryTxn<'a> {
 
 macro_rules! table_fields {
     ($($f:ident),+ $(,)?) => {
-        impl InMemoryDb {
+        #[allow(dead_code)]
+impl InMemoryDb {
             pub(crate) fn snapshot(&self) -> InMemoryDb {
                 let mut snap = self.clone();
                 snap.tx_open = RefCell::new(false);
@@ -1753,6 +1755,7 @@ table_fields!(
     bdk_changeset,
 );
 
+#[allow(dead_code)]
 impl InMemoryDb {
     /// Reserve the single transaction slot of this store.
     pub(crate) fn open_tx(&self) -> Result<(), Error> {
@@ -1784,6 +1787,7 @@ impl InMemoryDb {
     }
 }
 
+#[allow(dead_code)]
 impl InMemoryTxn<'_> {
     pub(crate) fn on_commit(&self, f: impl FnOnce() + 'static) {
         self.on_commit.borrow_mut().push(Box::new(f));
@@ -2587,6 +2591,7 @@ mod tests {
         assert_eq!(row.r#type, WalletTransactionType::Drain);
     }
 
+    #[test]
     fn test_backup_info_set_get_update_del() {
         let db = make_db();
 
@@ -2918,13 +2923,11 @@ mod tests {
         let txn = db.begin_transaction().unwrap();
         db.set_asset(make_asset_mod("outer")).unwrap();
 
-        let kept = txn
-            .with_savepoint(|_| {
-                db.set_asset(make_asset_mod("inner-kept"))?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(kept, ());
+        txn.with_savepoint(|_| {
+            db.set_asset(make_asset_mod("inner-kept"))?;
+            Ok(())
+        })
+        .unwrap();
 
         let err = txn
             .with_savepoint(|_| -> Result<(), Error> {

@@ -281,18 +281,21 @@ rgb_fs_store_migration = ["wallet", "sqlite", "rgb-ops/legacy"]
 _online = ["wallet"]
 bitcoind = [
     "_online",
+    "sqlite",
     "bdk_bitcoind_rpc",
     "reqwest",
     "rgb-ops/bitcoind_blocking",
 ]
 electrum = [
     "_online",
+    "sqlite",
     "bdk_electrum",
     "reqwest",
     "rgb-ops/electrum_blocking",
 ]
 esplora = [
     "_online",
+    "sqlite",
     "bdk_esplora",
     "reqwest",
     "rgb-ops/esplora_blocking",

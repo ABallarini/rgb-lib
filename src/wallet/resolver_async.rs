@@ -399,7 +399,7 @@ mod tests {
         let block = header(1);
         let mut resolver = FakeChain::new(chain_net);
         resolver.witnesses.insert(txid, status.clone());
-        resolver.headers.insert(height(1), block.clone());
+        resolver.headers.insert(height(1), block);
 
         let prefetched = block_on(PrefetchedChain::fetch(
             &resolver,
@@ -768,7 +768,7 @@ mod tests {
         let old = header(10);
         let new = header(20);
         let mut resolver = FakeChain::new(chain_net);
-        resolver.headers.insert(height(100), old.clone());
+        resolver.headers.insert(height(100), old);
 
         let before = block_on(PrefetchedChain::fetch(
             &resolver,
@@ -779,7 +779,7 @@ mod tests {
         .expect("prefetch before the reorg");
 
         // same height, different block: the tip the resolver serves changed
-        resolver.headers.insert(height(100), new.clone());
+        resolver.headers.insert(height(100), new);
         let after = block_on(PrefetchedChain::fetch(
             &resolver,
             chain_net,

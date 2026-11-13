@@ -99,7 +99,7 @@ fn manifest_is_written_through_the_adapter() {
     assert_eq!(through_adapter, fs::read(&manifest_path).unwrap());
 
     // the bytes are those of the pretty-printed manifest, and no temp sibling was left behind
-    let manifest = WalletManifest::read(&*wallet.files(), &wallet_dir).unwrap();
+    let manifest = WalletManifest::read(wallet.files(), &wallet_dir).unwrap();
     assert_eq!(
         through_adapter,
         serde_json::to_string_pretty(&manifest).unwrap().as_bytes()
@@ -337,7 +337,7 @@ fn multisig_hub_ops_layout_is_unchanged() {
 #[parallel]
 fn issued_contract_consignment_is_written_through_the_adapter() {
     let data_dir = tempfile::tempdir().unwrap();
-    let mut wallet = new_test_wallet(data_dir.path());
+    let wallet = new_test_wallet(data_dir.path());
     let wallet_dir = wallet.get_wallet_dir();
 
     // the offline issuer needs one unspent colored TXO; no indexer takes part

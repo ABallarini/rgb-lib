@@ -23,7 +23,7 @@ pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 /// the browser. The layout is the contract's own file encoding with the validated-consignment
 /// magic and the JSON validation status appended; the native issuance test pins this output to
 /// `save_file`, byte for byte.
-#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+#[allow(dead_code)] // wasm issuance and some feature/test combinations
 pub(crate) fn contract_file_bytes(valid_contract: &ValidContract) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     valid_contract

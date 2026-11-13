@@ -1359,7 +1359,7 @@ impl RgbLibDatabase {
 }
 
 /// Transaction handle of [`RgbLibDatabase`], over either backend.
-#[allow(private_interfaces)]
+#[allow(private_interfaces, clippy::large_enum_variant)]
 pub enum DbTxn {
     #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
     Sqlite(SqliteTxn),
