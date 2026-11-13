@@ -4,6 +4,12 @@
 
 use super::*;
 
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use crate::api::jsonrpc::ServerInfoResponse;
+
 #[cfg(not(target_arch = "wasm32"))]
 const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
@@ -436,9 +442,12 @@ pub(crate) fn calculate_descriptor_from_xpub(
 /// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
 /// expiration it keeps the data awaiting retrieval. A proxy not advertising it is considered to
 /// grant none.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "_online"))]
     if let Some(grace) = mock_retention_grace() {
         return grace;
     }
@@ -838,6 +847,16 @@ impl<'txn> RgbStock<'txn> {
         self.stock
             .accept_transfer(contract, resolver)
             .map_err(Error::from)
+    }
+
+    /// The witnesses anchoring `bundle_id`, as the browser prefetch needs them before opening the
+    /// database transaction that consumes the consignment.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+    pub(crate) fn bundle_witnesses(&self, bundle_id: BundleId) -> Result<BTreeSet<RgbTxid>, Error> {
+        Ok(rgbstd::persistence::RgbStore::bundle_witnesses(
+            self.stock.as_store(),
+            bundle_id,
+        )?)
     }
 
     pub(crate) fn consume_fascia(

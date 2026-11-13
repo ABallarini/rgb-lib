@@ -26,7 +26,10 @@ use super::*;
 #[cfg(feature = "_online")]
 use super::online::{broadcast_deadline, min_sender_retention_grace};
 // validation steps shared with the standalone validation API
-use crate::no_wallet::validation::{OffchainResolver, pending_claims, validate_deterministic};
+use crate::api::jsonrpc::{PostAckResponse, transfer_retrieved_message};
+use crate::no_wallet::validation::{
+    OffchainResolver, ResolveRejectList, pending_claims, validate_deterministic,
+};
 #[cfg(feature = "_online")]
 use crate::no_wallet::validation::{PendingClaims, resolve_claims};
 use rgbstd::validation::Validity;
@@ -69,7 +72,7 @@ pub trait ReceiveWallet: WalletOffline {
     }
 
     fn set_hub_accept_status(&self, _batch_transfer_idx: i32) -> Result<Option<bool>, Error> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "_online"))]
         if mock_hub_accept_pending() {
             return Ok(None);
         }
@@ -191,9 +194,6 @@ pub trait ReceiveWallet: WalletOffline {
             .atomic_write(&self.wallet_key(&path)?, serialized.as_bytes())?;
         Ok(())
     }
-
-    /// Load the validated consignment of a received transfer is a native-only step (see
-    /// `WalletOnline::load_received_valid_transfer`): the browser driver revalidates instead.
 
     /// Path of the mint locks the received consignment at `consignment_path` waits for (see
     /// [`PendingMintLocks`]).
@@ -1310,6 +1310,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
             .clone()
             .unwrap_or_default();
         // the mint paying the recipient, once the consignment is found to carry one
+        #[allow(unused_mut)] // mutated by the native claims handling only
         let mut received_mint: Option<ReceivedMint> = None;
         // refuse the consignment (see refuse_consignment_via), ending the processing. A mint is
         // known as such once checked (by an earlier refresh) or once its claims are read.
@@ -1406,7 +1407,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         };
         // phase 1: everything that only depends on the consignment itself, then the external
         // claims (mint locks) to confirm before resolving the witnesses
-        #[cfg(test)]
+        #[cfg(all(test, feature = "_online"))]
         count_received_consignment_validation();
         let pending_and_claims =
             validate_deterministic(&prepared.consignment, asset_schema, &validation_config)
@@ -1414,6 +1415,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                     let claims = pending_claims(&mut pending, asset_schema)?;
                     Ok((pending, claims))
                 });
+        #[allow(unused_mut)] // mutated by the native claims handling only
         let (mut pending, pending_claims) = match pending_and_claims
             .map_err(|e| receive_checks::received_validation_error(e, self.logger()))
         {
@@ -1465,7 +1467,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         // always be merged, while each extra allocation weighs on the receiving UTXO (spending it
         // moves all of its allocations, which a bundle limits)
         let single_allocation = receiving.len() == 1;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "_online"))]
         let single_allocation = single_allocation || accept_multiple_allocations();
         if !single_allocation {
             error!(
@@ -1539,6 +1541,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         // check by a bridge locking right away, or for a wallet restored from a backup older than
         // the check). The UTXO allocations are checked anyway (see below)
         let checked_mint = self.read_received_mint(&recipient_id)?.is_some();
+        #[allow(unused_mut)] // mutated by the native claims handling only
         let mut committed_mint = checked_mint;
 
         // a UTXO holding more allocations of the asset than a bundle can spend would be frozen,
@@ -1629,6 +1632,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
             fallback: chain,
         };
 
+        #[allow(unused_mut)] // mutated by the native claims handling only
         let mut bridge_circulating_supply: Option<u64> = None;
         #[cfg(feature = "_online")]
         if let Some(PendingClaims {

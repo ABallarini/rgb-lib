@@ -250,6 +250,7 @@ async fn regtest_esplora_online_smoke() {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
         supported_schemas: AssetSchema::VALUES.to_vec(),
+        allow_reckless_schemas: false,
     };
     let mut wallet = Wallet::new_in_memory(wallet_data.clone(), wallet_keys.clone())
         .expect("wallet over the in-memory backend");
@@ -349,6 +350,7 @@ async fn regtest_proxy_receive_smoke() {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
         supported_schemas: AssetSchema::VALUES.to_vec(),
+        allow_reckless_schemas: false,
     };
     let mut wallet = Wallet::new_in_memory(wallet_data, SinglesigKeys::from_keys(&keys, None))
         .expect("wallet over the in-memory backend");

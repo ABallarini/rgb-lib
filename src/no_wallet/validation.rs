@@ -317,7 +317,7 @@ impl From<RejectListLocation> for RejectListSource {
 ///
 /// This only tells whether an opout is listed: which decision applies to an allocation, given the
 /// ones along its history, is decided when walking the history (see `rejected_opouts`).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RejectList {
     pub(crate) reject_opouts: HashSet<Opout>,
     pub(crate) allow_opouts: HashSet<Opout>,

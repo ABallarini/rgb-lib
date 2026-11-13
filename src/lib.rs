@@ -636,9 +636,9 @@ use crate::{
         proxy::{
             AckTransferData, GetAckResponse, GetConsignmentResponse, InvoiceStatus, JsonRpcError,
             JsonRpcResponse, PostAckResponse, PostConsignmentData, ProxyClient, ProxyTransferState,
-            ServerInfoResponse, get_ack_message, list_transfers_message, map_proxy_error,
-            post_consignment_message, post_media_message, pow_difficulty_required,
-            prepare_ack_auth_message, prepare_invoice_auth_message, transfer_retrieved_message,
+            get_ack_message, list_transfers_message, map_proxy_error, post_consignment_message,
+            post_media_message, pow_difficulty_required, prepare_ack_auth_message,
+            prepare_invoice_auth_message, transfer_retrieved_message,
         },
     },
     database::entities::{
@@ -646,8 +646,8 @@ use crate::{
         wallet_transaction::ActiveModel as DbWalletTransactionActMod,
     },
     encryption::{
-        decode_hash_hex, decrypt_blob, decrypt_stream, derive_shared, ed25519_from_seed,
-        encrypt_blob, encrypt_to_tempfile, invoice_id, sign_ed25519, transfer_id, verify_ed25519,
+        decode_hash_hex, decrypt_stream, derive_shared, ed25519_from_seed, encrypt_blob,
+        encrypt_to_tempfile, invoice_id, sign_ed25519, transfer_id, verify_ed25519,
         verifying_key_from_bytes,
     },
     no_wallet::{BitcoindAuth, IndexerConfig},
@@ -695,10 +695,7 @@ use crate::utils::adjust_canonicalization;
     not(feature = "_online")
 ))]
 use crate::{
-    encryption::{
-        decode_hash_hex, decrypt_blob, derive_shared, ed25519_from_seed, sign_ed25519,
-        verifying_key_from_bytes,
-    },
+    encryption::{derive_shared, ed25519_from_seed, sign_ed25519, verifying_key_from_bytes},
     utils::script_buf_from_recipient_id,
 };
 #[cfg(all(test, feature = "wallet"))]

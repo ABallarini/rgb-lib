@@ -2,6 +2,11 @@
 //!
 //! This module defines the methods of the [`Wallet`] structure.
 
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use super::receive::ReceiveWallet;
 use super::*;
 
 /// Keys for the singlesig wallet.
@@ -131,8 +136,18 @@ impl WalletBackup for Wallet {
 impl WalletOffline for Wallet {}
 
 // the shared receive driver runs on the singlesig wallet, with the defaults its trait provides
-#[cfg(feature = "_online")]
-impl ReceiveWallet for Wallet {}
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+impl ReceiveWallet for Wallet {
+    // BFA mint receive over the browser transport is a later step: a mint consignment is refused
+    // rather than left waiting for a lock the browser cannot check
+    #[cfg(all(target_arch = "wasm32", not(feature = "_online")))]
+    fn accepts_received_mints(&self) -> bool {
+        false
+    }
+}
 
 #[cfg(feature = "_online")]
 impl WalletOnline for Wallet {

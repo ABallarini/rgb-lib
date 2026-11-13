@@ -25,11 +25,14 @@ pub mod persistence;
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
 pub(crate) mod receive_checks;
-// FOLLOW-UP(wasm-receive): the shared receive driver is native only until the browser transport
-// and the prefetched resolvers are wired (see `receive_wasm`).
-#[cfg(feature = "_online")]
+// FOLLOW-UP(wasm-receive): the shared receive driver runs natively and, over the browser
+// transport in `receive_wasm`, on wasm32.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) mod receive;
-#[cfg(any())]
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
 pub(crate) mod receive_wasm;
 #[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
 pub(crate) mod wasm_online;
@@ -156,11 +159,14 @@ pub(crate) use offline::TRANSFER_DATA_FILE;
 #[cfg(feature = "rgb_fs_store_migration")]
 pub(crate) use offline::TRANSFERS_DIR;
 pub(crate) use offline::WalletOffline;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use offline::max_utxo_asset_allocations;
 #[cfg(feature = "_online")]
 pub(crate) use online::WalletOnline;
-// the receive driver is native only until the browser transport is wired (see the module gate)
+// the receive driver is shared by the native and browser paths
 #[cfg(feature = "_online")]
 pub(crate) use receive::{NativeReceiveTransport, ReceiveDriver, ReceiveWallet, drive_native};
 

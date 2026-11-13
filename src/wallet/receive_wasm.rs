@@ -15,42 +15,104 @@
 
 use super::indexer_async::{EsploraResolver, EsploraTransport};
 use super::receive::{
-    PendingReceive, PrefetchQuestions, ReceiveDriver, ReceiveTransport, ack_signature,
-    already_handled, broadcast_error, parse_reject_list, pending_receives, receive_transfer_idx,
+    PendingReceive, PrefetchQuestions, ReceiveDriver, ReceiveTransport, ReceiveWallet,
+    ack_signature, already_handled, broadcast_error, pending_receives, receive_transfer_idx,
     transfer_retrieved_signature,
 };
 use super::resolver_async::PrefetchedChain;
 use super::*;
 use crate::api::fetch::ProxyFetchClient;
-use crate::api::jsonrpc::{ProxyTransferState, list_transfers_message, map_proxy_error};
+use crate::api::jsonrpc::{
+    PostAckResponse, ProxyTransferState, list_transfers_message, map_proxy_error,
+};
 use crate::encryption::sha256_digest;
+use crate::no_wallet::validation::{
+    RejectList, RejectListSource, ResolveRejectList, genesis_reject_list_source,
+};
 use base64::{Engine as _, engine::general_purpose};
 
 /// Marker of a `transfer.retrieved` the durable snapshot still owes the recipient proxy.
 const RETRIEVED_MARKER_FILE: &str = "retrieved.pending.json";
 
+/// The reject lists a consignment's assets declare, read before the database transaction opens.
+///
+/// The browser cannot fetch while a transaction is open, so the receive prefetches the lists the
+/// validation will ask for and hands them to the driver through [`ResolveRejectList`].
+#[derive(Default)]
+pub(super) struct PrefetchedRejectLists {
+    lists: HashMap<RejectListSource, RejectList>,
+}
+
+impl ResolveRejectList for PrefetchedRejectLists {
+    fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        self.lists
+            .get(source)
+            .cloned()
+            .ok_or_else(|| Error::Internal {
+                details: format!("no prefetched reject list for {source:?}"),
+            })
+    }
+}
+
+/// Read the reject lists the consignment's assets declare, failing closed on the ones kept by an
+/// EVM contract, which the browser cannot query.
+async fn prefetch_reject_lists(
+    wallet: &Wallet,
+    consignment: Option<&RgbTransfer>,
+) -> Result<PrefetchedRejectLists, Error> {
+    let mut lists = HashMap::new();
+    let Some(consignment) = consignment else {
+        return Ok(PrefetchedRejectLists { lists });
+    };
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    let Some(source) = genesis_reject_list_source(asset_schema, consignment.genesis())? else {
+        return Ok(PrefetchedRejectLists { lists });
+    };
+    match &source {
+        RejectListSource::Url(url) => {
+            let client = ProxyFetchClient::new(url)?;
+            let list = client.get_reject_list().await?;
+            let (reject_list, invalid) = RejectList::parse(&list);
+            if invalid > 0 {
+                warn!(
+                    wallet.logger(),
+                    "Ignoring {invalid} invalid opout(s) in reject list"
+                );
+            }
+            lists.insert(source, reject_list);
+        }
+        RejectListSource::Evm(_) => {
+            return Err(Error::Internal {
+                details: s!("EVM reject lists are not supported in the browser"),
+            });
+        }
+    }
+    Ok(PrefetchedRejectLists { lists })
+}
+
 /// [`ReceiveTransport`] over the browser's `fetch` client.
-pub(crate) struct WasmReceiveTransport<'a, W: WalletOffline + ?Sized> {
+struct WasmReceiveTransport<'a, W: WalletOffline + ?Sized> {
     wallet: &'a W,
     /// Esplora endpoint that answers the chain queries (tip height, broadcast).
     indexer_url: &'a str,
+    /// Reject lists prefetched before the transaction opened.
+    reject_lists: &'a PrefetchedRejectLists,
 }
 
 #[allow(dead_code)]
 impl<'a, W: WalletOffline + ?Sized> WasmReceiveTransport<'a, W> {
-    pub(crate) fn new(wallet: &'a W, indexer_url: &'a str) -> Self {
+    fn new(wallet: &'a W, indexer_url: &'a str, reject_lists: &'a PrefetchedRejectLists) -> Self {
         Self {
             wallet,
             indexer_url,
+            reject_lists,
         }
     }
 }
 
 impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W> {
-    async fn get_reject_list(&self, url: &str) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
-        let client = ProxyFetchClient::new(url)?;
-        let list = client.get_reject_list().await?;
-        parse_reject_list(&list, self.wallet.logger())
+    fn reject_list_resolver(&self) -> &dyn ResolveRejectList {
+        self.reject_lists
     }
 
     async fn fetch_and_save_attachments(
@@ -113,7 +175,14 @@ impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W>
 
     async fn sender_retention_grace(&self, sender_proxy: &str) -> Result<u32, Error> {
         let client = ProxyFetchClient::new(sender_proxy)?;
-        crate::utils::retention_grace_from_info(client.get_info().await)
+        let res = client.get_info().await?;
+        if let Some(err) = res.error {
+            return Err(map_proxy_error(err));
+        }
+        let info = res.result.ok_or_else(|| Error::Proxy {
+            details: s!("missing server.info result"),
+        })?;
+        Ok(crate::utils::proxy_retention_grace(&info))
     }
 
     async fn post_ack(
@@ -554,10 +623,12 @@ impl Wallet {
 
         // the safe-height check resolves the unsafe history again, so prefetch those answers
         // before the database transaction opens
+        let mut reject_lists = PrefetchedRejectLists::default();
         let prefetched = if status == TransferStatus::WaitingSafeHeight {
             let key = self.wallet_key(&consignment_path)?;
             let bytes = self.files().read(&key)?;
             let questions = RgbTransfer::load(bytes.as_slice()).ok();
+            reject_lists = prefetch_reject_lists(self, questions.as_ref()).await?;
             Some(prefetch_chain_answers(self, indexer_url, questions.as_ref()).await?)
         } else {
             None
@@ -572,7 +643,7 @@ impl Wallet {
             .unwrap_or_default();
         let mut updated_batch_transfer: DbBatchTransferActMod = candidate.batch.clone().into();
         let outcome = {
-            let transport = WasmReceiveTransport::new(self, indexer_url);
+            let transport = WasmReceiveTransport::new(self, indexer_url, &reject_lists);
             match prefetched {
                 Some(chain) => {
                     self.resume_receive(
@@ -599,6 +670,7 @@ impl Wallet {
                         &mode,
                         &recipient_seed,
                         None,
+                        false,
                     )
                     .await
                     .map(|outcome| (outcome, None)),
@@ -701,7 +773,8 @@ impl Wallet {
                 }
                 continue;
             };
-            let transport = WasmReceiveTransport::new(self, indexer_url);
+            let empty_lists = PrefetchedRejectLists::default();
+            let transport = WasmReceiveTransport::new(self, indexer_url, &empty_lists);
             if transport
                 .mark_transfer_retrieved(&marker.proxy_url, &marker.transfer_id, &seed)
                 .await
@@ -824,7 +897,9 @@ impl Wallet {
                         let txn = self.database().begin_transaction()?;
                         let mut updated: DbBatchTransferActMod = candidate.batch.clone().into();
                         {
-                            let transport = WasmReceiveTransport::new(self, indexer_url);
+                            let empty_lists = PrefetchedRejectLists::default();
+                            let transport =
+                                WasmReceiveTransport::new(self, indexer_url, &empty_lists);
                             self.refuse_consignment_via(
                                 &transport,
                                 &txn,
@@ -832,6 +907,7 @@ impl Wallet {
                                 &recipient_id,
                                 &recipient_seed,
                                 &mut updated,
+                                false,
                             )
                             .await?;
                         }
@@ -876,6 +952,7 @@ impl Wallet {
         // parse once for the prefetch set; a malformed consignment still runs the driver, which
         // refuses it with the same error a native load would report
         let questions = RgbTransfer::load(consignment_bytes.as_slice()).ok();
+        let reject_lists = prefetch_reject_lists(self, questions.as_ref()).await?;
         let prefetched = prefetch_chain_answers(self, indexer_url, questions.as_ref()).await?;
 
         let txn = self.database().begin_transaction()?;
@@ -902,7 +979,7 @@ impl Wallet {
 
         let mut updated_batch_transfer: DbBatchTransferActMod = candidate.batch.clone().into();
         let outcome = {
-            let transport = WasmReceiveTransport::new(self, indexer_url);
+            let transport = WasmReceiveTransport::new(self, indexer_url, &reject_lists);
             self.drive_receive(
                 &transport,
                 &prefetched,

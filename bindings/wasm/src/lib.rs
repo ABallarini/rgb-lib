@@ -78,6 +78,7 @@ fn wallet_data(network: BitcoinNetwork) -> WalletData {
             AssetSchema::Cfa,
             AssetSchema::Ifa,
         ],
+        allow_reckless_schemas: false,
     }
 }
 
@@ -837,6 +838,10 @@ impl RgbLibWallet {
                 amounts,
                 inflation_amounts,
                 reject_list_url,
+                // a browser issue carries no link right nor contract checks to skip
+                false,
+                None,
+                false,
             )
             .map(|asset| asset.asset_id)
             .map_err(|e| failure("cannot issue the asset", e))
