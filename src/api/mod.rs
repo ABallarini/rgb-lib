@@ -1,5 +1,15 @@
 #[cfg(feature = "_validation")]
 pub(crate) mod evm;
+// Protocol definitions, request builders and pure decoders shared by the native blocking client
+// and the browser `fetch` one, so payloads and error mapping cannot drift between the transports.
+#[cfg(any(
+    feature = "_validation",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
+pub(crate) mod evm_abi;
+// Browser EVM transport: `reqwest`'s `fetch` backend, wasm32 only, over the shared ABI code.
+#[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+pub(crate) mod evm_fetch;
 #[cfg(feature = "_online")]
 pub(crate) mod multisig_hub;
 #[cfg(feature = "_online")]

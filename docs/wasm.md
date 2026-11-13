@@ -24,11 +24,11 @@ The implementation is shared with the native wallet: the browser binding is a th
 | Multisig hub paths | Not available on wasm |
 | BDK online access (sync with DB reconciliation, tip height, fee estimation) | Supported over the async Esplora transport (`sync`, `getTipHeight`, `getFeeEstimation`) |
 | RGB receive over a proxy (download, decrypt, validate, ACK/NACK, resume `WaitingSafeHeight`/`WaitingBroadcast`, `transfer.retrieved`) | Supported and exported (`receiveTransfer`, `syncOnline`) over the Fetch proxy client and the prefetched async chain resolver |
-| BFA mint receive | Not available on wasm: checking the mint lock needs an EVM RPC endpoint, so a mint consignment is refused and `getReceivedMint` returns `null` |
+| BFA mint receive | Not wired yet: the shared EVM ABI/request code and the browser `EvmFetchClient` compile (see [Indexers and HTTP](#indexers-and-http)), but no receive path calls them, so a mint consignment is refused and `getReceivedMint` returns `null` |
 | Proxy health check | Supported and exported (`checkProxyUrl`): read-only `server.info` over the Fetch proxy client |
 | RGB transfers, send, proxy invoice reservation, media upload, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
 | Out-of-band consignment import and ACK | Native-only: `provide_out_of_band_consignment` and `provide_out_of_band_ack` take `Online` and may broadcast |
-| Async Esplora and Fetch proxy transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive |
+| Async Esplora and Fetch transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive, and the Fetch EVM client is compiled but not wired into BFA receive |
 | Backups | Encrypted byte backup/restore supported; path-based filesystem backups native only |
 | Legacy file migrations | Native only |
 | Web Worker | Not required; optional future seam only |
@@ -71,7 +71,7 @@ Do **not** enable `bitcoind`, `electrum` or `esplora` for wasm32: their dependen
 | Feature | Effect on wasm32 |
 | ------- | ---------------- |
 | `wallet` | Shared wallet code, in-memory database backend, browser clock, CSPRNG and IndexedDB storage |
-| `esplora_async` | Async Esplora transport, wired into the BDK sync and the receive validation, plus the Fetch proxy client; wasm only |
+| `esplora_async` | Async Esplora transport, wired into the BDK sync and the receive validation, plus the Fetch proxy client and the Fetch EVM client; wasm only |
 | `sqlite` | Native only: SQLite driver and Tokio runtime; must stay off |
 | `bitcoind`, `electrum`, `esplora` | Native blocking indexers; must stay off |
 | `bdk_file_store_migration`, `rgb_fs_store_migration` | Native legacy imports; must stay off |
@@ -366,8 +366,16 @@ The root crate with `esplora_async` compiles the browser transport, resolver and
 | `EsploraTransport` | Async Esplora client over `fetch`: wallet full scan, block hash, broadcast, fee estimates and the other indexer reads |
 | `EsploraResolver` | Async witness, block-header and chain-net answers for RGB validation |
 | `ProxyFetchClient` | RGB proxy JSON-RPC over `fetch`, including in-memory multipart uploads |
+| `EvmFetchClient` | EVM JSON-RPC over `fetch`: chain ID, finalized block, `eth_call` and reject-list reads, over the shared `evm_abi` payloads and decoders |
 
 `EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transaction runs the native sync bookkeeping: pending witness state is reconciled and colored TXOs new to the DB are registered. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of a released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`; the remaining proxy writes (invoice reservation, media upload, send) stay in the native-only flow.
+
+`EvmFetchClient` is built from the same `evm_abi` selectors, calldata builders and result decoders as the native
+blocking `EvmClient`, so the two transports cannot drift. It applies a 15 s deadline per request, caps a response body
+at 1 MiB, retries only HTTP 502/503/504 and non-timeout transport errors, maps a reverted `eth_call` to `None` and
+reports a chain-ID mismatch as the typed `EvmChainIdMismatch` error without ever including the endpoint URL. Nothing
+calls it yet: the BFA mint receive path is still native-only, so the client and the shared ABI code compile into the
+wasm build but are not assembled into a receive.
 
 The bindings crate enables `wallet,esplora_async`, so the generated package contains the transport and the three read-only methods. No native blocking transport is in the wasm graph: `bitcoind`, `electrum` and `esplora` are native-only, and the graph check rejects their crates.
 

@@ -1,19 +1,10 @@
+use super::evm_abi::*;
 use super::*;
 
-/// Selector of `getFundsInBlock(uint256,uint256)` on a bridge contract (`MinimalBridge`)
-const FUNDS_IN_BLOCK_SELECTOR: &str = "0x2ce06e2d";
-/// Selector of `circulatingSupply()` on a bridge contract (`MinimalBridge`)
-#[cfg(feature = "_online")]
-const CIRCULATING_SUPPLY_SELECTOR: &str = "0x9358928b";
+// The selectors, request/response types, ABI decoders and pure request builders live in
+// `super::evm_abi`, shared with the browser `fetch` client.
+pub use super::evm_abi::MintLockStatus;
 
-/// Selector of `length()` on a reject list contract (`IRgbRejectList`)
-const REJECT_LIST_LENGTH_SELECTOR: &str = "0x1f7b6d32";
-/// Selector of `entries(uint256,uint256)` on a reject list contract (`IRgbRejectList`)
-const REJECT_LIST_ENTRIES_SELECTOR: &str = "0x17b937e6";
-/// Maximum number of reject list entries requested with a single `entries` call
-///
-/// The contract doesn't bound pages, the `eth_call` gas cap and timeout of the node do.
-const REJECT_LIST_PAGE_SIZE: u64 = 1000;
 /// Number of times a JSON-RPC request is sent again when it fails for a temporary reason (see
 /// [`EvmClient::post`])
 const RPC_RETRIES: u32 = 2;
@@ -23,252 +14,10 @@ const RPC_RETRY_PAUSE: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const RPC_RETRY_PAUSE: Duration = Duration::from_millis(10);
 
-/// The status of the lock confirming a mint, which has to be included on the external chain
-/// before the block the mint commits to (`before_block`), as recorded by the bridge contract as of
-/// the latest finalized block (see [`EvmClient::mint_lock_status`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MintLockStatus {
-    /// The lock is recorded, included before `before_block`
-    Confirmed,
-    /// No lock is recorded yet, but one may still be included before `before_block`
-    Pending,
-    /// The mint will never be confirmed: the block at height `before_block - 1` is finalized and
-    /// no lock is recorded in it or in a previous block
-    Expired,
-}
-
-/// The block an `eth_call` reads the state as of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CallBlock {
-    /// The block with this number
-    Number(u64),
-    /// The latest block (`latest` tag), whichever it is when the node answers the call
-    #[cfg(feature = "_online")]
-    Latest,
-}
-
-impl CallBlock {
-    /// The block parameter of the call: the hex-encoded block number or the tag.
-    fn param(self) -> String {
-        match self {
-            Self::Number(block) => format!("0x{block:x}"),
-            #[cfg(feature = "_online")]
-            Self::Latest => s!("latest"),
-        }
-    }
-}
-
-impl From<u64> for CallBlock {
-    fn from(block: u64) -> Self {
-        Self::Number(block)
-    }
-}
-
 /// JSON-RPC client for an EVM node.
 pub struct EvmClient {
     client: RestClient,
     rpc_url: String,
-}
-
-/// Strip the `0x` prefix the JSON-RPC API puts on every hex-encoded value, refusing values
-/// without it.
-fn strip_hex_prefix<'a>(value: &'a str, what: &str) -> Result<&'a str, Error> {
-    value.strip_prefix("0x").ok_or_else(|| Error::Network {
-        details: format!("invalid EVM {what} {value}: missing 0x prefix"),
-    })
-}
-
-/// Parse a hex-encoded (`0x`-prefixed) quantity.
-fn parse_quantity(value: &str, what: &str) -> Result<u64, Error> {
-    u64::from_str_radix(strip_hex_prefix(value, what)?, 16).map_err(|e| Error::Network {
-        details: format!("invalid EVM {what} {value}: {e}"),
-    })
-}
-
-/// Parse a hex-encoded (`0x`-prefixed) block number.
-fn parse_block_number(hex_block: &str) -> Result<u64, Error> {
-    parse_quantity(hex_block, "block number")
-}
-
-/// The parameters of a method taking none, serialized as an empty array: JSON-RPC 2.0 allows
-/// `params` to be omitted or to be an array or an object, not `null` (as a unit struct would be).
-const NO_PARAMS: [(); 0] = [];
-
-/// Decode a hex-encoded ABI word (32 bytes) at the given word index from `data`.
-/// `data` must start with "0x".
-fn abi_word(data: &str, index: usize) -> Result<[u8; 32], Error> {
-    // work on bytes: slicing the str could split a (bogus) multi-byte char and panic
-    let hex = strip_hex_prefix(data, "ABI data")?.as_bytes();
-    // the index can come from the data itself (e.g. an array offset)
-    let end = index
-        .checked_add(1)
-        .and_then(|words| words.checked_mul(64))
-        .ok_or_else(|| abi_error("word index out of range"))?;
-    let start = end - 64;
-    if hex.len() < end {
-        return Err(Error::Network {
-            details: format!("ABI data too short: expected at least {end} hex chars"),
-        });
-    }
-    let mut buf = [0u8; 32];
-    hex::decode_to_slice(&hex[start..end], &mut buf).map_err(|e| Error::Network {
-        details: format!("ABI hex decode error: {e}"),
-    })?;
-    Ok(buf)
-}
-
-/// Decode a hex-encoded ABI word as a `u64` at the given word index from `data`.
-/// Returns `None` if the uint256 value doesn't fit in a `u64`.
-fn abi_word_u64(data: &str, index: usize) -> Result<Option<u64>, Error> {
-    let word = abi_word(data, index)?;
-    if word[..24].iter().any(|b| *b != 0) {
-        return Ok(None);
-    }
-    Ok(Some(u64::from_be_bytes(word[24..32].try_into().unwrap())))
-}
-
-/// An entry of a reject list kept by an EVM contract (`IRgbRejectList.Entry`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RejectListEntry {
-    /// RGB operation output the decision applies to.
-    pub opout: Opout,
-    /// Whether the opout is rejected (`true`) or allowed (`false`).
-    pub reject: bool,
-}
-
-/// The entries of a reject list kept by an EVM contract, in append order.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RejectListLog {
-    /// All the entries, as of the latest block.
-    pub entries: Vec<RejectListEntry>,
-    /// How many of the leading entries were appended in finalized blocks.
-    pub finalized: usize,
-}
-
-impl RejectListLog {
-    /// The opouts currently rejected and allowed, as `(reject, allow)`.
-    ///
-    /// The latest entry for an opout wins, but entries in non-finalized blocks could still be
-    /// dropped or reordered by a reorg. So, erring on the safe side, a reject counts as soon as
-    /// it's seen, while an allow counts only once finalized: an opout is rejected if its finalized
-    /// decision is a reject or if any non-finalized entry rejects it, and allowed if its finalized
-    /// decision is an allow and no non-finalized entry rejects it.
-    pub(crate) fn decisions(&self) -> (HashSet<Opout>, HashSet<Opout>) {
-        let (finalized, pending) = self.entries.split_at(self.finalized);
-        let finalized = finalized
-            .iter()
-            .map(|e| (e.opout, e.reject))
-            .collect::<HashMap<_, _>>();
-        let pending_rejects = pending
-            .iter()
-            .filter(|e| e.reject)
-            .map(|e| e.opout)
-            .collect::<HashSet<_>>();
-        let (mut reject, mut allow) = (pending_rejects, HashSet::new());
-        for (opout, rejected) in finalized {
-            if rejected {
-                reject.insert(opout);
-            } else if !reject.contains(&opout) {
-                allow.insert(opout);
-            }
-        }
-        (reject, allow)
-    }
-}
-
-fn abi_error(details: &str) -> Error {
-    Error::Network {
-        details: format!("invalid ABI data: {details}"),
-    }
-}
-
-/// Decode a hex-encoded ABI word as a `uint16` at the given word index from `data`.
-fn abi_word_u16(data: &str, index: usize) -> Result<u16, Error> {
-    abi_word_u64(data, index)?
-        .and_then(|v| u16::try_from(v).ok())
-        .ok_or_else(|| abi_error("bad uint16"))
-}
-
-/// Decode the result of `entries(uint256,uint256)`, an ABI-encoded
-/// `(bytes32, uint16, uint16, bool)[]`: the offset of the array, its length, then each entry
-/// inline as four words.
-fn decode_reject_list_entries(data: &str) -> Result<Vec<RejectListEntry>, Error> {
-    // the offset and the length come from the (untrusted) contract: both are checked against the
-    // data size before being used, so that they can't make the indexes overflow
-    let words = strip_hex_prefix(data, "ABI data")?.len() / 64;
-    let len_index = abi_word_u64(data, 0)?
-        .filter(|o| o % 32 == 0)
-        .and_then(|o| usize::try_from(o / 32).ok())
-        .filter(|i| *i < words)
-        .ok_or_else(|| abi_error("bad array offset"))?;
-    let len = abi_word_u64(data, len_index)?
-        .and_then(|l| usize::try_from(l).ok())
-        .filter(|l| {
-            l.checked_mul(4)
-                .and_then(|entry_words| entry_words.checked_add(len_index + 1))
-                .is_some_and(|end| end <= words)
-        })
-        .ok_or_else(|| abi_error("bad array length"))?;
-    let mut entries = vec![];
-    for i in 0..len {
-        let base = len_index + 1 + 4 * i;
-        let opout = Opout {
-            op: OpId::from(abi_word(data, base)?),
-            ty: AssignmentType::with(abi_word_u16(data, base + 1)?),
-            no: abi_word_u16(data, base + 2)?,
-        };
-        let reject = match abi_word_u64(data, base + 3)? {
-            Some(0) => false,
-            Some(1) => true,
-            _ => return Err(abi_error("bad bool")),
-        };
-        entries.push(RejectListEntry { opout, reject });
-    }
-    Ok(entries)
-}
-
-/// ABI-encode a `uint256` argument as a hex word.
-fn abi_encode_u64(value: u64) -> String {
-    format!("{value:064x}")
-}
-
-/// JSON-RPC request envelope.
-#[derive(Debug, Serialize)]
-struct RpcRequest<P: Serialize> {
-    jsonrpc: &'static str,
-    method: &'static str,
-    params: P,
-    id: u64,
-}
-
-/// JSON-RPC response envelope, carrying either the result or the error of the request.
-#[derive(Debug, Deserialize)]
-struct RpcResponse<R> {
-    result: Option<R>,
-    error: Option<RpcError>,
-}
-
-/// Error object of a JSON-RPC response.
-#[derive(Debug, Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-/// Transaction call object for `eth_call`.
-#[derive(Debug, Serialize)]
-struct CallObject {
-    /// Contract address to call.
-    to: String,
-    /// ABI-encoded call data (hex).
-    data: String,
-}
-
-/// The part of a block header returned by `eth_getBlockByNumber` that is needed here.
-#[derive(Debug, Deserialize)]
-struct BlockHeader {
-    /// Block number (hex).
-    number: String,
 }
 
 impl EvmClient {
@@ -354,26 +103,11 @@ impl EvmClient {
         amount: u64,
         block: impl Into<CallBlock>,
     ) -> Result<Option<u64>, Error> {
-        let data = format!(
-            "{FUNDS_IN_BLOCK_SELECTOR}{}{}",
-            hex::encode(lock_id.to_byte_array()),
-            abi_encode_u64(amount)
-        );
+        let data = funds_in_block_calldata(lock_id, amount);
         let Some(result) = self.eth_call_unless_reverted(contract, data, block)? else {
             return Ok(None);
         };
-        if result == "0x" {
-            return Ok(None);
-        }
-        // compare the hex length exactly: a length rounded to whole words would let trailing
-        // data through
-        if strip_hex_prefix(&result, "ABI data")?.len() != 64 {
-            return Err(abi_error("unexpected getFundsInBlock result size"));
-        }
-        // the record is the block plus one, zero meaning there's none
-        let block_plus_one = abi_word_u64(&result, 0)?
-            .ok_or_else(|| abi_error("lock block doesn't fit in a u64"))?;
-        Ok(block_plus_one.checked_sub(1))
+        decode_funds_in_block(&result)
     }
 
     /// The status of the lock of `amount` with ID `lock_id`, which has to be included before
@@ -390,17 +124,8 @@ impl EvmClient {
         before_block: u64,
         finalized_block: u64,
     ) -> Result<MintLockStatus, Error> {
-        Ok(
-            match self.funds_in_block(contract, lock_id, amount, finalized_block)? {
-                Some(block) if block < before_block => MintLockStatus::Confirmed,
-                Some(_) => MintLockStatus::Expired,
-                // a lock not recorded as of the finalized block can only be included after it
-                None if finalized_block.saturating_add(1) >= before_block => {
-                    MintLockStatus::Expired
-                }
-                None => MintLockStatus::Pending,
-            },
-        )
+        let record = self.funds_in_block(contract, lock_id, amount, finalized_block)?;
+        Ok(mint_lock_status_from(record, before_block, finalized_block))
     }
 
     /// Whether the bridge contract at `contract` records, as of the latest block, a lock of
@@ -433,23 +158,13 @@ impl EvmClient {
     pub(crate) fn circulating_supply(&self, contract: &EvmAddress) -> Result<Option<u64>, Error> {
         let Some(result) = self.eth_call_unless_reverted(
             contract,
-            CIRCULATING_SUPPLY_SELECTOR.to_string(),
+            circulating_supply_calldata(),
             CallBlock::Latest,
         )?
         else {
             return Ok(None);
         };
-        if result == "0x" {
-            return Ok(None);
-        }
-        // compare the hex length exactly: a length rounded to whole words would let trailing
-        // data through
-        if strip_hex_prefix(&result, "ABI data")?.len() != 64 {
-            return Err(abi_error("unexpected circulatingSupply result size"));
-        }
-        abi_word_u64(&result, 0)?
-            .map(Some)
-            .ok_or_else(|| abi_error("circulating supply doesn't fit in a u64"))
+        decode_circulating_supply(&result)
     }
 
     fn rpc_error(method: &str, err: RpcError) -> Error {
@@ -500,19 +215,6 @@ impl EvmClient {
         parse_block_number(&self.rpc::<_, String>("eth_blockNumber", NO_PARAMS)?)
     }
 
-    /// The parameters of an `eth_call` of `contract` with `data` as of `block`.
-    fn call_params(
-        contract: &EvmAddress,
-        data: String,
-        block: impl Into<CallBlock>,
-    ) -> (CallObject, String) {
-        let call = CallObject {
-            to: contract.to_string(),
-            data,
-        };
-        (call, block.into().param())
-    }
-
     /// Call `contract` with `data` (`eth_call`) as of `block`, returning the raw result.
     fn eth_call(
         &self,
@@ -520,7 +222,7 @@ impl EvmClient {
         data: String,
         block: impl Into<CallBlock>,
     ) -> Result<String, Error> {
-        self.rpc("eth_call", Self::call_params(contract, data, block))
+        self.rpc("eth_call", call_params(contract, data, block))
     }
 
     /// Call `contract` with `data` (`eth_call`) as of `block`, returning the raw result, or `None`
@@ -532,10 +234,10 @@ impl EvmClient {
         block: impl Into<CallBlock>,
     ) -> Result<Option<String>, Error> {
         let method = "eth_call";
-        match self.try_rpc(method, Self::call_params(contract, data, block))? {
+        match self.try_rpc(method, call_params(contract, data, block))? {
             Ok(result) => result.map(Some).ok_or_else(|| Self::null_result(method)),
             // nodes report a revert with this message, followed by the reason if there's one
-            Err(err) if err.message.starts_with("execution reverted") => Ok(None),
+            Err(err) if err.is_revert() => Ok(None),
             Err(err) => Err(Self::rpc_error(method, err)),
         }
     }
@@ -559,13 +261,8 @@ impl EvmClient {
     /// Returns `None` if there is no contract at `contract` as of `block`: calling an address with
     /// no code returns no data.
     fn reject_list_length(&self, contract: &EvmAddress, block: u64) -> Result<Option<u64>, Error> {
-        let len_data = self.eth_call(contract, REJECT_LIST_LENGTH_SELECTOR.to_string(), block)?;
-        if len_data == "0x" {
-            return Ok(None);
-        }
-        abi_word_u64(&len_data, 0)?
-            .map(Some)
-            .ok_or_else(|| abi_error("reject list length doesn't fit in a u64"))
+        let len_data = self.eth_call(contract, reject_list_length_calldata(), block)?;
+        decode_reject_list_length(&len_data)
     }
 
     fn reject_list_entries_paged(
@@ -601,11 +298,7 @@ impl EvmClient {
         let mut start = 0;
         while start < len {
             let end = std::cmp::min(start.saturating_add(page_size), len);
-            let data = format!(
-                "{REJECT_LIST_ENTRIES_SELECTOR}{}{}",
-                abi_encode_u64(start),
-                abi_encode_u64(end)
-            );
+            let data = reject_list_entries_calldata(start, end);
             let page = decode_reject_list_entries(&self.eth_call(contract, data, block)?)?;
             if page.len() as u64 != end - start {
                 return Err(abi_error("unexpected reject list page size"));
@@ -627,7 +320,7 @@ impl EvmClient {
     /// history for every future receiver, so locks are only accepted once finalized.
     pub(crate) fn finalized_block_number(&self) -> Result<u64, Error> {
         let method = "eth_getBlockByNumber";
-        let header: Option<BlockHeader> = self
+        let header: Option<super::evm_abi::BlockHeader> = self
             .try_rpc(method, ("finalized", false))?
             .map_err(|err| Self::rpc_error(method, err))?;
         let header = header.ok_or_else(|| Error::Network {
@@ -845,7 +538,6 @@ mod tests {
                 "{result:?}"
             );
         }
-        assert!(abi_word("0x", usize::MAX).is_err());
 
         let mut server = mockito::Server::new();
         let block_number = server
