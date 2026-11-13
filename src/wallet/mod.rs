@@ -19,6 +19,12 @@ pub(crate) mod offline;
 pub(crate) mod online;
 #[cfg(target_arch = "wasm32")]
 pub mod persistence;
+// wallet-free checks shared by the native and browser receive drivers
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) mod receive_checks;
 // FOLLOW-UP(wasm-receive): the shared receive driver and its browser transport still target the
 // pre-rebase rgb-std validation API (terminals, build_opouts_dag, find_terminal_bundle). The
 // upstream receive flow is the live implementation until they are ported; the sources are kept in

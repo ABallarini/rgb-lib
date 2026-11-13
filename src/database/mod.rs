@@ -574,7 +574,10 @@ impl SqliteTxn {
         )?)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn update_asset(&self, asset: &mut DbAssetActMod) -> Result<DbAsset, Error> {
         Ok(block_on(Asset::update(asset.clone()).exec(self.inner()))?)
     }
@@ -2042,7 +2045,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn update_asset(&self, asset: &mut DbAssetActMod) -> Result<DbAsset, Error> {
         match self {
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
