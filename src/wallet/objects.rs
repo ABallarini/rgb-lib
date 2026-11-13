@@ -2519,7 +2519,10 @@ pub struct SentMint {
 
 /// The mint locks a received consignment waits for, saved once it has been validated as far as it
 /// can be without them, so that until they're finalized a refresh only looks them up.
-#[cfg(feature = "_online")]
+///
+/// The browser has no EVM RPC endpoint, so it never waits for locks: it still compiles the type so
+/// the file it names round-trips through the same adapter as every other wallet file.
+#[cfg_attr(not(feature = "_online"), allow(dead_code))]
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct PendingMintLocks {
     /// SHA-256 digest (hex-encoded) of the consignment file waiting for the locks

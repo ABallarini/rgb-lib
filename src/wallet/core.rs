@@ -323,7 +323,10 @@ impl WalletManifest {
     ///
     /// Used when restoring a wasm wallet, where the manifest comes from the snapshot instead of a
     /// file. Unlike the file-based check, the mutable settings are checked too: the database bytes
-    /// in the snapshot were built with the settings the manifest records.
+    /// in the snapshot were built with the settings the manifest records. `supported_schemas` is
+    /// the exception: a restore takes the set from the manifest before calling this (see
+    /// [`Wallet::from_snapshot`](crate::wallet::Wallet::from_snapshot)), so a wallet that gained a
+    /// schema still restores the snapshots it wrote before.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn check_unchanged(
         &self,

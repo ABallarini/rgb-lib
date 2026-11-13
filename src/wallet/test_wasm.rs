@@ -192,12 +192,16 @@ async fn wallet_lifecycle_over_indexed_db() {
         .err()
         .expect("a changed setting must be rejected");
     assert!(matches!(err, Error::WalletSettingMismatch { .. }));
+    // the schemas are the exception: the snapshot carries the set its database was built with, so
+    // a caller offering more or fewer schemas restores it with the snapshot's own set
     let mut changed_data = wallet_data.clone();
     changed_data.supported_schemas = vec![AssetSchema::Nia];
-    let err = Wallet::from_snapshot(&loaded, changed_data, wallet_keys)
-        .err()
-        .expect("a changed setting must be rejected");
-    assert!(matches!(err, Error::WalletSettingMismatch { .. }));
+    let restored = Wallet::from_snapshot(&loaded, changed_data, wallet_keys.clone())
+        .expect("the snapshot schemas win");
+    assert_eq!(
+        restored.get_wallet_data().supported_schemas,
+        wallet_data.supported_schemas
+    );
 
     delete_snapshot(WALLET_ID).await.unwrap();
     assert!(load_snapshot(WALLET_ID).await.unwrap().is_none());
@@ -859,6 +863,81 @@ async fn browser_files_survive_flush_and_restore() {
         .expect("the second flush");
     let restored = Wallet::from_snapshot(&reloaded, wallet_data(), keys).expect("second restore");
     assert_eq!(restored.files().read(&media).unwrap(), b"second");
+
+    delete_snapshot(WALLET_ID).await.unwrap();
+}
+
+/// The BFA mint files travel with the wallet like every other file: the details of a checked mint
+/// and the locks a receive waits for are written and read through the adapter, under the keys the
+/// native wallet uses, and come back from a snapshot restore.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn received_mint_files_survive_flush_and_restore() {
+    use crate::wallet::objects::PendingMintLocks;
+    use crate::wallet::receive::ReceiveWallet;
+
+    const WALLET_ID: &str = "received-mint-test";
+    delete_snapshot(WALLET_ID).await.unwrap();
+    let (wallet, keys) = memory_wallet();
+    let recipient_id = "bcrt:utxob:abcd-efgh";
+
+    let received_mint = ReceivedMint {
+        opid: "opid".to_string(),
+        lock_id: "lockid".to_string(),
+        amount: 1234,
+        before_block: 900_000,
+        evm_chain_id: 11_155_111,
+        bridge_contract: "0x0000000000000000000000000000000000000001".to_string(),
+    };
+    wallet
+        .save_received_mint(recipient_id, &received_mint)
+        .unwrap();
+    assert!(wallet.has_received_mint(recipient_id));
+    assert_eq!(
+        wallet.read_received_mint(recipient_id).unwrap(),
+        Some(received_mint.clone())
+    );
+
+    // the pending locks of a consignment waiting for its mint are saved next to it
+    let consignment_path = wallet.get_receive_consignment_path(recipient_id);
+    let pending_mint_locks = PendingMintLocks {
+        consignment_digest: "digest".to_string(),
+        evm_chain_id: 11_155_111,
+        bridge_contract: crate::EvmAddress::default(),
+        claims: vec![],
+    };
+    let locks_key = wallet
+        .wallet_key(&wallet.get_receive_mint_locks_path(&consignment_path))
+        .unwrap();
+    wallet
+        .files()
+        .atomic_write(
+            &locks_key,
+            serde_json::to_string(&pending_mint_locks)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+
+    wallet.flush(WALLET_ID, &new_writer_id(), 0).await.unwrap();
+    let stored = load_snapshot_record(WALLET_ID)
+        .await
+        .unwrap()
+        .expect("the flushed snapshot");
+    drop(wallet);
+
+    let restored = Wallet::from_snapshot(&stored.bytes, wallet_data(), keys).expect("restore");
+    assert_eq!(
+        restored.read_received_mint(recipient_id).unwrap(),
+        Some(received_mint)
+    );
+    assert!(restored.has_received_mint(recipient_id));
+    let locks: PendingMintLocks =
+        serde_json::from_slice(&restored.files().read(&locks_key).unwrap())
+            .expect("the pending mint locks file");
+    assert_eq!(locks.consignment_digest, "digest");
+    assert_eq!(locks.evm_chain_id, 11_155_111);
+    assert_eq!(locks.bridge_contract, crate::EvmAddress::default());
 
     delete_snapshot(WALLET_ID).await.unwrap();
 }

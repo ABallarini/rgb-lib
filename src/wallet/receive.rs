@@ -186,25 +186,21 @@ pub trait ReceiveWallet: WalletOffline {
         received_mint: &ReceivedMint,
     ) -> Result<(), Error> {
         let serialized = serde_json::to_string(received_mint).map_err(InternalError::from)?;
-        let path = self.get_received_mint_path(recipient_id);
-        #[cfg(not(target_arch = "wasm32"))]
-        atomic_write(&path, serialized.as_bytes())?;
-        #[cfg(target_arch = "wasm32")]
-        self.files()
-            .atomic_write(&self.wallet_key(&path)?, serialized.as_bytes())?;
-        Ok(())
+        let key = self.wallet_key(&self.get_received_mint_path(recipient_id))?;
+        self.files().atomic_write(&key, serialized.as_bytes())
     }
 
-    /// Path of the mint locks the received consignment at `consignment_path` waits for (see
-    /// [`PendingMintLocks`]).
-    #[cfg(feature = "_online")]
+    /// Key of the mint locks the received consignment at `consignment_path` waits for (see
+    /// [`PendingMintLocks`]). Only the online driver waits for locks, but the key is part of the
+    /// wallet's files on every build.
     fn get_receive_mint_locks_path(&self, consignment_path: &Path) -> PathBuf {
         consignment_path.with_extension("mint_locks.json")
     }
 
     #[cfg(feature = "_online")]
-    fn consignment_file_digest(consignment_path: &Path) -> Result<String, Error> {
-        Ok(hex::encode(sha256_digest(&fs::read(consignment_path)?)))
+    fn consignment_file_digest(&self, consignment_path: &Path) -> Result<String, Error> {
+        let bytes = self.files().read(&self.wallet_key(consignment_path)?)?;
+        Ok(hex::encode(sha256_digest(&bytes)))
     }
 
     #[cfg(feature = "_online")]
@@ -216,16 +212,14 @@ pub trait ReceiveWallet: WalletOffline {
     ) -> Result<(), Error> {
         let BridgeLocation::Evm(EvmContract { chain_id, address }) = bridge_location;
         let pending_mint_locks = PendingMintLocks {
-            consignment_digest: Self::consignment_file_digest(consignment_path)?,
+            consignment_digest: self.consignment_file_digest(consignment_path)?,
             evm_chain_id: *chain_id,
             bridge_contract: *address,
             claims,
         };
         let serialized = serde_json::to_string(&pending_mint_locks).map_err(InternalError::from)?;
-        atomic_write(
-            &self.get_receive_mint_locks_path(consignment_path),
-            serialized.as_bytes(),
-        )
+        let key = self.wallet_key(&self.get_receive_mint_locks_path(consignment_path))?;
+        self.files().atomic_write(&key, serialized.as_bytes())
     }
 
     /// Whether the received consignment at `consignment_path` is still waiting for the mint locks
@@ -234,14 +228,16 @@ pub trait ReceiveWallet: WalletOffline {
     /// RPC endpoint missing or on another chain) is left to the processing of the consignment.
     #[cfg(feature = "_online")]
     fn waiting_for_mint_locks(&self, consignment_path: &Path) -> Result<bool, Error> {
-        let Some(pending_mint_locks) =
-            fs::read_to_string(self.get_receive_mint_locks_path(consignment_path))
-                .ok()
-                .and_then(|s| serde_json::from_str::<PendingMintLocks>(&s).ok())
+        let key = self.wallet_key(&self.get_receive_mint_locks_path(consignment_path))?;
+        let Some(pending_mint_locks) = self
+            .files()
+            .read(&key)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PendingMintLocks>(&bytes).ok())
         else {
             return Ok(false);
         };
-        if Self::consignment_file_digest(consignment_path).ok()
+        if self.consignment_file_digest(consignment_path).ok()
             != Some(pending_mint_locks.consignment_digest)
         {
             return Ok(false);
@@ -1326,8 +1322,7 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                         &recipient_id,
                         &recipient_seed,
                         updated_batch_transfer,
-                        received_mint.is_some()
-                            || self.get_received_mint_path(&recipient_id).exists(),
+                        received_mint.is_some() || self.has_received_mint(&recipient_id),
                     )
                     .await
             };

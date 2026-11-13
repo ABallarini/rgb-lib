@@ -2534,7 +2534,7 @@ pub trait WalletOnline: WalletOffline + receive::ReceiveWallet {
         let signed_tx =
             paying_bundle.and_then(|paying_bundle| donation_signed_tx(&paying_bundle.tx));
         // the mint paying the recipient was saved when the consignment was accepted
-        let mint_consignment = self.get_received_mint_path(&recipient_id).exists();
+        let mint_consignment = self.has_received_mint(&recipient_id);
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         let mode = receive_mode_from_transfer(self, txn, &transfer)?;
@@ -6849,7 +6849,7 @@ pub trait WalletOnline: WalletOffline + receive::ReceiveWallet {
         Ok(transfer
             .recipient_id
             .as_ref()
-            .is_some_and(|recipient_id| self.get_received_mint_path(recipient_id).exists()))
+            .is_some_and(|recipient_id| self.has_received_mint(recipient_id)))
     }
 
     /// Set the known circulating supply of the BFA asset with ID `asset_id` to the one read from

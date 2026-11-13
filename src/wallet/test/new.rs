@@ -366,6 +366,124 @@ fn snapshot_and_restore_memory_success() {
 
 #[test]
 #[parallel]
+fn snapshot_restore_keeps_the_schema_set_it_was_written_with() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    // the four schemas a wallet created before BFA support listed
+    let mut old_data = data_dir.wallet_data();
+    old_data.supported_schemas = vec![
+        AssetSchema::Nia,
+        AssetSchema::Uda,
+        AssetSchema::Cfa,
+        AssetSchema::Ifa,
+    ];
+    let wallet = Wallet::new_with_database(
+        old_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+
+    // a caller whose wallet now also supports BFA restores it: the schemas travel in the manifest
+    // and the snapshot's own set wins over the one the caller lists
+    let mut new_data = old_data.clone();
+    new_data.supported_schemas = AssetSchema::VALUES.to_vec();
+    let restored = Wallet::from_snapshot(&snapshot, new_data, wallet_keys.clone())
+        .expect("a snapshot written before BFA support restores");
+    assert_eq!(
+        restored.get_wallet_data().supported_schemas,
+        old_data.supported_schemas
+    );
+    // the restored wallet writes the same set again, so it keeps restoring
+    let snapshot = restored.snapshot().unwrap().unwrap();
+    drop(restored);
+    let restored = Wallet::from_snapshot(&snapshot, data_dir.wallet_data(), wallet_keys)
+        .expect("the restored snapshot restores again");
+    assert_eq!(
+        restored.get_wallet_data().supported_schemas,
+        old_data.supported_schemas
+    );
+}
+
+#[test]
+#[parallel]
+fn bfa_snapshot_restores_and_mainnet_keeps_the_opt_in() {
+    let data_dir = PrivateDataDir::new();
+
+    // regtest: a wallet supporting BFA snapshots and restores with it
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet = Wallet::new_with_database(
+        data_dir.wallet_data(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+    let restored = Wallet::from_snapshot(&snapshot, data_dir.wallet_data(), wallet_keys)
+        .expect("a BFA snapshot restores off mainnet");
+    assert!(
+        restored
+            .get_wallet_data()
+            .supported_schemas
+            .contains(&AssetSchema::Bfa)
+    );
+
+    // mainnet: BFA is only operated with an explicit opt-in, so the snapshot of a wallet created
+    // with one does not restore for a caller that doesn't opt in
+    let keys = generate_keys(BitcoinNetwork::Mainnet, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let mut mainnet_data = data_dir.wallet_data();
+    mainnet_data.bitcoin_network = BitcoinNetwork::Mainnet;
+    // the schemas a mainnet wallet allows, plus the bridged one the caller opts into
+    mainnet_data.supported_schemas = vec![
+        AssetSchema::Nia,
+        AssetSchema::Uda,
+        AssetSchema::Cfa,
+        AssetSchema::Bfa,
+    ];
+    mainnet_data.allow_reckless_schemas = true;
+    let wallet = Wallet::new_with_database(
+        mainnet_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+
+    let mut no_opt_in = mainnet_data.clone();
+    no_opt_in.allow_reckless_schemas = false;
+    // without the opt-in the mainnet check refuses the schema, so the snapshot of a wallet that
+    // operated it does not restore silently
+    let err = Wallet::from_snapshot(&snapshot, no_opt_in, wallet_keys.clone())
+        .err()
+        .expect("a mainnet wallet without the opt-in must not restore BFA");
+    assert!(
+        matches!(
+            err,
+            Error::CannotUseSchemaOnMainnet {
+                asset_schema: AssetSchema::Bfa
+            }
+        ),
+        "{err:?}"
+    );
+    let restored = Wallet::from_snapshot(&snapshot, mainnet_data, wallet_keys)
+        .expect("the opted-in snapshot restores");
+    assert!(
+        restored
+            .get_wallet_data()
+            .supported_schemas
+            .contains(&AssetSchema::Bfa)
+    );
+}
+
+#[test]
+#[parallel]
 fn sqlite_snapshot_is_none() {
     let data_dir = PrivateDataDir::new();
     let wallet = data_dir.wallet(true, None);

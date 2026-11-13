@@ -455,8 +455,12 @@ impl Wallet {
     /// The snapshot carries the wallet manifest, so the settings the wallet was created with are
     /// validated against `wallet_data` and `keys` before the database is rebuilt; a mismatch
     /// returns [`Error::WalletSettingMismatch`] and the raw database snapshot is not the accepted
-    /// input format. The browser files stored in the snapshot are restored into the wallet's
-    /// adapter before it is returned, so the caller sees the files the flushed wallet had.
+    /// input format. The schemas the snapshot was created with are taken from the manifest rather
+    /// than from `wallet_data`, so a wallet whose code gained a schema keeps restoring the
+    /// snapshots it wrote before; `allow_reckless_schemas` still comes from the caller, so a
+    /// mainnet wallet only operates non-mainnet-safe schemas when it explicitly opts in. The
+    /// browser files stored in the snapshot are restored into the wallet's adapter before it is
+    /// returned, so the caller sees the files the flushed wallet had.
     ///
     /// Constructors are synchronous, so the host restores the snapshot asynchronously with
     /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
@@ -473,6 +477,13 @@ impl Wallet {
         let manifest = manifest.ok_or_else(|| Error::Internal {
             details: "the wallet snapshot carries no wallet manifest".to_string(),
         })?;
+        // the schemas are part of the state the snapshot carries: a wallet updated to support more
+        // of them must not reject the snapshots it wrote before, and the restored wallet keeps the
+        // set its database was built with
+        let wallet_data = WalletData {
+            supported_schemas: manifest.supported_schemas.clone(),
+            ..wallet_data
+        };
         manifest.check_unchanged(&wallet_data, &keys)?;
         let database = RgbLibDatabase::new_memory_from_snapshot(&db_snapshot)?;
         // construction stores the manifest back into the backend, so the restored wallet can be

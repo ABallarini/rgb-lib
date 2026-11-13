@@ -28,8 +28,8 @@
 //!   changeset
 //! - `assets/<asset_id>`: issued contract/consignment files
 //! - `media_files/<digest>`: media blobs
-//! - `transfers/<transfer_id>/...`: PSBTs, fasciae, transfer data, consignments and receive
-//!   metadata/validated copies
+//! - `transfers/<transfer_id>/...`: PSBTs, fasciae, transfer data, consignments, receive
+//!   metadata/validated copies, the checked mint details and the mint locks a receive waits for
 //! - `hub_ops/<file_id>`: multisig hub download cache (native only)
 //! - `rgb/` and `rgb.deleting/`: legacy RGB store input/retirement (native-only migration)
 //!

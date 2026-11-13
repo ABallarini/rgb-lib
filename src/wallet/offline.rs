@@ -2568,14 +2568,22 @@ pub trait WalletOffline: WalletBackup {
             .join(MINT_RCV_FILE)
     }
 
+    /// Whether the details of the mint received on `recipient_id` were saved, once the wallet
+    /// checked it (see [`Self::read_received_mint`]).
+    fn has_received_mint(&self, recipient_id: &str) -> bool {
+        self.wallet_key(&self.get_received_mint_path(recipient_id))
+            .and_then(|key| self.files().exists(&key))
+            .unwrap_or(false)
+    }
+
     /// The details of the mint received on `recipient_id`, saved once the wallet has checked it.
     fn read_received_mint(&self, recipient_id: &str) -> Result<Option<ReceivedMint>, Error> {
-        let path = self.get_received_mint_path(recipient_id);
-        if !path.exists() {
+        let key = self.wallet_key(&self.get_received_mint_path(recipient_id))?;
+        if !self.files().exists(&key)? {
             return Ok(None);
         }
         let received_mint =
-            serde_json::from_str(&fs::read_to_string(path)?).map_err(InternalError::from)?;
+            serde_json::from_slice(&self.files().read(&key)?).map_err(InternalError::from)?;
         Ok(Some(received_mint))
     }
 
