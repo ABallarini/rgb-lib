@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::atomic_tmp_path;
 
 #[test]
 #[parallel]

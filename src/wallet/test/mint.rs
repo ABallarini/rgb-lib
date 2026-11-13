@@ -1552,6 +1552,7 @@ fn bdk_changes_persisted() {
         assert!(!wallet.get_wallet_dir().join(BDK_PENDING_FILE).exists());
         let reloaded = setup_bdk(
             wallet.database(),
+            &*default_files(wallet.get_wallet_dir()),
             wallet.get_wallet_dir(),
             wallet.get_descriptors().colored,
             wallet.get_descriptors().vanilla,

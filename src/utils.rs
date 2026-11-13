@@ -39,9 +39,9 @@ pub(crate) const KEYCHAIN_BTC: u8 = 0;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const INDEXER_STOP_GAP: usize = 20;
-#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora_async"))]
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
 pub(crate) const INDEXER_TIMEOUT: u64 = 10;
-#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora_async"))]
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
 pub(crate) const INDEXER_RETRIES: u8 = 3;
 #[cfg(feature = "electrum")]
 pub(crate) const INDEXER_BATCH_SIZE: usize = 5;
@@ -82,8 +82,8 @@ pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     const VERBATIM_PREFIX: &str = r#"\\?\"#;
     let p = p.as_ref().display().to_string();
-    if p.starts_with(VERBATIM_PREFIX) {
-        p[VERBATIM_PREFIX.len()..].to_string()
+    if let Some(stripped) = p.strip_prefix(VERBATIM_PREFIX) {
+        stripped.to_string()
     } else {
         p
     }

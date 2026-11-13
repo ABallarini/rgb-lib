@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "electrum")]
+use rgbstd::validation::Validity;
 
 #[cfg(feature = "electrum")]
 fn mint_bfa_to_self(

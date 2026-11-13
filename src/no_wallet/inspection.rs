@@ -181,6 +181,7 @@ pub struct ConsignmentInspection {
 }
 
 /// Result of validating an RGB consignment against its own witness data.
+#[cfg(feature = "wallet")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct ConsignmentValidation {

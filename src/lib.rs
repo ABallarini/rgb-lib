@@ -266,12 +266,19 @@ use std::cell::{Cell, RefCell};
 // `cmp::Ordering` is qualified, as the crate also imports `sync::atomic::Ordering`
 #[cfg(feature = "esplora")]
 use std::cmp;
-#[cfg(all(test, unix, feature = "wallet"))]
-use std::os::unix::fs::PermissionsExt;
+#[cfg(any(feature = "wallet", feature = "_validation"))]
+use std::io::Read;
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use std::panic;
 #[cfg(any(feature = "wallet", feature = "bitcoind_validation"))]
 use std::path::PathBuf;
 #[cfg(all(test, feature = "wallet"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "wallet", feature = "_validation")
+))]
+use std::time::Duration;
 #[cfg(feature = "_online")]
 use std::{
     cmp::{max, min},
@@ -284,8 +291,7 @@ use std::{
     fs,
     hash::Hash,
     io::{self, Write},
-    panic,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -294,8 +300,6 @@ use std::{
     path::Path,
     str::FromStr,
 };
-#[cfg(any(feature = "wallet", feature = "_validation"))]
-use std::{io::Read, time::Duration};
 
 #[cfg(test)]
 use amplify::confinement::NonEmptyVec;
@@ -363,11 +367,13 @@ use bdk_wallet::{
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 #[cfg(feature = "wallet")]
 use ed25519_dalek::SigningKey;
+#[cfg(feature = "_online")]
+use ed25519_dalek::{Signature, Verifier};
 #[cfg(any(
     feature = "_online",
     all(target_arch = "wasm32", feature = "esplora_async")
 ))]
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, VerifyingKey};
 #[cfg(feature = "wallet")]
 use file_format::FileFormat;
 #[cfg(any(
@@ -431,8 +437,7 @@ use rgbstd::indexers::esplora_blocking::esplora_client::{
 use rgbstd::persistence::LegacyFsStore;
 #[cfg(feature = "wallet")]
 use rgbstd::{
-    Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, RevealedData, TokenIndex,
-    Vout,
+    Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, TokenIndex,
     containers::{SealWitness, SpvProof},
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, LinkError,
@@ -455,7 +460,6 @@ use rgbstd::{
     },
     txout::ExplicitSeal,
     validation::{SchemaDefinition, WitnessOrdProvider},
-    vm::WitnessPos,
 };
 use rgbstd::{
     Amount, AssignmentType, Assignments, ChainNet, ExposedSeal, Genesis, GlobalStateType,
@@ -474,10 +478,12 @@ use rgbstd::{
         RejectListLocation, RejectListUrl, TokenData, UnicodeTicker,
     },
     txout::{BlindSeal, SealTxid, TxPtr, TxoSeal},
-    validation::{DbcProof, OpsDag, SchemaRules, ValidationConfig, ValidationError, Warning},
+    validation::{DbcProof, OpsDag, ValidationConfig, ValidationError, Warning},
 };
 #[cfg(test)]
 use rgbstd::{Assign, VoidState, assignments::AssignVec};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use rgbstd::{RevealedData, Vout, vm::WitnessPos};
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
 use schemata::{
@@ -492,18 +498,25 @@ use schemata::{
     TS_TRANSFER_INFLATION, TS_TRANSFER_LINK,
 };
 #[cfg(feature = "wallet")]
-use scrypt::{Params, phc::Salt, scrypt};
+use scrypt::{Params, phc::Salt};
 #[cfg(all(test, feature = "wallet"))]
 use sea_orm::IntoActiveValue;
 #[cfg(feature = "wallet")]
 use sea_orm::{
-    ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction,
-    DbErr, DeriveActiveEnum, EntityTrait, EnumIter, Iterable, JoinType, JsonValue, QueryFilter,
-    QueryOrder, QueryResult, QuerySelect, TransactionTrait, TryGetError, TryGetable, TryIntoModel,
+    ActiveValue, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult, TryGetError,
+    TryGetable, TryIntoModel,
+};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use sea_orm::{
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    JoinType, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
     sea_query::{Alias, Condition, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
 };
+// `AssetSchema::iter` is only called by the tests today, including the browser ones
+#[cfg(all(feature = "wallet", any(test, not(target_arch = "wasm32"))))]
+use sea_orm::Iterable;
 #[cfg(feature = "_online")]
-use sea_orm::{PaginatorTrait, RelationTrait, Select};
+use sea_orm::RelationTrait;
 #[cfg(feature = "wallet")]
 use sea_query::{ArrayType, ColumnType, Nullable, Value, ValueTypeErr};
 #[cfg(feature = "wallet")]
@@ -518,21 +531,23 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 #[cfg(feature = "wallet")]
 use sha2::{Digest, Sha256};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use slog::Drain;
 #[cfg(feature = "wallet")]
-use slog::{Drain, Logger, debug, error, info, o, warn};
-#[cfg(feature = "wallet")]
-use slog_async::AsyncGuard;
-#[cfg(feature = "wallet")]
+use slog::{Logger, debug, error, info, o, warn};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use slog_term::{FullFormat, PlainDecorator};
+#[cfg(feature = "wallet")]
+use strict_encoding::FieldName;
 #[cfg(all(test, feature = "wallet"))]
 use strict_encoding::StrictDumb;
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
 use strict_encoding::StrictSerialize;
 use strict_encoding::{DeserializeError, StrictDeserialize};
-#[cfg(feature = "wallet")]
-use strict_encoding::{FieldName, StrictDecode, StrictEncode};
 #[cfg(feature = "rgb_fs_store_migration")]
 use strict_encoding::{StreamReader, StrictReader};
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use strict_encoding::{StrictDecode, StrictEncode};
 #[cfg(feature = "wallet")]
 use strict_types::{TypeLib, TypeLibId};
 #[cfg(all(feature = "wallet", test, not(target_arch = "wasm32")))]
@@ -611,8 +626,10 @@ use crate::utils::INDEXER_BATCH_SIZE;
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::utils::INDEXER_STOP_GAP;
-#[cfg(feature = "_online")]
-use crate::utils::write_fascia;
+#[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
+use crate::utils::{
+    LOG_FILE, RGB_RUNTIME_DELETING_DIR, atomic_write, atomic_write_with, setup_logger,
+};
 #[cfg(feature = "wallet")]
 use crate::utils::{check_psbt_parsable, strip_rgb_data};
 #[cfg(feature = "bitcoind")]
@@ -670,12 +687,11 @@ use crate::{
     error::InternalError,
     keys::{Keys, WitnessVersion},
     utils::{
-        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
-        RGB_RUNTIME_DELETING_DIR, RgbStock, atomic_tmp_path, atomic_write, atomic_write_with,
+        ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LoggerGuard, PURPOSE, RgbStock,
         beneficiary_from_script_buf, bfa_reject_list_url, from_str_or_number_mandatory,
         from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
         get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
-        read_fascia, setup_logger, str_to_xpub,
+        read_fascia, str_to_xpub,
     },
     wallet::{
         AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,

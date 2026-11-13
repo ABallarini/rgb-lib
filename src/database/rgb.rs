@@ -2566,6 +2566,7 @@ mod legacy {
 
         /// Following a symlink pointing at an ancestor makes the walk re-enter the tree,
         /// which must not end in an infinite loop.
+        #[cfg(unix)]
         #[test]
         fn symlink_loop_terminates() {
             let tmp = tempfile::tempdir().unwrap();
@@ -2580,6 +2581,7 @@ mod legacy {
 
         /// A symlink escaping the walked dir must not be handed to the callback, which reads,
         /// rewrites and deletes the files it is given.
+        #[cfg(unix)]
         #[test]
         fn symlink_outside_is_not_visited() {
             let outside = tempfile::tempdir().unwrap();

@@ -666,21 +666,25 @@ fn fail() {
     assert!(matches!(result, Err(Error::FingerprintMismatch)));
 
     // non-writable wallet dir
-    let non_writable_path = "non_writable";
-    let _ = fs::remove_dir(non_writable_path);
-    fs::create_dir(non_writable_path).unwrap();
-    // set the permissions to read and execute only (no write permissions)
-    let permissions = fs::Permissions::from_mode(0o555);
-    fs::set_permissions(non_writable_path, permissions).unwrap();
-    // try to setup logger, expecting it to receive a permission denied error
-    let result = std::panic::catch_unwind(|| setup_logger(non_writable_path, Some("log")));
-    assert!(result.is_ok());
-    let res = result.unwrap();
-    assert!(res.is_err());
-    let err = res.err().unwrap();
-    assert!(matches!(err, Error::IO { details: m } if m.starts_with("Permission denied")));
-    // remove non writable directory
-    fs::remove_dir(non_writable_path).unwrap();
+    // permission bits are only enforced on unix; windows has no equivalent here
+    #[cfg(unix)]
+    {
+        let non_writable_path = "non_writable";
+        let _ = fs::remove_dir(non_writable_path);
+        fs::create_dir(non_writable_path).unwrap();
+        // set the permissions to read and execute only (no write permissions)
+        let permissions = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(non_writable_path, permissions).unwrap();
+        // try to setup logger, expecting it to receive a permission denied error
+        let result = std::panic::catch_unwind(|| setup_logger(non_writable_path, Some("log")));
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert!(matches!(err, Error::IO { details: m } if m.starts_with("Permission denied")));
+        // remove non writable directory
+        fs::remove_dir(non_writable_path).unwrap();
+    }
 }
 
 #[cfg(feature = "electrum")]

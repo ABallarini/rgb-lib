@@ -26,8 +26,6 @@ use biscuit_auth::{KeyPair, builder::date, macros::*};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 #[cfg(feature = "electrum")]
-use regex::RegexSet;
-#[cfg(feature = "electrum")]
 use rgbstd::stl::{EmbeddedMedia as RgbEmbeddedMedia, ProofOfReserves as RgbProofOfReserves};
 #[cfg(feature = "_online")]
 use rgbstd::{Assign, RevealedValue, TypedAssigns};

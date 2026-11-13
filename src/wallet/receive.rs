@@ -1289,7 +1289,6 @@ fn resolve_native_claims<W: ReceiveWallet + ?Sized>(
     let unconfirmed = resolve_claims(pending, &claim_resolver, &pending_claims.claims, |opid| {
         mint_resolver.is_expired(opid)
     })?;
-    drop(claim_resolver);
     drop(mint_resolver);
 
     let max_mint_lock_blocks = wallet
@@ -1542,6 +1541,8 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
         Ok((outcome, retrieval))
     }
 
+    // only the browser receive loop prefetches claims: the native one resolves them as it goes
+    #[cfg_attr(feature = "_online", allow(unused_variables))]
     async fn drive_receive_inner<T: ReceiveTransport + ?Sized>(
         &self,
         transport: &T,

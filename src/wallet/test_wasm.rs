@@ -67,7 +67,7 @@ use crate::{
     Error, LoggerGuard,
     database::entities::txo::ActiveModel as DbTxoActMod,
     keys::generate_keys,
-    setup_logger,
+    utils::setup_logger,
     wallet::{core::WalletCore, offline::RgbWalletOpsOffline},
 };
 use sea_orm::ActiveValue;

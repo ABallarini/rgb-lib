@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(feature = "wallet")]
 use rgbstd::validation::SchemaRules;
 
 pub(crate) const SCHEMA_ID_NIA: &str =
