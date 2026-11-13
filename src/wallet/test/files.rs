@@ -78,6 +78,7 @@ fn new_test_wallet(data_dir: &Path) -> Wallet {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: AssetSchema::VALUES.to_vec(),
+        allow_reckless_schemas: false,
     };
     Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, Some(2))).unwrap()
 }
@@ -125,6 +126,7 @@ fn manifest_is_written_through_the_adapter() {
             "database_type",
             "max_allocations_per_utxo",
             "supported_schemas",
+            "allow_reckless_schemas",
             "account_xpub_vanilla",
             "account_xpub_colored",
             "vanilla_keychain",
@@ -321,6 +323,7 @@ fn multisig_hub_ops_layout_is_unchanged() {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: AssetSchema::VALUES.to_vec(),
+        allow_reckless_schemas: false,
     };
     let wallet = MultisigWallet::new(
         wallet_data,

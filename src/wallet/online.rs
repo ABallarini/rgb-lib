@@ -480,6 +480,7 @@ pub trait WalletOnline: WalletOffline {
                             }
                         }
                     }
+                    IndexerError::Internal { .. } => {}
                 }
                 if indexer.get_tx_confirmations(&txid)?.is_none() {
                     return Err(Error::FailedBroadcast {
@@ -1897,7 +1898,7 @@ pub trait WalletOnline: WalletOffline {
                                 self.logger(),
                                 "Cannot find the media file but the contract defines one"
                             );
-                            self.cleanup_media_files(&saved_media)?;
+                            WalletOffline::cleanup_media_files(self, &saved_media)?;
                             return Ok(false);
                         }
                     }
@@ -1913,7 +1914,7 @@ pub trait WalletOnline: WalletOffline {
                             self.logger(),
                             "Media for digest {digest} was not provided for the out-of-band receive"
                         );
-                        self.cleanup_media_files(&saved_media)?;
+                        WalletOffline::cleanup_media_files(self, &saved_media)?;
                         return Ok(false);
                     }
                 },
@@ -6043,11 +6044,8 @@ pub trait WalletOnline: WalletOffline {
         let mut difficulty = 0;
         for _ in 0..MAX_POW_ATTEMPTS {
             let pow_timestamp = now().unix_timestamp().to_string();
-            let pow_nonce = crate::executor::cpu_executor().proof_of_work(
-                &data.transfer_id,
-                &pow_timestamp,
-                difficulty,
-            );
+            let pow_nonce =
+                crate::encryption::solve_pow(&data.transfer_id, &pow_timestamp, difficulty);
             let res = proxy_client.post_consignment(
                 data,
                 consignment_path,

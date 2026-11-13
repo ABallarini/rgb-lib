@@ -1338,6 +1338,7 @@ mod wasm_snapshot_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: AssetSchema::VALUES.to_vec(),
+            allow_reckless_schemas: false,
         };
         let manifest = WalletManifest::new(&wallet_data, &SinglesigKeys::from_keys(&keys, None));
         (manifest, keys.mnemonic)

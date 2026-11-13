@@ -130,10 +130,8 @@ impl WalletBackup for Wallet {
 
 impl WalletOffline for Wallet {}
 
-#[cfg(any(
-    feature = "_online",
-    all(feature = "esplora_async", target_arch = "wasm32")
-))]
+// the receive driver this marker implements is gated off until ported (see wallet/mod.rs)
+#[cfg(any())]
 impl ReceiveWallet for Wallet {}
 
 #[cfg(feature = "_online")]

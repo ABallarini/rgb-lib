@@ -114,11 +114,15 @@ mod tests {
             ("runtime.rs", 1),
             // test-only mock electrum server, `cfg(all(test, feature = "_online"))`
             ("wallet/indexer.rs", 1),
-            // native `slog_async` drain, plus a test-only mock electrum server
-            ("utils.rs", 2),
+            // native `slog_async` drain
+            ("utils.rs", 1),
             // browser retry backoff: the async client's `Sleeper::sleep` resolves a `setTimeout`
             // promise, so nothing blocks the page; wasm32-only module
             ("wallet/indexer_async.rs", 1),
+            // native EVM claim retry pause; `api::evm` is gated behind `_validation`
+            ("api/evm.rs", 1),
+            // test-only mock electrum server, `cfg(all(test, feature = "electrum_validation"))`
+            ("no_wallet/validation.rs", 1),
         ];
 
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

@@ -203,9 +203,6 @@ compile_error!(
     all(target_arch = "wasm32", feature = "esplora_async")
 ))]
 pub(crate) mod api;
-#[cfg(test)]
-#[macro_use]
-mod test_macros;
 #[cfg(feature = "wallet")]
 pub(crate) mod database;
 // without the wallet only the database enums are needed, as some are shared with inspection
@@ -218,8 +215,6 @@ pub(crate) mod database {
 #[cfg(feature = "wallet")]
 pub(crate) mod encryption;
 pub(crate) mod error;
-#[cfg(feature = "wallet")]
-pub(crate) mod executor;
 #[cfg(feature = "wallet")]
 pub mod keys;
 pub mod no_wallet;
@@ -253,16 +248,16 @@ pub use rgbstd::{
     validation::Claim,
 };
 
+#[cfg(feature = "wallet")]
+pub use crate::database::enums::{
+    Encryption, TransferStatus, TransportType, WalletTransactionType,
+};
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use crate::utils::block_on;
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TypeOfTransition},
     error::Error,
     no_wallet::BitcoinNetwork,
-};
-#[cfg(feature = "wallet")]
-pub use crate::{
-    database::enums::{Encryption, TransferStatus, TransportType, WalletTransactionType},
 };
 
 #[cfg(feature = "_validation")]
@@ -317,6 +312,8 @@ use bdk_bitcoind_rpc::{Emitter as BitcoindEmitter, bip158::FilterIter as Bitcoin
 use bdk_electrum::BdkElectrumClient;
 #[cfg(feature = "esplora")]
 use bdk_esplora::EsploraExt;
+#[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+use bdk_esplora::esplora_client::Error as EsploraError;
 #[cfg(feature = "_online")]
 use bdk_wallet::Update;
 #[cfg(all(test, feature = "wallet"))]
@@ -365,13 +362,22 @@ use bdk_wallet::{
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 #[cfg(feature = "wallet")]
 use ed25519_dalek::SigningKey;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 #[cfg(feature = "wallet")]
 use file_format::FileFormat;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use hkdf::Hkdf;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use hmac::{Mac, SimpleHmac};
 #[cfg(feature = "wallet")]
 use psrgbt::{PSBT_MPC_PREFIX, PSBT_OPRET_PREFIX, PSBT_RGB_PREFIX, PSBT_TAPRET_PREFIX};
@@ -492,18 +498,13 @@ use scrypt::{Params, phc::Salt, scrypt};
 use sea_orm::IntoActiveValue;
 #[cfg(feature = "wallet")]
 use sea_orm::{
-    ActiveValue, DbErr, DeriveActiveEnum, EnumIter, JsonValue, QueryResult, TryGetError,
-    TryGetable, TryIntoModel,
-};
-#[cfg(feature = "_online")]
-use sea_orm::{PaginatorTrait, RelationTrait, Select};
-#[cfg(feature = "wallet")]
-use sea_orm::{
     ActiveValue, ColumnTrait, ConnectOptions, Database, DatabaseConnection, DatabaseTransaction,
     DbErr, DeriveActiveEnum, EntityTrait, EnumIter, Iterable, JoinType, JsonValue, QueryFilter,
     QueryOrder, QueryResult, QuerySelect, TransactionTrait, TryGetError, TryGetable, TryIntoModel,
     sea_query::{Alias, Condition, Expr, ExprTrait, Func, OnConflict, SimpleExpr},
 };
+#[cfg(feature = "_online")]
+use sea_orm::{PaginatorTrait, RelationTrait, Select};
 #[cfg(feature = "wallet")]
 use sea_query::{ArrayType, ColumnType, Nullable, Value, ValueTypeErr};
 #[cfg(feature = "wallet")]
@@ -511,7 +512,10 @@ use serde::Deserializer;
 #[cfg(feature = "wallet")]
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use sha2::Sha512;
 #[cfg(feature = "wallet")]
 use sha2::{Digest, Sha256};
@@ -540,7 +544,10 @@ use time::OffsetDateTime;
 use url::Url;
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use walkdir::WalkDir;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 #[cfg(feature = "wallet")]
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -551,22 +558,6 @@ use crate::api::evm::MintLockStatus;
 use crate::api::{
     evm::{EvmClient, MintClaimResolver},
     reject_list::RejectListClient,
-};
-#[cfg(feature = "_validation")]
-use crate::error::IndexerError;
-#[cfg(feature = "bitcoind")]
-use crate::no_wallet::validation::checked_bitcoind_indexes;
-#[cfg(feature = "electrum")]
-use crate::no_wallet::validation::electrum_config;
-#[cfg(feature = "esplora")]
-use crate::no_wallet::validation::esplora_config;
-#[cfg(feature = "_online")]
-use crate::no_wallet::validation::{
-    ChainResolver, ClaimResolution, OffchainResolver, PendingClaims, RejectList, RejectListSource,
-    RemoteRejectListResolver, ResolveRejectList, check_reject_list, genesis_reject_list_source,
-    get_resolver, pending_claims, rejected_opouts, resolve_claims, resolve_witnesses,
-    unreachable_indexer_details, validate_consignment_internal, validate_deterministic,
-    validate_with_claims,
 };
 #[cfg(any(
     feature = "_online",
@@ -597,6 +588,22 @@ use crate::database::entities::{
 use crate::database::entities::{
     rgb_assignment::Model as DbAssignment, rgb_global_state::Model as DbGlobalState,
     rgb_witness_ord::Model as DbWitnessOrd,
+};
+#[cfg(feature = "_validation")]
+use crate::error::IndexerError;
+#[cfg(feature = "bitcoind")]
+use crate::no_wallet::validation::checked_bitcoind_indexes;
+#[cfg(feature = "electrum")]
+use crate::no_wallet::validation::electrum_config;
+#[cfg(feature = "esplora")]
+use crate::no_wallet::validation::esplora_config;
+#[cfg(feature = "_online")]
+use crate::no_wallet::validation::{
+    ChainResolver, ClaimResolution, OffchainResolver, PendingClaims, RejectList, RejectListSource,
+    RemoteRejectListResolver, ResolveRejectList, check_reject_list, genesis_reject_list_source,
+    get_resolver, pending_claims, rejected_opouts, resolve_claims, resolve_witnesses,
+    unreachable_indexer_details, validate_consignment_internal, validate_deterministic,
+    validate_with_claims,
 };
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
@@ -666,11 +673,11 @@ use crate::{
     keys::{Keys, WitnessVersion},
     utils::{
         ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, LoggerGuard, PURPOSE,
-        RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, atomic_tmp_path, atomic_write,
-        atomic_write_with, beneficiary_from_script_buf, bfa_reject_list_url,
-        from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
-        get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex,
-        now, parse_address_str, read_fascia, setup_logger, str_to_xpub,
+        RGB_RUNTIME_DELETING_DIR, RgbStock, atomic_tmp_path, atomic_write, atomic_write_with,
+        beneficiary_from_script_buf, bfa_reject_list_url, from_str_or_number_mandatory,
+        from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
+        get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
+        read_fascia, setup_logger, str_to_xpub,
     },
     wallet::{
         AssetFilter, Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
@@ -681,6 +688,22 @@ use crate::{
 // the mock electrum server of the validation tests, shared with the wallet ones
 #[cfg(all(test, feature = "electrum"))]
 use crate::no_wallet::validation::tests::start_single_connection_electrum_mock;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::utils::adjust_canonicalization;
+// the browser wallet runs the wallet crypto and script helpers without `_online`: the receive
+// driver reaches them through this module, not through the native proxy clients above
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "esplora_async",
+    not(feature = "_online")
+))]
+use crate::{
+    encryption::{
+        decode_hash_hex, decrypt_blob, derive_shared, ed25519_from_seed, sign_ed25519,
+        verifying_key_from_bytes,
+    },
+    utils::script_buf_from_recipient_id,
+};
 #[cfg(all(test, feature = "wallet"))]
 use crate::{
     keys::generate_keys,

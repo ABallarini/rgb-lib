@@ -988,7 +988,10 @@ pub enum Error {
     WrongPassword,
 }
 
-#[cfg(feature = "_validation")]
+#[cfg(any(
+    feature = "_validation",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
     #[error("Indexer internal error: {details}")]
@@ -1128,7 +1131,10 @@ impl From<bdk_wallet::bitcoin::psbt::PsbtParseError> for Error {
     }
 }
 
-#[cfg(feature = "_validation")]
+#[cfg(any(
+    feature = "_validation",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 impl From<IndexerError> for Error {
     fn from(e: IndexerError) -> Self {
         Error::Indexer {

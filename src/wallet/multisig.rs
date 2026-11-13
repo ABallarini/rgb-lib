@@ -4,9 +4,6 @@
 
 use super::*;
 
-#[cfg(feature = "_online")]
-use super::receive::{NativeReceiveTransport, release_retrievals};
-
 #[cfg(not(target_arch = "wasm32"))]
 const HUB_OPS_DIR: &str = "hub_ops";
 
@@ -295,9 +292,8 @@ impl WalletOffline for MultisigWallet {
     }
 }
 
-// the overrides reach the multisig hub, which is a native online capability, so this impl is
-// native-only: on the browser the receive wallet is the singlesig one.
-#[cfg(feature = "_online")]
+// native-only and waiting for the ported receive driver (see wallet/mod.rs)
+#[cfg(any())]
 impl ReceiveWallet for MultisigWallet {
     // every cosigner downloads the consignment from the recipient proxy
     fn releases_received_transfer_data(&self) -> bool {
@@ -379,19 +375,12 @@ impl RgbWalletOpsOnline for MultisigWallet {
             "Failing batch transfer with idx {:?}...", batch_transfer_idx
         );
         let txn = self.database().begin_transaction()?;
-        let mut retrievals: Vec<PendingRetrieval> = vec![];
-        let outcome = self.fail_transfers_impl(
-            &txn,
-            batch_transfer_idx,
-            no_asset_only,
-            skip_sync,
-            &mut retrievals,
-        )?;
+        let outcome =
+            self.fail_transfers_impl(&txn, batch_transfer_idx, no_asset_only, skip_sync)?;
         if outcome.transfers_changed {
             self.update_backup_info(&txn, false)?;
         }
         self.persist_and_commit(txn)?;
-        release_retrievals(&NativeReceiveTransport::new(self), &retrievals);
         info!(self.logger(), "Fail transfers completed");
         if outcome.cannot_fail {
             return Err(Error::CannotFailBatchTransfer);
@@ -2124,13 +2113,11 @@ impl MultisigWallet {
             },
             false,
         )?;
-        let mut retrievals: Vec<PendingRetrieval> = vec![];
-        self.refresh_impl(&txn, None, vec![], true, &mut retrievals)?;
-        self.refresh_impl(&txn, None, vec![], true, &mut retrievals)?;
+        self.refresh_impl(&txn, None, vec![], true)?;
+        self.refresh_impl(&txn, None, vec![], true)?;
 
         let op_idx = self.get_local_last_processed_operation_idx_impl(&txn)?;
         self.persist_and_commit(txn)?;
-        release_retrievals(&NativeReceiveTransport::new(self), &retrievals);
         let next_op_idx = op_idx
             .checked_add(1)
             .expect("operation index cannot exceed i32::MAX");
@@ -2152,19 +2139,15 @@ impl MultisigWallet {
             );
         if needs_refresh {
             let txn = self.database().begin_transaction()?;
-            let mut retrievals: Vec<PendingRetrieval> = vec![];
-            let _ = self.refresh_impl(&txn, None, vec![], true, &mut retrievals)?;
+            let _ = self.refresh_impl(&txn, None, vec![], true)?;
             self.persist_and_commit(txn)?;
-            release_retrievals(&NativeReceiveTransport::new(self), &retrievals);
             if !matches!(
                 op.operation_type,
                 OperationType::Inflation | OperationType::Burn
             ) {
                 let txn = self.database().begin_transaction()?;
-                let mut retrievals: Vec<PendingRetrieval> = vec![];
-                let _ = self.refresh_impl(&txn, None, vec![], true, &mut retrievals);
+                let _ = self.refresh_impl(&txn, None, vec![], true);
                 self.persist_and_commit(txn)?;
-                release_retrievals(&NativeReceiveTransport::new(self), &retrievals);
             }
         }
 

@@ -267,6 +267,8 @@ impl InMemoryDb {
             max_supply: av_opt(a.max_supply),
             known_circulating_supply: av_opt(a.known_circulating_supply),
             reject_list_url: av_opt(a.reject_list_url),
+            linked_from_contract: av_opt(a.linked_from_contract),
+            linked_to_contract: av_opt(a.linked_to_contract),
         };
         self.assets.borrow_mut().push(row);
         Ok(idx)
@@ -283,6 +285,7 @@ impl InMemoryDb {
             user_driven: av_or(a.user_driven, false),
             batch_transfer_idx: av(a.batch_transfer_idx),
             asset_id: av_opt(a.asset_id),
+            transition_type: av_opt(a.transition_type),
         };
         self.asset_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -1648,6 +1651,7 @@ fn to_entity_db_data(
                 user_driven: a.user_driven,
                 batch_transfer_idx: a.batch_transfer_idx,
                 asset_id: a.asset_id,
+                transition_type: a.transition_type,
             })
             .collect(),
         transfers: transfers

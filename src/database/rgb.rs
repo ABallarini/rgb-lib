@@ -17,11 +17,45 @@ use super::*;
 
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::database::entities::{
-    rgb_aluvm_lib, rgb_assignment, rgb_bundle, rgb_bundle_contract, rgb_bundle_witness,
-    rgb_genesis, rgb_global_state, rgb_invalid_op, rgb_op_bundle, rgb_op_input, rgb_outpoint_opout,
-    rgb_schema, rgb_schema_type_lib, rgb_secret_seal, rgb_secret_seal_opout, rgb_type_lib,
-    rgb_witness, rgb_witness_ord,
+    rgb_aluvm_lib,
+    rgb_aluvm_lib::ActiveModel as DbAluvmLibActMod,
+    rgb_assignment,
+    rgb_assignment::ActiveModel as DbAssignmentActMod,
+    rgb_bundle,
+    rgb_bundle::ActiveModel as DbBundleActMod,
+    rgb_bundle_contract,
+    rgb_bundle_contract::ActiveModel as DbBundleContractActMod,
+    rgb_bundle_witness,
+    rgb_bundle_witness::ActiveModel as DbBundleWitnessActMod,
+    rgb_genesis,
+    rgb_genesis::{ActiveModel as DbGenesisActMod, Model as DbGenesis},
+    rgb_global_state,
+    rgb_global_state::ActiveModel as DbGlobalStateActMod,
+    rgb_invalid_op,
+    rgb_invalid_op::ActiveModel as DbInvalidOpActMod,
+    rgb_op_bundle,
+    rgb_op_bundle::ActiveModel as DbOpBundleActMod,
+    rgb_op_input,
+    rgb_op_input::{ActiveModel as DbOpInputActMod, Model as DbOpInput},
+    rgb_outpoint_opout,
+    rgb_outpoint_opout::ActiveModel as DbOutpointOpoutActMod,
+    rgb_schema,
+    rgb_schema::{ActiveModel as DbSchemaActMod, Model as DbSchema},
+    rgb_schema_type_lib,
+    rgb_schema_type_lib::ActiveModel as DbSchemaTypeLibActMod,
+    rgb_secret_seal,
+    rgb_secret_seal::ActiveModel as DbSecretSealActMod,
+    rgb_secret_seal_opout,
+    rgb_secret_seal_opout::ActiveModel as DbSecretSealOpoutActMod,
+    rgb_type_lib,
+    rgb_type_lib::ActiveModel as DbTypeLibActMod,
+    rgb_witness,
+    rgb_witness::{ActiveModel as DbWitnessActMod, Model as DbWitness},
+    rgb_witness_ord,
+    rgb_witness_ord::ActiveModel as DbWitnessOrdActMod,
 };
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use rgbstd::persistence::{AllocKind, AllocSeal, decode, encode};
 
 /// Max number of values bound in a single query.
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]

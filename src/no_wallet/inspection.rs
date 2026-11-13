@@ -328,7 +328,7 @@ pub fn validate_consignment_offchain(
                 invalid("invalid", failure.to_string())
             }
             Err(ValidationError::ResolverError(e)) => invalid("resolver", e.to_string()),
-            Err(ValidationError::ExternalAnchorsPending(count)) => invalid(
+            Err(ValidationError::PendingClaims(count)) => invalid(
                 "external_anchors",
                 format!("{count} external anchor(s) need online confirmation"),
             ),

@@ -1465,6 +1465,117 @@ impl DbTxn {
             DbTxn::Memory(m) => m.backend.db.update_bdk_changeset(changeset),
         }
     }
+
+    /// The number of allocations of the asset with ID `asset_id`, or of any asset if `None`, the
+    /// TXO with index `txo_idx` holds or is due to receive, from transfers that haven't failed.
+    #[cfg(feature = "_online")]
+    pub(crate) fn count_txo_incoming_colorings(
+        &self,
+        txo_idx: i32,
+        asset_id: Option<&str>,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<usize, Error> {
+        Ok(self
+            .incoming_colorings(txo_idx, asset_id, exclude_asset_transfer_idx)?
+            .count())
+    }
+
+    /// The total amount of the asset with ID `asset_id` the TXO with index `txo_idx` holds or is
+    /// due to receive.
+    #[cfg(feature = "_online")]
+    pub(crate) fn txo_incoming_amount(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<u128, Error> {
+        Ok(self
+            .incoming_colorings(txo_idx, Some(asset_id), exclude_asset_transfer_idx)?
+            .map(|c| u128::from(c.assignment.main_amount()))
+            .sum())
+    }
+
+    /// The number of mint rights of the asset with ID `asset_id` the TXO with index `txo_idx`
+    /// holds or is due to receive.
+    #[cfg(feature = "_online")]
+    pub(crate) fn count_txo_incoming_mint_rights(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<usize, Error> {
+        Ok(self
+            .incoming_colorings(txo_idx, Some(asset_id), exclude_asset_transfer_idx)?
+            .filter(|c| c.assignment == Assignment::MintRight)
+            .count())
+    }
+
+    /// The incoming colorings matching the query of `count_txo_incoming_colorings`, loaded from
+    /// either backend.
+    #[cfg(feature = "_online")]
+    fn incoming_colorings<'a>(
+        &'a self,
+        txo_idx: i32,
+        asset_id: Option<&'a str>,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<impl Iterator<Item = DbColoring> + 'a, Error> {
+        let colorings = self.iter_colorings()?;
+        let asset_transfers = self.iter_asset_transfers()?;
+        let batch_transfers = self.iter_batch_transfers()?;
+        Ok(colorings.into_iter().filter(move |c| {
+            c.txo_idx == txo_idx
+                && c.asset_transfer_idx != exclude_asset_transfer_idx
+                && ColoringType::INCOMING.contains(&c.r#type)
+                && asset_transfers
+                    .iter()
+                    .find(|at| at.idx == c.asset_transfer_idx)
+                    .is_some_and(|at| {
+                        asset_id.is_none_or(|id| at.asset_id.as_deref() == Some(id))
+                            && batch_transfers
+                                .iter()
+                                .find(|bt| bt.idx == at.batch_transfer_idx)
+                                .is_some_and(|bt| bt.status != TransferStatus::Failed)
+                    })
+        }))
+    }
+
+    /// The unpaid blind invoices on the UTXO at `outpoint`, other than the one of the transfer
+    /// with index `exclude_transfer_idx`.
+    #[cfg(feature = "_online")]
+    pub(crate) fn get_utxo_unpaid_invoices(
+        &self,
+        outpoint: &Outpoint,
+        exclude_transfer_idx: i32,
+    ) -> Result<Vec<(DbTransfer, Option<String>)>, Error> {
+        let transfers = self.iter_transfers()?;
+        let asset_transfers = self.iter_asset_transfers()?;
+        let batch_transfers = self.iter_batch_transfers()?;
+        let colorings = self.iter_colorings()?;
+        Ok(
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .filter(|(utxo, t, _)| *utxo == outpoint && t.idx != exclude_transfer_idx)
+                .map(|(_, t, at)| (t.clone(), at.asset_id))
+                .collect(),
+        )
+    }
+
+    /// The UTXOs with an unpaid blind invoice requesting a mint right of the asset with ID
+    /// `asset_id` (see `unpaid_invoices`).
+    pub(crate) fn get_mint_right_invoice_utxos(
+        &self,
+        asset_id: &str,
+    ) -> Result<HashSet<Outpoint>, Error> {
+        let transfers = self.iter_transfers()?;
+        let asset_transfers = self.iter_asset_transfers()?;
+        let batch_transfers = self.iter_batch_transfers()?;
+        let colorings = self.iter_colorings()?;
+        Ok(
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .filter(|(_, t, at)| t.requests_mint_right(at.asset_id.as_deref(), asset_id))
+                .map(|(utxo, _, _)| utxo.clone())
+                .collect(),
+        )
+    }
 }
 
 /// The storage backend behind [`RgbLibDatabase`]:

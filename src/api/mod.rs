@@ -1,3 +1,4 @@
+#[cfg(feature = "_validation")]
 pub(crate) mod evm;
 #[cfg(feature = "_online")]
 pub(crate) mod multisig_hub;

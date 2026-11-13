@@ -318,7 +318,7 @@ esplora_validation = [
 # browser Esplora transport: async `esplora-client` over `fetch`, wasm32 only (on other targets it
 # enables no transport, and the blocking `esplora` feature stays the native one). Deliberately not
 # `_online`: the wasm sync path is wired separately from the native online paths.
-esplora_async = ["wallet", "bdk_esplora", "dep:reqwest_fetch", "dep:mime_guess"]
+esplora_async = ["wallet", "bdk_esplora", "dep:reqwest_fetch", "dep:mime_guess", "dep:x25519-dalek"]
 camel_case = []
 
 [profile.release]

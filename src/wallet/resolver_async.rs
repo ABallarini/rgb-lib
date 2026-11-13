@@ -207,9 +207,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::BitcoinNetwork;
     use crate::database::enums::AssetSchema;
     use crate::runtime::block_on;
-    use crate::utils::BitcoinNetwork;
     use crate::wallet::setup_rgb;
     use crate::{RgbLibDatabase, RgbStock};
 
@@ -861,7 +861,14 @@ mod tests {
     /// the RGB stock.
     fn seeded_memory_db() -> RgbLibDatabase {
         let db = RgbLibDatabase::new_memory();
-        setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).expect("setup rgb");
+        setup_rgb(
+            &db,
+            vec![AssetSchema::Nia],
+            BitcoinNetwork::Regtest,
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("setup rgb");
         db
     }
 

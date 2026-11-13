@@ -282,9 +282,9 @@ mod test {
     use rgbstd::persistence::{RgbStore, Stock};
 
     use super::rgb_store::MemRgbStore;
+    use crate::BitcoinNetwork;
     use crate::RgbStock;
     use crate::database::enums::AssetSchema;
-    use crate::utils::BitcoinNetwork;
     use crate::wallet::{setup_db, setup_rgb};
 
     /// `RgbLibDatabase` in memory mode must run the same `setup_rgb` schema
@@ -295,7 +295,14 @@ mod test {
         use crate::RgbLibDatabase;
 
         let db = RgbLibDatabase::new_memory();
-        setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+        setup_rgb(
+            &db,
+            vec![AssetSchema::Nia],
+            BitcoinNetwork::Regtest,
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
 
         let txn = db.begin_transaction().unwrap();
         let stock = RgbStock::new(&txn);
@@ -313,7 +320,14 @@ mod test {
     fn memory_rgb_store_imports_the_same_schemata_as_sqlite() {
         let dir = tempfile::tempdir().unwrap();
         let db = setup_db(dir.path()).unwrap();
-        setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+        setup_rgb(
+            &db,
+            vec![AssetSchema::Nia],
+            BitcoinNetwork::Regtest,
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
 
         let txn = db.begin_transaction().unwrap();
         let stock = RgbStock::new(&txn);
@@ -531,7 +545,14 @@ mod test {
 
         fn setup() -> RgbLibDatabase {
             let db = RgbLibDatabase::new_memory();
-            setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+            setup_rgb(
+                &db,
+                vec![AssetSchema::Nia],
+                BitcoinNetwork::Regtest,
+                false,
+                &slog::Logger::root(slog::Discard, slog::o!()),
+            )
+            .unwrap();
             db
         }
 
@@ -615,7 +636,14 @@ mod test {
         use sea_orm::ActiveValue;
 
         let db = RgbLibDatabase::new_memory();
-        setup_rgb(&db, vec![AssetSchema::Nia], BitcoinNetwork::Regtest).unwrap();
+        setup_rgb(
+            &db,
+            vec![AssetSchema::Nia],
+            BitcoinNetwork::Regtest,
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
         let backend = db.memory_backend().unwrap().clone();
 
         {
