@@ -25,11 +25,9 @@ pub mod persistence;
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
 pub(crate) mod receive_checks;
-// FOLLOW-UP(wasm-receive): the shared receive driver and its browser transport still target the
-// pre-rebase rgb-std validation API (terminals, build_opouts_dag, find_terminal_bundle). The
-// upstream receive flow is the live implementation until they are ported; the sources are kept in
-// the tree and re-enabled by flipping this gate.
-#[cfg(any())]
+// FOLLOW-UP(wasm-receive): the shared receive driver is native only until the browser transport
+// and the prefetched resolvers are wired (see `receive_wasm`).
+#[cfg(feature = "_online")]
 pub(crate) mod receive;
 #[cfg(any())]
 pub(crate) mod receive_wasm;
@@ -162,9 +160,9 @@ pub(crate) use offline::WalletOffline;
 pub(crate) use offline::max_utxo_asset_allocations;
 #[cfg(feature = "_online")]
 pub(crate) use online::WalletOnline;
-// the receive driver is kept for the wasm port (see the module gate above)
-#[cfg(any())]
-pub(crate) use receive::ReceiveWallet;
+// the receive driver is native only until the browser transport is wired (see the module gate)
+#[cfg(feature = "_online")]
+pub(crate) use receive::{NativeReceiveTransport, ReceiveDriver, ReceiveWallet, drive_native};
 
 use super::*;
 

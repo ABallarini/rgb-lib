@@ -292,8 +292,8 @@ impl WalletOffline for MultisigWallet {
     }
 }
 
-// native-only and waiting for the ported receive driver (see wallet/mod.rs)
-#[cfg(any())]
+// the multisig wallet receives through the shared driver too, deciding on the hub first
+#[cfg(feature = "_online")]
 impl ReceiveWallet for MultisigWallet {
     // every cosigner downloads the consignment from the recipient proxy
     fn releases_received_transfer_data(&self) -> bool {

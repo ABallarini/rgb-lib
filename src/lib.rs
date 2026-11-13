@@ -402,6 +402,8 @@ use rgbinvoice::{Beneficiary, XChainNet};
 use rgbstd::SecretSeal;
 #[cfg(feature = "rgb_fs_store_migration")]
 use rgbstd::containers::legacy::ConsignmentV0;
+#[cfg(feature = "_online")]
+use rgbstd::contract::FilterIncludeAll;
 #[cfg(feature = "rgb_fs_store_migration")]
 use rgbstd::contract::{KnownState, OpWitness, OutputAssignment};
 #[cfg(feature = "_validation")]
@@ -475,12 +477,8 @@ use rgbstd::{
 };
 #[cfg(test)]
 use rgbstd::{Assign, VoidState, assignments::AssignVec};
-#[cfg(feature = "_online")]
-use rgbstd::{contract::FilterIncludeAll, validation::Validity};
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
-#[cfg(feature = "_online")]
-use schemata::{BfaWrapper, CfaWrapper, NiaWrapper, UdaWrapper};
 use schemata::{
     BridgedFungibleAsset, CollectibleFungibleAsset, InflatableFungibleAsset, NonInflatableAsset,
     UniqueDigitalAsset,
@@ -599,10 +597,9 @@ use crate::no_wallet::validation::electrum_config;
 use crate::no_wallet::validation::esplora_config;
 #[cfg(feature = "_online")]
 use crate::no_wallet::validation::{
-    ChainResolver, ClaimResolution, OffchainResolver, PendingClaims, RejectList, RejectListSource,
-    RemoteRejectListResolver, ResolveRejectList, check_reject_list, genesis_reject_list_source,
-    get_resolver, pending_claims, rejected_opouts, resolve_claims, resolve_witnesses,
-    unreachable_indexer_details, validate_consignment_internal, validate_deterministic,
+    ChainResolver, ClaimResolution, OffchainResolver, RejectList, RejectListSource,
+    RemoteRejectListResolver, ResolveRejectList, genesis_reject_list_source, get_resolver,
+    rejected_opouts, unreachable_indexer_details, validate_consignment_internal,
     validate_with_claims,
 };
 #[cfg(feature = "wallet")]

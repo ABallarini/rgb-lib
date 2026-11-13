@@ -130,8 +130,8 @@ impl WalletBackup for Wallet {
 
 impl WalletOffline for Wallet {}
 
-// the receive driver this marker implements is gated off until ported (see wallet/mod.rs)
-#[cfg(any())]
+// the shared receive driver runs on the singlesig wallet, with the defaults its trait provides
+#[cfg(feature = "_online")]
 impl ReceiveWallet for Wallet {}
 
 #[cfg(feature = "_online")]
