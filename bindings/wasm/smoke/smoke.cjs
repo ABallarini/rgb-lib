@@ -82,6 +82,7 @@ async function main() {
     uda: [],
     cfa: [],
     ifa: [],
+    bfa: [],
   });
   assert.deepEqual(JSON.parse(wallet.listTransfers()), []);
   assert.deepEqual(JSON.parse(wallet.listUnspents(false)), []);
@@ -115,6 +116,31 @@ async function main() {
   assert.throws(
     () => wallet.witnessReceive(null, '"Any"', BigInt(expiration), 1, "sometimes"),
     /unsupported encryption/,
+  );
+
+  // BFA: supported off mainnet, from local data only. Issuance needs colored UTXOs for the mint
+  // rights, so only the argument checks and the absence of a checked mint are exercised here.
+  assert.ok(walletData.supported_schemas.includes("Bfa"), "regtest must support BFA");
+  const BRIDGE = "0x0000000000000000000000000000000000000001";
+  assert.throws(
+    () => wallet.issueBfa("BFA", "Bridged asset", 0, 0, 1n, BRIDGE, null, false, null, false),
+    /Issuance request with zero mint rights/,
+  );
+  assert.throws(
+    () => wallet.issueBfa("BFA", "Bridged asset", 0, 1, 1n, "not-an-address", null, false, null, false),
+    /Invalid EVM contract address/,
+  );
+  // no checked mint pays this wallet, so the read is JSON null rather than an error
+  assert.equal(wallet.getReceivedMint("bcrt:wvout:unknown"), null);
+
+  // mainnet keeps the four schemas it always supported: BFA is refused and reckless schemas stay off
+  const mainnet = RgbLibWallet.create("smoke-mainnet", MNEMONIC, "mainnet");
+  const mainnetData = JSON.parse(mainnet.getWalletData());
+  assert.equal(mainnetData.supported_schemas.includes("Bfa"), false);
+  assert.equal(mainnetData.allow_reckless_schemas, false);
+  assert.throws(
+    () => mainnet.issueBfa("BFA", "Bridged asset", 0, 1, 1n, BRIDGE, null, false, null, false),
+    /Schema Bfa is not supported/,
   );
 
   // the snapshot carries the database and BDK state, never the mnemonic

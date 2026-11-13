@@ -64,7 +64,21 @@ use rgb_lib::wallet::rust_only::check_proxy_url_async as core_check_proxy_url_as
 const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
 
 /// Settings of a browser wallet, over the in-memory backend.
+///
+/// Only the schemas the network allows are listed: IFA is inflatable and BFA is bridged from an EVM
+/// chain, and neither is allowed on mainnet. `allow_reckless_schemas` stays off, so a mainnet wallet
+/// never silently supports a schema it has to refuse.
 fn wallet_data(network: BitcoinNetwork) -> WalletData {
+    let supported_schemas = match network {
+        BitcoinNetwork::Mainnet => vec![AssetSchema::Nia, AssetSchema::Uda, AssetSchema::Cfa],
+        _ => vec![
+            AssetSchema::Nia,
+            AssetSchema::Uda,
+            AssetSchema::Cfa,
+            AssetSchema::Ifa,
+            AssetSchema::Bfa,
+        ],
+    };
     WalletData {
         // no filesystem on the host: the wallet data lives in memory and travels in snapshots
         data_dir: String::new(),
@@ -72,12 +86,7 @@ fn wallet_data(network: BitcoinNetwork) -> WalletData {
         // the only `DatabaseType` value; an injected in-memory backend ignores it
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-        supported_schemas: vec![
-            AssetSchema::Nia,
-            AssetSchema::Uda,
-            AssetSchema::Cfa,
-            AssetSchema::Ifa,
-        ],
+        supported_schemas,
         allow_reckless_schemas: false,
     }
 }
@@ -682,6 +691,27 @@ impl RgbLibWallet {
         json_result("cannot serialize the wallet data", &wallet_data)
     }
 
+    /// Return the mint received on `recipient_id` as JSON, or `null` when the wallet checked none.
+    ///
+    /// It is what the sender has to lock on the external chain for the mint to complete, read from
+    /// the wallet files, so it survives a snapshot restore. A recipient ID of a transfer that was
+    /// not received, failed or is not a mint gives `null`.
+    #[wasm_bindgen(js_name = getReceivedMint)]
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<JsValue, JsValue> {
+        let received_mint = {
+            let wallet = self.borrow_wallet()?;
+            wallet
+                .get_received_mint(recipient_id)
+                .map_err(|e| failure("cannot get the received mint", e))?
+        };
+        match received_mint {
+            Some(received_mint) => {
+                json_result("cannot serialize the received mint", &received_mint).map(JsValue::from)
+            }
+            None => Ok(JsValue::NULL),
+        }
+    }
+
     /// Return a new receive address from the vanilla wallet.
     #[wasm_bindgen(js_name = getAddress)]
     pub fn get_address(&self) -> Result<String, JsValue> {
@@ -842,6 +872,49 @@ impl RgbLibWallet {
                 false,
                 None,
                 false,
+            )
+            .map(|asset| asset.asset_id)
+            .map_err(|e| failure("cannot issue the asset", e))
+    }
+
+    /// Issue a BFA asset and return its asset ID.
+    ///
+    /// BFA assets are bridged from an EVM chain, so they are supported on every network but
+    /// mainnet: a mainnet wallet refuses this with the core `Schema Bfa is not supported`, and the
+    /// binding never opts into reckless schemas. `mintRights` mint rights are issued, each on its
+    /// own colored UTXO, so the wallet must already hold them. `chainId` is a `bigint` in JS.
+    /// `contractAddress` is the `0x`-prefixed bridge contract address, committed in the asset
+    /// genesis; `rejectListAddress` optionally commits to a reject list on the same chain. Contract
+    /// checks against the EVM chain are not performed here: `skipContractChecks` only skips the
+    /// checks the wallet can make on its own data for `linkedFromContract`.
+    #[wasm_bindgen(js_name = issueBfa)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .issue_asset_bfa(
+                ticker,
+                name,
+                precision,
+                mint_rights,
+                chain_id,
+                contract_address,
+                reject_list_address,
+                link_right,
+                linked_from_contract,
+                skip_contract_checks,
             )
             .map(|asset| asset.asset_id)
             .map_err(|e| failure("cannot issue the asset", e))

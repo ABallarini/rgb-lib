@@ -14,7 +14,7 @@ The implementation is shared with the native wallet: the browser binding is a th
 | Offline reads: balances, metadata, assets, transfers, unspents, transactions, wallet data | Supported |
 | PSBT sign and finalize | Supported offline |
 | Delete eligible failed transfers | Supported offline |
-| Issue NIA, UDA, CFA and IFA assets | Supported, but the wallet must already hold a colored UTXO |
+| Issue NIA, UDA, CFA, IFA and BFA assets | Supported, but the wallet must already hold a colored UTXO; a mainnet wallet lists only NIA, UDA and CFA, so IFA and BFA are refused there |
 | Whole-wallet snapshot | Supported |
 | IndexedDB persistence (`load`, `flush`, `deleteSnapshot`) | Supported in browsers |
 | Watch-only wallets | Supported and exported (`createWatchOnly`, `restoreWatchOnly`) |
@@ -24,6 +24,7 @@ The implementation is shared with the native wallet: the browser binding is a th
 | Multisig hub paths | Not available on wasm |
 | BDK online access (sync with DB reconciliation, tip height, fee estimation) | Supported over the async Esplora transport (`sync`, `getTipHeight`, `getFeeEstimation`) |
 | RGB receive over a proxy (download, decrypt, validate, ACK/NACK, resume `WaitingSafeHeight`/`WaitingBroadcast`, `transfer.retrieved`) | Supported and exported (`receiveTransfer`, `syncOnline`) over the Fetch proxy client and the prefetched async chain resolver |
+| BFA mint receive | Not available on wasm: checking the mint lock needs an EVM RPC endpoint, so a mint consignment is refused and `getReceivedMint` returns `null` |
 | Proxy health check | Supported and exported (`checkProxyUrl`): read-only `server.info` over the Fetch proxy client |
 | RGB transfers, send, proxy invoice reservation, media upload, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
 | Out-of-band consignment import and ACK | Native-only: `provide_out_of_band_consignment` and `provide_out_of_band_ack` take `Online` and may broadcast |
@@ -32,7 +33,7 @@ The implementation is shared with the native wallet: the browser binding is a th
 | Legacy file migrations | Native only |
 | Web Worker | Not required; optional future seam only |
 
-The JS package exposes the singlesig offline subset, the read-only online reads and the proxy receive: create, restore, load, watch-only creation and restore, name, id, getAddress, blindReceive, witnessReceive, the balance, metadata, asset, transfer, unspent, transaction and wallet-data reads, signPsbt, finalizePsbt, deleteTransfers, NIA/UDA/CFA/IFA issuance, snapshot, flush and deleteSnapshot, sync, syncOnline, receiveTransfer, getTipHeight and getFeeEstimation, plus the free functions `generateKeys`, `restoreKeys` and `checkProxyUrl` and the hub-free `RgbLibMultisigWallet` class. Hub-coordinated multisig operations stay native-only.
+The JS package exposes the singlesig offline subset, the read-only online reads and the proxy receive: create, restore, load, watch-only creation and restore, name, id, getAddress, blindReceive, witnessReceive, the balance, metadata, asset, transfer, unspent, transaction and wallet-data reads, getReceivedMint, signPsbt, finalizePsbt, deleteTransfers, NIA/UDA/CFA/IFA/BFA issuance, snapshot, flush and deleteSnapshot, sync, syncOnline, receiveTransfer, getTipHeight and getFeeEstimation, plus the free functions `generateKeys`, `restoreKeys` and `checkProxyUrl` and the hub-free `RgbLibMultisigWallet` class. Hub-coordinated multisig operations stay native-only.
 
 The browser wallet is **online for its own BDK wallet and for proxy receives**: it can scan the chain, receive and ACK RGB consignments through a proxy, but it cannot create a proxy receive invoice, transfer RGB assets or send, which stay native-only.
 
@@ -107,7 +108,7 @@ wasm-pack build bindings/wasm --target nodejs --out-dir pkg-node
 node bindings/wasm/smoke/smoke.cjs
 ```
 
-The smoke covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`, `deleteTransfers`), the out-of-band `witnessReceive` invoice plus the `blindReceive` core error on a wallet without a colored UTXO, snapshot, restore, restore with a mismatched mnemonic, invalid-mnemonic error handling, `generateKeys`/`restoreKeys`, watch-only creation with address/snapshot/restore, the hub-free multisig subset (construction, id, descriptors, descriptor-derived address, snapshot, restore), invoice parsing, the invalid-consignment rejection, the offline rejection of an invalid `checkProxyUrl` endpoint and the re-entrant call guard (a second call while a `sync` is in flight throws `the wallet is busy with another operation`). Node has no IndexedDB, so `load()` and `flush()` are not exercised there.
+The smoke covers create, wallet id, receive address, the offline reads (`getBtcBalance`, `listAssets`, `listTransfers`, `listUnspents`, `listTransactions`, `getWalletData`, `getReceivedMint`, `deleteTransfers`), the out-of-band `witnessReceive` invoice plus the `blindReceive` core error on a wallet without a colored UTXO, the `issueBfa` argument checks (zero mint rights, an invalid contract address) and its mainnet refusal, snapshot, restore, restore with a mismatched mnemonic, invalid-mnemonic error handling, `generateKeys`/`restoreKeys`, watch-only creation with address/snapshot/restore, the hub-free multisig subset (construction, id, descriptors, descriptor-derived address, snapshot, restore), invoice parsing, the invalid-consignment rejection, the offline rejection of an invalid `checkProxyUrl` endpoint and the re-entrant call guard (a second call while a `sync` is in flight throws `the wallet is busy with another operation`). Node has no IndexedDB, so `load()` and `flush()` are not exercised there.
 
 ### Browser lifecycle test
 
@@ -179,7 +180,7 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | Item | Description |
 | ---- | ----------- |
 | `RgbLibWallet.create(name, mnemonic, network)` | Synchronous. New wallet with Taproot keys. |
-| `RgbLibWallet.restore(name, snapshot, mnemonic, network)` | Synchronous. Rebuild from `snapshot()` bytes. Settings are validated against the snapshot. |
+| `RgbLibWallet.restore(name, snapshot, mnemonic, network)` | Synchronous. Rebuild from `snapshot()` bytes. Settings are validated against the snapshot; the supported schemas are taken from it, so a snapshot written before BFA support still restores. |
 | `RgbLibWallet.load(name, mnemonic, network)` | Async. Read IndexedDB, restore, or create when no snapshot exists; adopts the stored writer and sequence. Await before use. |
 | `RgbLibWallet.createWatchOnly(name, keys, network)` | Synchronous. New watch-only wallet from the core `SinglesigKeys` JSON; `mnemonic` must be absent or `null`, a phrase is refused. |
 | `RgbLibWallet.restoreWatchOnly(name, snapshot, keys, network)` | Synchronous. Rebuild a watch-only wallet from `snapshot()` bytes and its public keys. |
@@ -204,7 +205,7 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | `getFeeEstimation(indexer_url, blocks)` | Async. Fee estimate in sat/vB for confirmation within `blocks` (`1..=1008`), interpolated like the native Esplora indexer; an endpoint without fee history throws `Cannot estimate fees`. |
 | `getAssetBalance(asset_id)` | JSON. Settled, future and spendable balance of an RGB asset. |
 | `getAssetMetadata(asset_id)` | JSON. Schema, supply, precision, ticker, details and token metadata. |
-| `listAssets()` | JSON. Assets grouped by schema in `nia`, `uda`, `cfa` and `ifa`. |
+| `listAssets()` | JSON. Assets grouped by schema in `nia`, `uda`, `cfa`, `ifa` and `bfa`. |
 | `listTransfers(asset_id?)` | JSON. RGB transfers, optionally filtered by asset ID. |
 | `listUnspents(settled_only)` | JSON. Unspents; `settled_only` excludes pending RGB allocations. |
 | `listTransactions()` | JSON. Known Bitcoin transactions, newest first. |
@@ -215,6 +216,8 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | `issueUda(ticker, name, details, precision)` | Issue a UDA asset; returns the asset ID. |
 | `issueCfa(name, details, precision, amounts)` | Issue a CFA asset; returns the asset ID. |
 | `issueIfa(ticker, name, precision, amounts, inflation_amounts, reject_list_url?)` | Issue an IFA asset; returns the asset ID. |
+| `issueBfa(ticker, name, precision, mint_rights, chain_id, contract_address, reject_list_address?, link_right, linked_from_contract?, skip_contract_checks)` | Issue a BFA asset; returns the asset ID. `mint_rights` mint rights are issued on their own colored UTXOs and `chain_id` is a `bigint`. The bridge contract (`0x`-prefixed) is committed in the genesis. Refused on mainnet: the binding never enables reckless schemas. |
+| `getReceivedMint(recipient_id)` | JSON. The core `ReceivedMint` of a checked mint (`opid`, `lock_id`, `amount`, `before_block`, `evm_chain_id`, `bridge_contract`), or `null` when no mint was checked for that recipient. |
 | `snapshot()` | Whole wallet state as bytes: database, BDK data and browser blobs; never the mnemonic. |
 | `flush()` | Async. Guarded write of `snapshot()` to IndexedDB: rejects a stale sequence, resolves once committed. |
 | `deleteSnapshot(name)` | Async. Delete the IndexedDB record for `name` and detach the instance; `name` must equal `name()`, a missing record is not an error, and every later `flush()` throws instead of recreating it. |
