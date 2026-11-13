@@ -159,6 +159,7 @@ pub(crate) struct MemoryTxn {
     on_commit: std::cell::RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
+#[allow(dead_code)]
 impl MemoryTxn {
     pub(crate) fn on_commit(&self, f: impl FnOnce() + 'static) {
         self.on_commit.borrow_mut().push(Box::new(f));
@@ -442,6 +443,7 @@ mod test {
             }
         }
 
+        #[allow(clippy::arc_with_non_send_sync)]
         let backend = Arc::new(MemoryBackend::new());
         let txid_kept = Txid::from_byte_array([1; 32]);
         let txid_dropped = Txid::from_byte_array([2; 32]);
@@ -719,6 +721,7 @@ mod test {
         use std::sync::Arc;
 
         // wallet transaction open
+        #[allow(clippy::arc_with_non_send_sync)]
         let backend = Arc::new(MemoryBackend::new());
         let txn = backend.begin_transaction().unwrap();
         assert!(backend.to_snapshot().is_err());

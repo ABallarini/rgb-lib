@@ -33,6 +33,32 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 #[cfg(feature = "esplora_async")]
 use super::receive_wasm::set_fail_after_cache;
 use super::*;
+
+/// Build a `Response` whose `url` is absolute. A constructed browser `Response` has an empty URL,
+/// which `reqwest`'s wasm client rejects when it parses the response URL.
+fn mock_response(body: &str, url: &str) -> JsValue {
+    let global = js_sys::global();
+    let response = js_sys::Reflect::get(&global, &JsValue::from_str("Response"))
+        .unwrap()
+        .dyn_into::<js_sys::Function>()
+        .unwrap();
+    let response =
+        js_sys::Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(body)))
+            .unwrap();
+    let descriptor = js_sys::Object::new();
+    js_sys::Reflect::set(
+        descriptor.as_ref(),
+        &JsValue::from_str("value"),
+        &JsValue::from_str(url),
+    )
+    .unwrap();
+    js_sys::Object::define_property(
+        response.unchecked_ref::<js_sys::Object>(),
+        &JsValue::from_str("url"),
+        &descriptor,
+    );
+    response
+}
 use crate::wallet::persistence::{
     InjectedFailure, delete_snapshot, load_snapshot, load_snapshot_record, new_writer_id,
     save_snapshot, save_snapshot_record, set_injected_failure,
@@ -1361,7 +1387,6 @@ async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
     let fetch = {
         let no_consignment = no_consignment.clone();
         let consignment_gets = consignment_gets.clone();
-        let global = global.clone();
         Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
             let method = Reflect::get(&request, &JsValue::from_str("method"))
                 .ok()
@@ -1382,12 +1407,7 @@ async fn cached_proxy_consignment_is_reused_when_the_proxy_deleted_it() {
                 "ack.post" => r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#.to_string(),
                 _ => r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string(),
             };
-            let response = Reflect::get(&global, &JsValue::from_str("Response")).unwrap();
-            let response = response.dyn_into::<js_sys::Function>().unwrap();
-            let response =
-                Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(&body)))
-                    .unwrap();
-            js_sys::Promise::resolve(&response)
+            js_sys::Promise::resolve(&mock_response(&body, PROXY_URL))
         })
     };
     Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
@@ -1490,7 +1510,6 @@ async fn proxy_release_waits_for_the_snapshot_and_is_retried() {
     let fetch = {
         let retrieved_calls = retrieved_calls.clone();
         let fail_retrieved = fail_retrieved.clone();
-        let global = global.clone();
         Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
             let method = Reflect::get(&request, &JsValue::from_str("method"))
                 .ok()
@@ -1510,12 +1529,7 @@ async fn proxy_release_waits_for_the_snapshot_and_is_retried() {
                 }
                 _ => r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string(),
             };
-            let response = Reflect::get(&global, &JsValue::from_str("Response")).unwrap();
-            let response = response.dyn_into::<js_sys::Function>().unwrap();
-            let response =
-                Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(&body)))
-                    .unwrap();
-            js_sys::Promise::resolve(&response)
+            js_sys::Promise::resolve(&mock_response(&body, PROXY_URL))
         })
     };
     Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
@@ -1657,7 +1671,6 @@ async fn second_sync_resumes_a_waiting_receive() {
     let acks = Rc::new(Cell::new(0));
     let fetch = {
         let acks = acks.clone();
-        let global = global.clone();
         Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
             let method = Reflect::get(&request, &JsValue::from_str("method"))
                 .ok()
@@ -1678,12 +1691,7 @@ async fn second_sync_resumes_a_waiting_receive() {
                 ),
                 _ => r#"{"jsonrpc":"2.0","id":null,"result":true}"#.to_string(),
             };
-            let response = Reflect::get(&global, &JsValue::from_str("Response")).unwrap();
-            let response = response.dyn_into::<js_sys::Function>().unwrap();
-            let response =
-                Reflect::construct(&response, &js_sys::Array::of1(&JsValue::from_str(&body)))
-                    .unwrap();
-            js_sys::Promise::resolve(&response)
+            js_sys::Promise::resolve(&mock_response(&body, PROXY_URL))
         })
     };
     Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();

@@ -698,6 +698,7 @@ pub(crate) fn check_psbt_parsable(psbt: &Psbt) -> Result<(), Error> {
 
 /// Write a fascia file atomically, so a crash mid-write cannot leave a torn one behind.
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+#[allow(dead_code)] // native tests and the legacy migration use it independently of the indexer
 pub(crate) fn write_fascia(path: &Path, fascia: &Fascia) -> Result<(), Error> {
     let bytes = fascia
         .to_strict_serialized::<FASCIA_MAX_LEN>()

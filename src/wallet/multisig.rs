@@ -1159,6 +1159,7 @@ impl MultisigWallet {
                 wallet_data,
                 logger,
                 _logger_guard,
+                #[allow(clippy::arc_with_non_send_sync)]
                 database: Arc::new(database),
                 wallet_dir,
                 files,

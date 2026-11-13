@@ -286,16 +286,19 @@ _validation = ["reqwest"]
 bitcoind = [
     "_online",
     "bitcoind_validation",
+    "sqlite",
     "bdk_bitcoind_rpc",
 ]
 electrum = [
     "_online",
     "electrum_validation",
+    "sqlite",
     "bdk_electrum",
 ]
 esplora = [
     "_online",
     "esplora_validation",
+    "sqlite",
     "bdk_esplora",
 ]
 # support for an indexer, only to validate consignments (not enabling the wallet functionality)
