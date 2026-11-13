@@ -32,7 +32,7 @@ pub(crate) mod evm_fetch;
 pub(crate) mod multisig_hub;
 #[cfg(feature = "_online")]
 pub(crate) mod proxy;
-#[cfg(feature = "_online")]
+#[cfg(any(feature = "_online", feature = "_validation"))]
 pub(crate) mod reject_list;
 
 // Protocol definitions and request builders shared by the native blocking proxy client and the
@@ -54,7 +54,7 @@ use super::*;
 const JSON: &str = "application/json";
 #[cfg(feature = "_online")]
 const OCTET_STREAM: &str = "application/octet-stream";
-#[cfg(feature = "_online")]
+#[cfg(any(feature = "_online", feature = "_validation"))]
 const CONNECT_TIMEOUT: u64 = 10;
 // the browser transport has no separable connect timeout, so it applies this one to the whole
 // request

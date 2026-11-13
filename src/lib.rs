@@ -1,5 +1,15 @@
 #![allow(clippy::too_many_arguments)]
 #![deny(missing_docs)]
+// Feature-isolation builds compile the shared wallet without a network/validation path; code
+// used by the online builds and by tests still resolves as private-but-unused there.
+#![cfg_attr(
+    all(
+        not(target_arch = "wasm32"),
+        not(feature = "_online"),
+        not(feature = "_validation")
+    ),
+    allow(dead_code, unused_imports)
+)]
 // The wasm32 test build leaves the native-only test modules out, so the helpers and the sea-orm
 // entities that only they use look dead to `-D warnings` (set by CI). The browser test is the only
 // consumer of this cfg, so the lints are allowed for it alone.
@@ -266,7 +276,7 @@ use std::cell::{Cell, RefCell};
 // `cmp::Ordering` is qualified, as the crate also imports `sync::atomic::Ordering`
 #[cfg(feature = "esplora")]
 use std::cmp;
-#[cfg(any(feature = "wallet", feature = "_validation"))]
+#[cfg(feature = "wallet")]
 use std::io::Read;
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use std::panic;

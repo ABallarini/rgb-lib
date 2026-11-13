@@ -1353,7 +1353,10 @@ mod tests {
             let err = Error::from(err);
             assert_matches!(err, Error::Indexer { details } if !details.is_empty());
         }
-        #[cfg(any(feature = "esplora", feature = "esplora_async"))]
+        #[cfg(any(
+            feature = "esplora",
+            all(target_arch = "wasm32", feature = "esplora_async")
+        ))]
         {
             let err = IndexerError::Esplora(EsploraError::InvalidResponse);
             let err = Error::from(err);
