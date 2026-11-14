@@ -36,7 +36,7 @@ serde_json = "1"
 # Pinned to the release that pairs with wasm-bindgen 0.2.129: the CI job installs the matching
 # `wasm-bindgen-test-runner`, the same version the root Cargo.lock resolves.
 [dev-dependencies]
-wasm-bindgen-test = "=0.3.79"
+wasm-bindgen-test = "=0.3.80"
 
 # Separate crate, like `c-ffi` and `uniffi`: its own lockfile and no membership in the rgb-lib
 # workspace, so the root lockfile and default build stay untouched.

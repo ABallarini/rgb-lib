@@ -83,7 +83,7 @@ jobs:
         uses: nanasess/setup-chromedriver@v2
       # the runner ships with wasm-bindgen-cli and must match the wasm-bindgen version in Cargo.lock
       - name: Install wasm-bindgen-test-runner
-        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
       - name: Run the wallet lifecycle test in headless Chrome
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
