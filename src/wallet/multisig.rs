@@ -1166,13 +1166,13 @@ impl MultisigWallet {
     /// Returns `Some` only for wallets constructed over the in-memory backend and `None` for
     /// SQLite wallets, which persist themselves. Writing the returned bytes somewhere durable
     /// (for example IndexedDB) is up to the host: on wasm32 use
-    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot) on an explicit
+    /// `persistence::save_snapshot` on an explicit
     /// flush boundary. Two overlapping writes for one wallet id are serialized by IndexedDB and the
     /// last committed write wins.
     ///
     /// Multisig wallets have no manifest: the snapshot is the raw database snapshot natively, and
     /// on wasm32 an envelope with the browser files section and no manifest;
-    /// [`MultisigWallet::from_snapshot`] does not validate the settings.
+    /// `MultisigWallet::from_snapshot` does not validate the settings.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -1280,7 +1280,7 @@ impl MultisigWallet {
 
     /// Return the address at `index` of the vanilla receive descriptor.
     ///
-    /// [`MultisigWallet::get_address`] asks the hub for the next index shared by every cosigner, so
+    /// `MultisigWallet::get_address` asks the hub for the next index shared by every cosigner, so
     /// it only exists natively. A hub-free wallet derives the same address deterministically from
     /// its descriptors; this neither reveals nor persists the index.
     pub fn peek_address(&self, index: u32) -> String {

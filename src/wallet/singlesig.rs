@@ -239,8 +239,8 @@ impl Wallet {
     /// the construction path for a host that has no filesystem or SQLite driver, such as a
     /// `wasm32` binding: the wallet owns the backend for its whole lifetime, and the host makes the
     /// state durable with [`Wallet::snapshot`] followed by
-    /// `wallet::persistence::save_snapshot`, or with [`Wallet::flush`] on `wasm32`.
-    /// [`Wallet::from_snapshot`] rebuilds the wallet from those bytes.
+    /// `wallet::persistence::save_snapshot`, or with `Wallet::flush` on `wasm32`.
+    /// `Wallet::from_snapshot` rebuilds the wallet from those bytes.
     ///
     /// `wallet_data` is validated the same way as in [`Wallet::new`]; the in-memory backend has no
     /// directory to create, so its `data_dir` is unused.
@@ -368,10 +368,10 @@ impl Wallet {
     /// SQLite wallets, which persist themselves. The bytes are an envelope carrying the wallet
     /// manifest (non-secret settings, never the mnemonic), the browser files when the adapter keeps
     /// them in memory, and then the memory-backend snapshot;
-    /// [`Wallet::from_snapshot`] validates the manifest against the supplied settings before
+    /// `Wallet::from_snapshot` validates the manifest against the supplied settings before
     /// rebuilding the wallet. Writing the returned bytes somewhere durable
     /// (for example IndexedDB) is up to the host: on wasm32 use
-    /// [`persistence::save_snapshot`](crate::wallet::persistence::save_snapshot) on an explicit
+    /// `persistence::save_snapshot` on an explicit
     /// flush boundary. Two overlapping writes for one wallet id are serialized by IndexedDB and the
     /// last committed write wins.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
@@ -462,7 +462,7 @@ impl Wallet {
     /// Constructors are synchronous, so the host restores the snapshot asynchronously with
     /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
     /// this. The host owns the durable flush with
-    /// [`Wallet::flush`](crate::wallet::Wallet::flush), passing the writer id and the sequence it
+    /// `Wallet::flush`(crate::wallet::Wallet::flush), passing the writer id and the sequence it
     /// last loaded or wrote.
     #[cfg(any(test, target_arch = "wasm32"))]
     pub fn from_snapshot(
