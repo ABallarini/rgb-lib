@@ -1550,6 +1550,7 @@ mod tests {
                     REFUSED_URL.to_string(),
                     REFUSED_URL.to_string(),
                     transfer_id,
+                    None,
                 )
                 .await
                 .unwrap_err(),
@@ -1563,7 +1564,12 @@ mod tests {
         // syncOnline scans first, so the refused indexer is the clean documented failure
         let err = message(
             wallet
-                .sync_online(REFUSED_URL.to_string(), REFUSED_URL.to_string(), Some(2))
+                .sync_online(
+                    REFUSED_URL.to_string(),
+                    REFUSED_URL.to_string(),
+                    None,
+                    Some(2),
+                )
                 .await
                 .unwrap_err(),
         );

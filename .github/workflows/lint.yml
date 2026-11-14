@@ -18,6 +18,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: clippy
+          # dependency future-incompatibility warnings are not our lint failures
+          build-warnings: warn
       - name: Lint with all features
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - uses: taiki-e/install-action@cargo-hack
