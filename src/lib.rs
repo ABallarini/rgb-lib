@@ -1,15 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 #![deny(missing_docs)]
-// Feature-isolation builds compile the shared wallet without a network/validation path; code
-// used by the online builds and by tests still resolves as private-but-unused there.
-#![cfg_attr(
-    all(
-        not(target_arch = "wasm32"),
-        not(feature = "_online"),
-        not(feature = "_validation")
-    ),
-    allow(dead_code, unused_imports)
-)]
+// Native feature-isolation builds intentionally compile partial wallet/backend surfaces.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 // The wasm32 test build leaves the native-only test modules out, so the helpers and the sea-orm
 // entities that only they use look dead to `-D warnings` (set by CI). The browser test is the only
 // consumer of this cfg, so the lints are allowed for it alone.
