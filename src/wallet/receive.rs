@@ -2143,11 +2143,6 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                 donation_tx: donation_signed_tx(&paying_bundle.tx),
             }
         } else {
-            receive_checks::update_bfa_known_circulating_supply(
-                txn,
-                asset_id.clone(),
-                bridge_circulating_supply,
-            )?;
             apply_received_consignment(
                 self,
                 chain,
@@ -2166,6 +2161,12 @@ impl<W: ReceiveWallet + ?Sized> ReceiveDriver for W {
                 updated_batch_transfer,
             )?
         };
+        // the asset exists by now (the apply phase imports an unknown contract)
+        receive_checks::update_bfa_known_circulating_supply(
+            txn,
+            asset_id.clone(),
+            bridge_circulating_supply,
+        )?;
         match outcome {
             ApplyOutcome::WaitingSafeHeight(batch_transfer) => Ok(Some(batch_transfer)),
             ApplyOutcome::ReadyForAck { donation_tx } => {

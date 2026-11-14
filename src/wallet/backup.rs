@@ -20,7 +20,8 @@ const MAX_BACKUP_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BACKUP_ENTRY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BACKUP_ENTRIES: usize = 10_000;
 const MAX_PUB_DATA_BYTES: u64 = 64 * 1024;
-const MAX_SCRYPT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+// Allow the library's own customization (default +1) while still bounding untrusted archives.
+const MAX_SCRYPT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 const BACKUP_VERSION: u8 = 1;
 const BACKUP_PUB_DATA_FILE: &str = "backup.pub_data";
 const BACKUP_ENCRYPTED_FILE: &str = "backup.enc";
