@@ -31,10 +31,10 @@
 #   bitcoind -regtest -fallbackfee=0.0002 -txindex -daemon
 #   bitcoin-cli -regtest -generate 101        # funds + height > 0
 #   # start an Esplora-compatible indexer for regtest, e.g. electrs or the Esplora image,
-#   # and point ESPLORA_URL at it (default http://127.0.0.1:3002)
+#   # and point ESPLORA_URL at it (default http://127.0.0.1:8094/regtest/api)
 #
 # Usage:
-#   export RGB_REGTEST_ESPLORA_URL=http://127.0.0.1:3002
+#   export RGB_REGTEST_ESPLORA_URL=http://127.0.0.1:8094/regtest/api   # optional, the default
 #   export RGB_REGTEST_PROXY_URL=http://127.0.0.1:3000   # optional
 #   export RGB_REGTEST_MNEMONIC="..."                    # optional: fund its first internal address
 #   export RGB_REGTEST_TRANSFER_ID="..."                 # optional: a pending proxy transfer for it
@@ -54,15 +54,9 @@ set -euo pipefail
 
 cd "$(dirname "${0}")/.."
 
-ESPLORA_URL="${RGB_REGTEST_ESPLORA_URL:-}"
+ESPLORA_URL="${RGB_REGTEST_ESPLORA_URL:-http://127.0.0.1:8094/regtest/api}"
 PROXY_URL="${RGB_REGTEST_PROXY_URL:-}"
 FUNDED_MNEMONIC="${RGB_REGTEST_MNEMONIC:-}"
-
-if [[ -z "${ESPLORA_URL}" ]]; then
-    echo "RGB_REGTEST_ESPLORA_URL is not set; nothing to smoke against." >&2
-    echo "See the header of this script for the regtest setup." >&2
-    exit 2
-fi
 
 for tool in wasm-bindgen-test-runner chromedriver; do
     command -v "${tool}" >/dev/null || {
@@ -94,5 +88,7 @@ export WASM_BINDGEN_TEST_TIMEOUT=300
 # The env vars are compile-time: touch the test so a baked-in URL from an old build cannot win.
 touch src/wallet/test_wasm_online.rs
 
+# The smoke tests are `#[ignore]`d so the default browser job skips them: `--ignored` is what
+# selects them here, and the `regtest_` filter keeps the rest of the suite out.
 cargo test --lib --target wasm32-unknown-unknown --no-default-features \
-    --features wallet,esplora_async -- regtest_
+    --features wallet,esplora_async -- --ignored regtest_
