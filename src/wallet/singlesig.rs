@@ -147,6 +147,24 @@ impl ReceiveWallet for Wallet {
 }
 
 #[cfg(feature = "_online")]
+impl WalletPrepare for Wallet {
+    fn resolve_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        self.reject_list_resolver().get_reject_list(source)
+    }
+
+    fn sync_colored_fast(&mut self, txn: &DbTxn) -> Result<(), Error> {
+        self.sync_wallet(
+            txn,
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FastSync,
+            },
+            true,
+        )
+    }
+}
+
+#[cfg(feature = "_online")]
 impl WalletOnline for Wallet {
     fn wallet_specific_consistency_checks(&mut self, txn: &DbTxn) -> Result<(), Error> {
         self.sync_wallet(

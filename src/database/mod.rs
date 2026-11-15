@@ -469,7 +469,10 @@ impl SqliteTxn {
         Ok(res.last_insert_id)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn set_reserved_txos(
         &self,
         reserved_txos: Vec<DbReservedTxoActMod>,
@@ -936,7 +939,10 @@ impl SqliteTxn {
     }
 
     // helper to retrieve transfers for an asset without scanning the full tables
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn get_transfers_for_asset(
         &self,
         batch_transfer_idx: i32,
@@ -1740,7 +1746,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn set_reserved_txos(
         &self,
         reserved_txos: Vec<DbReservedTxoActMod>,
@@ -2399,7 +2408,10 @@ impl DbTxn {
     }
 
     // helper to retrieve transfers for an asset without scanning the full tables
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn get_transfers_for_asset(
         &self,
         batch_transfer_idx: i32,

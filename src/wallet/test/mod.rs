@@ -418,7 +418,7 @@ pub fn mock_token_data(token_data: TokenData) -> TokenData {
 }
 
 #[cfg(feature = "_online")]
-pub fn mock_input_unspents<W: WalletOnline + ?Sized>(
+pub fn mock_input_unspents<W: WalletPrepare + ?Sized>(
     wallet: &W,
     unspents: &[LocalUnspent],
 ) -> Vec<LocalUnspent> {

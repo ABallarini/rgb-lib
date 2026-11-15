@@ -1058,7 +1058,10 @@ pub struct AssignmentsCollection {
     pub mint: u64,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl AssignmentsCollection {
     fn add_fungible(&mut self, amt: u64) {
         self.fungible = self
@@ -2254,7 +2257,10 @@ pub struct LocalRecipient {
     pub invoice_expiration: Option<i64>,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl LocalRecipient {
     /// The IDs of the invoice and of the transfer to it on the proxy, given the hex-encoded pubkey
     /// of the sender operation.
@@ -2342,7 +2348,10 @@ pub enum MainTransition {
     },
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl MainTransition {
     /// The type of the transition.
     pub(crate) fn transition_type(&self) -> TypeOfTransition {
@@ -2447,7 +2456,10 @@ pub struct InfoBatchTransfer {
     pub operation_secret_key: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl InfoBatchTransfer {
     /// Whether this is the data of an operation of the kind identified by the given main
     /// transition, i.e. whether every transfer of the batch has it
@@ -2462,7 +2474,10 @@ impl InfoBatchTransfer {
 
 pub type TransferEndData = (String, PathBuf, InfoBatchTransfer, Fascia);
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub struct BeginOperationData {
     pub psbt: Psbt,
     pub transfer_dir: PathBuf,
@@ -2471,13 +2486,19 @@ pub struct BeginOperationData {
     pub opid: Option<String>,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub enum PrepareRgbPsbtResult {
     Retry,
     Success(Box<BeginOperationData>),
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub enum PrepareTransferPsbtResult {
     Retry,
     Success(Box<BeginOperationData>),
@@ -2673,7 +2694,10 @@ pub struct TakenSlots {
 /// The UTXOs selected as inputs of an operation, with the number of allocations of each asset they
 /// hold, which spending them moves, as inputs of the bundle of the asset, and their total amount,
 /// as a transition can't spend more than `u64::MAX` of an asset (which BFA assets can exceed).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[derive(Clone, Debug, Default)]
 pub struct SelectedInputs {
     outpoints: HashSet<Outpoint>,
@@ -2681,7 +2705,10 @@ pub struct SelectedInputs {
     allocations: HashMap<String, (usize, u128)>,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl SelectedInputs {
     /// The number of allocations of each asset held by the given UTXO, with their total amount.
     fn held_allocations(unspent: &LocalUnspent) -> HashMap<&str, (usize, u128)> {
@@ -2742,7 +2769,10 @@ impl SelectedInputs {
 }
 
 /// The allocations of an asset a destination of the RGB change holds or is due to receive.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[derive(Clone, Debug, Default)]
 struct ChangeSlotAsset {
     /// their number, of any kind (inflation rights included)
@@ -2758,7 +2788,10 @@ struct ChangeSlotAsset {
 }
 
 /// A destination of the RGB change of an operation, with the slots left on it.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[derive(Clone, Debug)]
 struct ChangeSlot {
     destination: ChangeDestination,
@@ -2778,7 +2811,10 @@ struct ChangeSlot {
 /// bundle can spend, nor more than `u64::MAX` of an asset (which a transition can't spend), nor
 /// more than one mint right of an asset. Each allocation is placed on its own, so the change is
 /// spread over as many destinations as needed.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[derive(Clone, Debug, Default)]
 pub struct ChangeSlots {
     slots: Vec<ChangeSlot>,
@@ -2787,7 +2823,10 @@ pub struct ChangeSlots {
     mint_right_invoices: HashSet<String>,
 }
 
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 impl ChangeSlots {
     /// The destinations of the change of an operation, with or without a new Bitcoin output for
     /// it, then the given pre-existing UTXOs, in order of preference, each allowed to hold

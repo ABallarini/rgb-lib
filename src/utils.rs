@@ -656,7 +656,11 @@ pub(crate) fn fascia_from_bytes(bytes: Vec<u8>, source: &str) -> Result<Fascia, 
 }
 
 /// Encode a fascia to its strict-encoded bytes, as written by [`write_fascia`].
-#[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+#[cfg(any(
+    feature = "_online",
+    feature = "rgb_fs_store_migration",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) fn fascia_to_bytes(fascia: &Fascia) -> Result<Vec<u8>, Error> {
     Ok(fascia
         .to_strict_serialized::<FASCIA_MAX_LEN>()
@@ -735,7 +739,10 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, Error> {
 ///
 /// Note this is the `bitcoin` hash display order, not the plain hex of [`hash_bytes_hex`]: the
 /// values are exchanged with counterparties, so the two must not be confused.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) fn hash_file_bytes(bytes: &[u8]) -> String {
     let mut engine = sha256::HashEngine::default();
     engine.input(bytes);
@@ -896,7 +903,10 @@ impl<'txn> RgbStock<'txn> {
 
     /// The assignments on the given outpoints of every contract assigning state there, in a
     /// single store query
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn assignments_by_contract(
         &self,
         outpoints: impl IntoIterator<Item = impl Into<OutPoint>>,
@@ -953,7 +963,10 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn contract_schema(&self, contract_id: ContractId) -> Result<Schema, Error> {
         self.stock
             .as_store()
@@ -1029,7 +1042,10 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn transfer_from_fascia_with_dag(
         &self,
         contract_id: ContractId,
@@ -1053,7 +1069,10 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn transition_builder_raw(
         &self,
         contract_id: ContractId,

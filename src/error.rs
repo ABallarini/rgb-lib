@@ -224,7 +224,10 @@ pub enum Error {
     InsufficientAllocationSlots,
 
     /// There are not enough assignments of the requested asset to fulfill the request
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     #[error("Insufficient total assignments for asset: {asset_id}")]
     InsufficientAssignments {
         /// Asset ID

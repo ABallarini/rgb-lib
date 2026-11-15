@@ -345,13 +345,32 @@ impl ReceiveWallet for MultisigWallet {
 }
 
 #[cfg(feature = "_online")]
-impl WalletOnline for MultisigWallet {
-    fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error> {
-        Ok(())
+impl WalletPrepare for MultisigWallet {
+    fn resolve_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        self.reject_list_resolver().get_reject_list(source)
+    }
+
+    fn sync_colored_fast(&mut self, txn: &DbTxn) -> Result<(), Error> {
+        // the multisig sync reveals the addresses the hub derived
+        self.sync_wallet(
+            txn,
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FastSync,
+            },
+            true,
+        )
     }
 
     fn supports_out_of_band_exchange(&self) -> bool {
         false
+    }
+}
+
+#[cfg(feature = "_online")]
+impl WalletOnline for MultisigWallet {
+    fn wallet_specific_consistency_checks(&mut self, _txn: &DbTxn) -> Result<(), Error> {
+        Ok(())
     }
 }
 

@@ -2,6 +2,12 @@
 #![deny(missing_docs)]
 // Native feature-isolation builds intentionally compile partial wallet/backend surfaces.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
+// The browser wiring of the shared operation preparation lands next: until then the wasm32 build,
+// which CI checks with `-D warnings`, sees what only it uses as dead code.
+#![cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(dead_code)
+)]
 // The wasm32 test build leaves the native-only test modules out, so the helpers and the sea-orm
 // entities that only they use look dead to `-D warnings` (set by CI). The browser test is the only
 // consumer of this cfg, so the lints are allowed for it alone.
@@ -325,6 +331,8 @@ use bdk_esplora::esplora_client::Error as EsploraError;
 use bdk_wallet::Update;
 #[cfg(all(test, feature = "wallet"))]
 use bdk_wallet::bitcoin::{TxIn, absolute::LockTime, transaction::Version};
+#[cfg(feature = "_online")]
+use bdk_wallet::chain::DescriptorExt;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 #[cfg(feature = "bdk_file_store_migration")]
@@ -356,13 +364,15 @@ use bdk_wallet::{
     chain::{BlockId, ConfirmationBlockTime, DescriptorId},
     miniscript::{Descriptor, DescriptorPublicKey},
 };
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 use bdk_wallet::{
     bitcoin::{
         blockdata::fee_rate::FeeRate,
         hashes::{HashEngine, sha256},
     },
-    chain::DescriptorExt,
     coin_selection::InsufficientFunds,
 };
 #[cfg(feature = "wallet")]
@@ -543,7 +553,11 @@ use slog_term::{FullFormat, PlainDecorator};
 use strict_encoding::FieldName;
 #[cfg(all(test, feature = "wallet"))]
 use strict_encoding::StrictDumb;
-#[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+#[cfg(any(
+    feature = "_online",
+    feature = "rgb_fs_store_migration",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 use strict_encoding::StrictSerialize;
 use strict_encoding::{DeserializeError, StrictDeserialize};
 #[cfg(feature = "rgb_fs_store_migration")]
@@ -661,21 +675,27 @@ use crate::{
             prepare_invoice_auth_message, transfer_retrieved_message,
         },
     },
-    database::entities::{
-        reserved_txo::ActiveModel as DbReservedTxoActMod,
-        wallet_transaction::ActiveModel as DbWalletTransactionActMod,
-    },
+    database::entities::wallet_transaction::ActiveModel as DbWalletTransactionActMod,
     encryption::{
         decode_hash_hex, decrypt_stream, derive_shared, ed25519_from_seed, encrypt_blob,
-        encrypt_to_tempfile, invoice_id, sign_ed25519, transfer_id, verify_ed25519,
-        verifying_key_from_bytes,
+        encrypt_to_tempfile, sign_ed25519, verify_ed25519, verifying_key_from_bytes,
     },
     no_wallet::{BitcoindAuth, IndexerConfig},
     utils::{
-        check_proxy, detect_indexer, get_indexer_and_resolver, hash_file, hash_file_bytes,
-        proxy_max_media, proxy_retention_grace, script_buf_from_recipient_id,
+        check_proxy, detect_indexer, get_indexer_and_resolver, hash_file, proxy_max_media,
+        proxy_retention_grace, script_buf_from_recipient_id,
     },
-    wallet::{AssignmentsCollection, Indexer, multisig::RespondToOperation},
+    wallet::{Indexer, multisig::RespondToOperation},
+};
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use crate::{
+    database::entities::reserved_txo::ActiveModel as DbReservedTxoActMod,
+    encryption::{invoice_id, transfer_id},
+    utils::hash_file_bytes,
+    wallet::AssignmentsCollection,
 };
 #[cfg(feature = "wallet")]
 use crate::{

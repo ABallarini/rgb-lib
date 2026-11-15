@@ -19,6 +19,12 @@ pub(crate) mod offline;
 pub(crate) mod online;
 #[cfg(target_arch = "wasm32")]
 pub mod persistence;
+// the steps preparing an outgoing operation: shared by the native online wallet and the browser
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) mod prepare;
 // wallet-free checks shared by the native and browser receive drivers
 #[cfg(any(
     feature = "_online",
@@ -96,6 +102,15 @@ pub use objects::{
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
 pub use online::{RgbWalletOpsOnline, check_indexer_url};
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(unused_imports)
+)] // used by the browser operations once wired
+pub(crate) use prepare::WalletPrepare;
 pub use singlesig::{SinglesigKeys, Wallet};
 
 pub(crate) use backup::WalletBackup;
@@ -142,12 +157,20 @@ pub(crate) use objects::ReceiveMode;
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
 pub(crate) use objects::ReceivedConsignmentMeta;
+// types shared with the browser preparation of an outgoing operation
 #[cfg(feature = "_online")]
 pub(crate) use objects::{
-    AssetInfo, AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots,
-    CleanAckOutcome, ExtraAllocations, FailTransfersOutcome, LocalRecipient, LocalRecipientData,
-    LocalWitnessData, MainTransition, OnlineData, PrepareRgbPsbtResult, PrepareTransferPsbtResult,
-    RefreshResultTrait, SelectedInputs, SentMint, TryFailBatchTransferOutcome,
+    AssetInfo, CleanAckOutcome, FailTransfersOutcome, OnlineData, RefreshResultTrait, SentMint,
+    TryFailBatchTransferOutcome,
+};
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::{
+    AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots, ExtraAllocations,
+    LocalRecipient, LocalRecipientData, LocalWitnessData, MainTransition, PrepareRgbPsbtResult,
+    PrepareTransferPsbtResult, SelectedInputs,
 };
 pub(crate) use objects::{
     AssetTransferColoringInfo, InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails,
@@ -164,7 +187,10 @@ pub(crate) use objects::{
     allow(unused_imports)
 )] // used by the browser receive loop once wired
 pub(crate) use objects::{ConsignmentPayment, PaymentSeal, TakenSlots};
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use offline::TRANSFER_DATA_FILE;
 #[cfg(feature = "rgb_fs_store_migration")]
 pub(crate) use offline::TRANSFERS_DIR;

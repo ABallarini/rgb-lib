@@ -532,7 +532,10 @@ impl Assignment {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn add_to_assignments(&self, assignments: &mut AssignmentsCollection) {
         match self {
             Self::Fungible(amt) => {
@@ -580,7 +583,10 @@ impl Assignment {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn inflation_amount(&self) -> u64 {
         if let Self::InflationRight(amt) = self {
             *amt
@@ -723,7 +729,10 @@ pub enum TypeOfTransition {
 }
 
 impl TypeOfTransition {
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Inflate => "inflate",

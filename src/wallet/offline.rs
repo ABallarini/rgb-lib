@@ -149,7 +149,11 @@ pub trait WalletOffline: WalletBackup {
     }
 
     /// Write a fascia through the wallet adapter, atomically.
-    #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+    #[cfg(any(
+        feature = "_online",
+        feature = "rgb_fs_store_migration",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     fn write_fascia_at(&self, key: &WalletPath, fascia: &Fascia) -> Result<(), Error> {
         let bytes = crate::utils::fascia_to_bytes(fascia).map_err(|e| Error::Internal {
             details: match e {
