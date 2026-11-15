@@ -201,8 +201,8 @@ async fn bfa_claim_prefetch_and_reject_list_over_the_browser_transport() {
             "eth_blockNumber",
             "eth_getBlockByNumber:finalized",
             "eth_call:0x1f7b6d32:0xf",
-            "eth_call:0x1f7b6d32:latest",
-            "eth_call:0x17b937e6:latest"
+            "eth_call:0x1f7b6d32:0x13",
+            "eth_call:0x17b937e6:0x13"
         ]
     );
 
