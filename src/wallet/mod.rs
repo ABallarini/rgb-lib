@@ -51,6 +51,10 @@ pub(crate) mod test_wasm;
 // Esplora. Compiled only with `esplora_async`; returns early when no regtest URL is baked in.
 #[cfg(all(test, target_arch = "wasm32", feature = "esplora_async"))]
 pub(crate) mod test_wasm_online;
+// Opt-in browser test for the BFA EVM claim prefetch and reject list transport against the local
+// mock JSON-RPC node in `scripts/mock_evm_rpc.mjs`. Returns early when no mock URL is baked in.
+#[cfg(all(test, target_arch = "wasm32", feature = "esplora_async"))]
+pub(crate) mod test_wasm_bfa;
 
 #[cfg(feature = "wallet")]
 pub use crate::api::evm_claims::{EvmReceiveConfig, EvmReceiveOptions};
