@@ -124,12 +124,12 @@ function ethCall(call) {
             const amount = BigInt(`0x${body.slice(64, 128)}`).toString();
             const block = LOCK_BLOCKS.get(amount);
             // the record is the block plus one, zero meaning there's none
-            return word(block === undefined ? 0n : block + 1n);
+            return `0x${word(block === undefined ? 0n : block + 1n)}`;
         }
         case CIRCULATING_SUPPLY_SELECTOR:
-            return word(BigInt(CIRCULATING_SUPPLY));
+            return `0x${word(BigInt(CIRCULATING_SUPPLY))}`;
         case REJECT_LIST_LENGTH_SELECTOR:
-            return word(BigInt(REJECT_LIST_ENTRIES.length));
+            return `0x${word(BigInt(REJECT_LIST_ENTRIES.length))}`;
         case REJECT_LIST_ENTRIES_SELECTOR: {
             const words = [word(32n), word(BigInt(REJECT_LIST_ENTRIES.length))];
             for (const entry of REJECT_LIST_ENTRIES) {
