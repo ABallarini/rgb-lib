@@ -1975,3 +1975,233 @@ async fn burn_begin_and_end_run_over_the_browser_transport() {
     assert!(input.spent, "the burn input must be marked spent");
     txn.commit().unwrap();
 }
+
+// A browser send runs from begin to end over a fake proxy and a fake Esplora node. The proxy
+// answers `server.info` and `invoice.check`, refuses the first `consignment.post` with `-114` (so
+// the shared PoW retry runs), then accepts it. The node refuses the first broadcast: the end must
+// roll back and leave the transfer initiated, and a second end must succeed.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let savedFetch = null;
+
+export function installMockSendNetwork(indexerUrl) {
+    const g = globalThis;
+    if (savedFetch === null) savedFetch = g.fetch;
+    g.__sendMock = {
+        indexer: indexerUrl,
+        consignments: 0,
+        broadcasts: 0,
+        failBroadcast: true,
+    };
+    g.fetch = async function (request) {
+        const url = request.url || '';
+        const state = g.__sendMock;
+        const respond = (body, status) => {
+            const response = new Response(body, { status: status || 200 });
+            Object.defineProperty(response, 'url', { value: url });
+            return response;
+        };
+        if (url.startsWith(state.indexer)) {
+            if (url.endsWith('/tx')) {
+                state.broadcasts += 1;
+                if (state.failBroadcast) return respond('broadcast refused', 500);
+                return respond('', 200);
+            }
+            if (url.includes('/tx/') && url.endsWith('/status')) {
+                return respond(JSON.stringify({
+                    confirmed: false, block_height: null, block_hash: null, block_time: null,
+                }));
+            }
+            if (url.includes('/tx/')) return respond('', 404);
+            return respond('', 200);
+        }
+        let text = '';
+        try { text = await request.clone().text(); } catch (e) {}
+        let method = '';
+        const jsonMethod = text.match(/"method"\s*:\s*"([^"]+)"/);
+        if (jsonMethod) method = jsonMethod[1];
+        if (method === 'server.info') {
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: {
+                protocol_version: '1.0', version: 'mock', uptime: 0,
+            }}));
+        }
+        if (method === 'invoice.check') {
+            const match = text.match(/"invoice_ids"\s*:\s*\["([^"]+)"/);
+            const result = {};
+            result[match ? match[1] : ''] = { status: 'available', pow_difficulty: '0' };
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result }));
+        }
+        // the only multipart request of a donation is consignment.post
+        state.consignments += 1;
+        if (state.consignments === 1) {
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, error: {
+                code: -114, message: 'proof of work', data: { pow_difficulty: '1' },
+            }}));
+        }
+        return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: true }));
+    };
+}
+
+export function setMockBroadcastFailure(fail) {
+    globalThis.__sendMock.failBroadcast = fail;
+}
+
+export function mockConsignmentPosts() {
+    return globalThis.__sendMock.consignments;
+}
+
+export function mockBroadcastPosts() {
+    return globalThis.__sendMock.broadcasts;
+}
+
+export function restoreMockSendNetwork() {
+    if (savedFetch !== null) {
+        globalThis.fetch = savedFetch;
+        savedFetch = null;
+    }
+    delete globalThis.__sendMock;
+}
+"#)]
+extern "C" {
+    fn installMockSendNetwork(indexer_url: &str);
+    fn setMockBroadcastFailure(fail: bool);
+    fn mockConsignmentPosts() -> u32;
+    fn mockBroadcastPosts() -> u32;
+    fn restoreMockSendNetwork();
+}
+
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn send_begin_and_end_run_over_the_browser_transport() {
+    use bdk_wallet::bitcoin::{Amount, TxOut, absolute, transaction};
+
+    const INDEXER_URL: &str = "http://127.0.0.1:3003";
+    const PROXY_URL: &str = "rpc://proxy.send.test";
+
+    let (mut wallet, _keys) = memory_wallet();
+    // one real BDK UTXO the PSBT can spend, registered in the wallet DB the way a scan does
+    let address = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 0)
+        .address;
+    let funding = BdkTransaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    wallet
+        .bdk_wallet_mut()
+        .apply_unconfirmed_txs([(funding, 0)]);
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        wallet.sync_db_txos_from_bdk(&txn, false).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let asset = wallet
+        .issue_asset_ifa(
+            "SEND".to_string(),
+            "Send".to_string(),
+            0,
+            vec![100],
+            vec![],
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("offline issuance");
+
+    // a witness invoice made out of band, then turned into a proxy recipient by adding an endpoint
+    let (mut recipient_wallet, _) = memory_wallet();
+    let expiration = now().unix_timestamp() as u64 + 3600;
+    let receive = recipient_wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Fungible(100),
+            expiration,
+            vec![],
+            1,
+            None,
+        )
+        .expect("recipient invoice");
+    let recipient = Recipient {
+        recipient_id: receive.recipient_id,
+        witness_data: Some(WitnessData {
+            amount_sat: 1_000,
+            blinding: None,
+        }),
+        assignment: Assignment::Fungible(100),
+        transport_endpoints: vec![PROXY_URL.to_string()],
+        public_key: Some(receive.public_key),
+        encryption: Encryption::Unsupported,
+        expiration_timestamp: Some(expiration),
+    };
+    let recipient_map = HashMap::from([(asset.asset_id.clone(), vec![recipient])]);
+
+    installMockSendNetwork(INDEXER_URL);
+    let begin = wallet
+        .send_begin_async(
+            recipient_map,
+            true,
+            2,
+            1,
+            now().unix_timestamp() as u64 + 1800,
+            Some("rpc://sender.send.test".to_string()),
+            INDEXER_URL,
+            None,
+        )
+        .await
+        .expect("send begin");
+    let signed = wallet
+        .sign_psbt(begin.psbt.clone(), None)
+        .expect("signing the send PSBT");
+    // the begin saved the operation, so its TXID is the one the end must broadcast and record
+    let txid = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let txid = txn
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|batch_transfer| !batch_transfer.incoming)
+            .and_then(|batch_transfer| batch_transfer.txid.clone())
+            .expect("the send begin must save its operation");
+        txn.commit().unwrap();
+        txid
+    };
+
+    // the first end has its consignment accepted (after the -114 retry) but its broadcast refused
+    let failed = wallet.send_end_async(INDEXER_URL, &signed).await;
+    assert!(
+        matches!(failed, Err(Error::FailedBroadcast { .. })),
+        "the refused broadcast must fail the end, got {failed:?}"
+    );
+    {
+        // the end's writes are rolled back: the begin's transfer is still initiated
+        let txn = wallet.database().begin_transaction().unwrap();
+        let batch = &txn.get_batch_transfers_by_txid(&txid).unwrap()[0];
+        assert_eq!(batch.status, TransferStatus::Initiated);
+        txn.commit().unwrap();
+    }
+    assert_eq!(mockConsignmentPosts(), 2, "one -114 retry then a success");
+    assert_eq!(mockBroadcastPosts(), 1);
+
+    setMockBroadcastFailure(false);
+    let res = wallet.send_end_async(INDEXER_URL, &signed).await;
+    let consignment_posts = mockConsignmentPosts();
+    let broadcast_posts = mockBroadcastPosts();
+    restoreMockSendNetwork();
+    let res = res.expect("the second end must succeed");
+    assert_eq!(res.txid, txid);
+    assert_eq!(consignment_posts, 3, "the retry posts the consignment once");
+    assert_eq!(broadcast_posts, 2);
+
+    let txn = wallet.database().begin_transaction().unwrap();
+    let batch = &txn.get_batch_transfers_by_txid(&txid).unwrap()[0];
+    assert_eq!(batch.status, TransferStatus::WaitingConfirmations);
+    txn.commit().unwrap();
+}

@@ -17,7 +17,7 @@ use crate::no_wallet::validation::{RejectList, RejectListSource, genesis_reject_
 /// one short read-only transaction reads the source, then the list is fetched with the wallet
 /// closed. A list kept by an EVM contract needs the configuration of the chain it lives on, which
 /// a browser caller supplies as it does for a receive.
-async fn prefetch_asset_reject_lists(
+pub(super) async fn prefetch_asset_reject_lists(
     wallet: &Wallet,
     asset_id: &str,
     evm: Option<&EvmReceiveOptions>,

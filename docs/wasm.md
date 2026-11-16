@@ -25,17 +25,19 @@ The implementation is shared with the native wallet: the browser binding is a th
 | BDK online access (sync with DB reconciliation, tip height, fee estimation) | Supported over the async Esplora transport (`sync`, `getTipHeight`, `getFeeEstimation`) |
 | RGB receive over a proxy (download, decrypt, validate, ACK/NACK, resume `WaitingSafeHeight`/`WaitingBroadcast`, `transfer.retrieved`) | Supported and exported (`receiveTransfer`, `syncOnline`) over the Fetch proxy client and the prefetched async chain resolver |
 | BFA mint receive | Supported when the caller supplies an EVM endpoint (`receiveTransfer`/`syncOnline` `evm` argument): claims, mint locks and EVM reject lists are prefetched before the transaction, and `getReceivedMint` reports the checked mint (`MintLockExpired`, `MintLockNotFound`, `NoEvmRpcUrl` and chain mismatches are typed errors) |
+| RGB send over a proxy (begin, sign, end, PoW retries, donation broadcast, consignment/media upload) | Supported and exported (`sendBegin`, `sendEnd`) over the Fetch proxy client and the async Esplora broadcast, using the shared send authoring |
+| RGB burn and link (begin, sign, end, PoW retries, broadcast) | Supported and exported (`burnBegin`/`burnEnd`, `linkBegin`/`linkEnd`) over the same shared authoring |
 | Proxy health check | Supported and exported (`checkProxyUrl`): read-only `server.info` over the Fetch proxy client |
-| RGB transfers, send, proxy invoice reservation, media upload, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
+| Proxy invoice reservation, mint, inflate, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
 | Out-of-band consignment import and ACK | Native-only: `provide_out_of_band_consignment` and `provide_out_of_band_ack` take `Online` and may broadcast |
 | Async Esplora and Fetch transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive; the Fetch EVM client serves claim, mint-lock and reject-list prefetch for BFA receive |
 | Backups | Encrypted byte backup/restore supported; path-based filesystem backups native only |
 | Legacy file migrations | Native only |
 | Web Worker | Not required; optional future seam only |
 
-The JS package exposes the singlesig offline subset, the read-only online reads and the proxy receive: create, restore, load, watch-only creation and restore, name, id, getAddress, blindReceive, witnessReceive, the balance, metadata, asset, transfer, unspent, transaction and wallet-data reads, getReceivedMint, signPsbt, finalizePsbt, deleteTransfers, NIA/UDA/CFA/IFA/BFA issuance, snapshot, flush and deleteSnapshot, sync, syncOnline, receiveTransfer, getTipHeight and getFeeEstimation, plus the free functions `generateKeys`, `restoreKeys` and `checkProxyUrl` and the hub-free `RgbLibMultisigWallet` class. Hub-coordinated multisig operations stay native-only.
+The JS package exposes the singlesig subset over the shared wallet: create, restore, load, watch-only creation and restore, name, id, getAddress, blindReceive, witnessReceive, the balance, metadata, asset, transfer, unspent, transaction and wallet-data reads, getReceivedMint, signPsbt, finalizePsbt, burnBegin/burnEnd, linkBegin/linkEnd, sendBegin/sendEnd, deleteTransfers, NIA/UDA/CFA/IFA/BFA issuance, snapshot, flush and deleteSnapshot, sync, syncOnline, receiveTransfer, getTipHeight and getFeeEstimation, plus the free functions `generateKeys`, `restoreKeys` and `checkProxyUrl` and the hub-free `RgbLibMultisigWallet` class. Hub-coordinated multisig operations stay native-only.
 
-The browser wallet is **online for its own BDK wallet and for proxy receives**: it can scan the chain, receive and ACK RGB consignments through a proxy, but it cannot create a proxy receive invoice, transfer RGB assets or send, which stay native-only.
+The browser wallet is **online for its own BDK wallet, for proxy receives and for outgoing sends, burns and links**: it can scan the chain, receive and ACK RGB consignments through a proxy, and author, post and broadcast an outgoing transfer with the shared wallet logic. It still cannot create a proxy receive invoice, mint or inflate.
 
 ## Build
 
@@ -368,7 +370,7 @@ The root crate with `esplora_async` compiles the browser transport, resolver and
 | `ProxyFetchClient` | RGB proxy JSON-RPC over `fetch`, including in-memory multipart uploads |
 | `EvmFetchClient` | EVM JSON-RPC over `fetch`: chain ID, finalized block, `eth_call` and reject-list reads, over the shared `evm_abi` payloads and decoders |
 
-`EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transaction runs the native sync bookkeeping: pending witness state is reconciled and colored TXOs new to the DB are registered. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of a released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`; the remaining proxy writes (invoice reservation, media upload, send) stay in the native-only flow.
+`EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transaction runs the native sync bookkeeping: pending witness state is reconciled and colored TXOs new to the DB are registered. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of an outgoing or released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`, `sendBegin`/`sendEnd`, `burnBegin`/`burnEnd` and `linkBegin`/`linkEnd`; the remaining proxy writes (invoice reservation, mint and inflate) stay in the native-only flow.
 
 `EvmFetchClient` is built from the same `evm_abi` selectors, calldata builders and result decoders as the native
 blocking `EvmClient`, so the two transports cannot drift. It applies a 15 s deadline per request, caps a response body
@@ -389,8 +391,7 @@ finalized yet leaves the consignment waiting (`PendingMintLocks`, no colorings),
 and `before_block`. The ACK/NACK/retrieval ordering, the single-allocation rule and the per-UTXO slot limits are the
 native ones, because the same driver runs both paths.
 
-Still deferred on wasm: `mintBegin`/`mintEnd`, send, link and burn, which need the native `_online` flow; the browser can
-currently receive and check a mint posted by a counterparty, not create one.
+The browser can also send, burn and link RGB assets: `sendBegin`/`sendEnd`, `burnBegin`/`burnEnd` and `linkBegin`/`linkEnd` run the shared authoring over the Fetch proxy client, with the proof-of-work retry and the async Esplora broadcast. A send expects the caller to pass the indexer URL to both calls and the EVM configuration for a BFA reject list; proxy-level authentication keys cannot be configured in the browser. Still deferred on wasm: `mintBegin`/`mintEnd`, inflate and proxy invoice creation, which need the native `_online` flow.
 
 The bindings crate enables `wallet,esplora_async`, so the generated package contains the transport and the three read-only methods. No native blocking transport is in the wasm graph: `bitcoind`, `electrum` and `esplora` are native-only, and the graph check rejects their crates.
 
@@ -410,13 +411,14 @@ Remaining caveat: the retry backoff sleeper still needs `window.setTimeout`, so 
 
 ### What is not assembled
 
-The remaining RGB online flow (`RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, proxy invoice reservation, transfers, send, media upload, hub coordination) is gated by the native-only `_online` feature. `esplora_async` deliberately does not enable it: the browser receive path is an additive async method in `wasm_online`/`receive_wasm`, not the native online trait.
+The remaining RGB online flow (`RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, proxy invoice reservation, mint, inflate, hub coordination) is gated by the native-only `_online` feature. `esplora_async` deliberately does not enable it: the browser receive, send, burn and link paths are additive async methods in `wasm_online`/`receive_wasm`/`send_wasm`/`transfer_wasm`, over the shared authoring, not the native online trait.
 
 For a consumer this means:
 
 - a browser wallet can be created, restored, persisted, derive addresses, read its snapshot and **sync its BDK wallet** against Esplora, so new funding of its own addresses becomes visible in its BTC balance;
 - it can **receive and ACK a pending proxy consignment** whose invoice was created for its keys, coloring the UTXO and importing an unknown contract;
-- sending, proxy invoice creation and media upload still need the native flow, so the browser cannot start a transfer or reserve an invoice;
+- it can **send, burn and link RGB assets** to recipients whose endpoints it knows, signing locally and ending over the async transports;
+- proxy invoice creation, mint and inflate still need the native flow;
 - `syncOnline` resumes a receive left in `WaitingSafeHeight` or `WaitingBroadcast`, and a terminal (`Settled`/`Failed`) one is skipped, but `WaitingConfirmations` settlement, expiry-based failure and the rest of the native refresh lifecycle still need the native wallet.
 
 ## Unsupported features and explicit errors
@@ -428,7 +430,7 @@ For a consumer this means:
 | Legacy BDK file-store migration | Compile-time absent |
 | Legacy RGB filesystem-store migration | Finding an `rgb/` store in the adapter is an explicit error |
 | Multisig hub coordination | Native `_online` only; the hub client and the hub-coordinated `MultisigWallet::get_address` are absent. `RgbLibMultisigWallet.getAddress(index)` derives from the descriptors instead. |
-| RGB online flow (transfer, send, proxy invoice reservation, media upload, hub) | Not assembled; BDK sync and proxy receive are supported, see above |
+| RGB online flow (proxy invoice reservation, mint, inflate, hub) | Not assembled; BDK sync, proxy receive and outgoing send/burn/link are supported, see above |
 | Out-of-band consignment import (`provide_out_of_band_consignment`) and ACK (`provide_out_of_band_ack`) | Native `_online` only: both core methods take an `Online` indexer and may broadcast, so they have no wasm-reachable form |
 | Native log files | No file logger; the logger is discarded |
 | `bdk_pending.json` crash recovery | Not needed; the in-memory database and snapshot are the only persistence steps |

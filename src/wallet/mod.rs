@@ -46,6 +46,12 @@ pub(crate) mod receive_wasm;
     target_arch = "wasm32",
     not(feature = "_online")
 ))]
+pub(crate) mod send_wasm;
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
 pub(crate) mod transfer_wasm;
 #[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
 pub(crate) mod wasm_online;
@@ -112,7 +118,10 @@ pub use objects::{
     target_arch = "wasm32",
     not(feature = "_online")
 ))]
-pub use objects::{BurnBeginResult, BurnDetails, LinkBeginResult, LinkDetails, OperationResult};
+pub use objects::{
+    BurnBeginResult, BurnDetails, LinkBeginResult, LinkDetails, OperationResult, SendBeginResult,
+    SendDetails,
+};
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
 pub use online::{RgbWalletOpsOnline, check_indexer_url};
@@ -120,7 +129,11 @@ pub use online::{RgbWalletOpsOnline, check_indexer_url};
     feature = "_online",
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
-pub(crate) use prepare::WalletPrepare;
+pub(crate) use prepare::{SendTransport, WalletPrepare};
+#[cfg(feature = "_online")]
+pub(crate) use prepare::{
+    check_operation_expiration, clock_skew_margin, invoice_expiration_margin,
+};
 pub use singlesig::{SinglesigKeys, Wallet};
 
 pub(crate) use backup::WalletBackup;
@@ -221,6 +234,8 @@ use super::*;
 pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
 pub(crate) const FASCIA_FILE: &str = "fascia";
 pub(crate) const UNSIGNED_PSBT_FILE: &str = "unsigned.psbt";
+/// Signed TX of an outgoing transfer, saved to broadcast it once the transfer is accepted
+pub(crate) const SIGNED_TX_FILE: &str = "signed.tx";
 
 /// Maximum time in the future, in seconds, an expiration can be set to, both for an invoice and
 /// for an outgoing operation: about 10 years. A later one is refused with
@@ -240,14 +255,20 @@ pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 /// The docs of `send_begin` and `send_init` state, in minutes, the operation expiration
 /// requirements following from it (this margin, [`INVOICE_EXPIRATION_MARGIN_SECS`] and their sum):
 /// update them along with it.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 
 /// Minimum time, in seconds, between the expiration of an outgoing operation and the earliest
 /// invoice expiration among its recipients, so the TX can only be released while the recipients
 /// are still waiting for it, leaving time to detect the ACKs and broadcast the TX and accounting
 /// for clock skew (see `v1.0-changes-spec.md` 6.1).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
 /// Minimum retention grace, in seconds, a recipient requires from the sender proxy
@@ -269,7 +290,10 @@ pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
 
 /// Maximum proof of work difficulty (leading zero bits) the wallet accepts to compute when posting
 /// a consignment; a proxy requiring more cannot be used to create transfers.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";

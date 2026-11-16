@@ -2109,7 +2109,10 @@ pub struct ReceivedMint {
 
 /// The result of a send begin operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct SendBeginResult {
     /// PSBT to inspect and sign
@@ -2122,7 +2125,10 @@ pub struct SendBeginResult {
 
 /// Details for send operations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct SendDetails {
     /// Path to the strict-encoded fascia file, for inspection

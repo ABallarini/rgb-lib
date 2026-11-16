@@ -12,7 +12,7 @@ use super::*;
 pub(crate) const INVOICE_QUOTA: u32 = 1;
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct JsonRpcError {
+pub struct JsonRpcError {
     pub(crate) code: i64,
     pub(crate) message: String,
     // -100 (cannot change), -200 (invalid) and -300 (missing) errors list the offending fields
@@ -83,7 +83,7 @@ pub(crate) fn params_json<T: Serialize>(params: &T) -> String {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct JsonRpcResponse<R> {
+pub struct JsonRpcResponse<R> {
     jsonrpc: String,
     id: Option<String>,
     pub(crate) result: Option<R>,
@@ -94,7 +94,7 @@ pub(crate) struct JsonRpcResponse<R> {
 pub(crate) struct NullRequest;
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ServerInfoResponse {
+pub struct ServerInfoResponse {
     pub(crate) protocol_version: String,
     pub(crate) version: String,
     pub(crate) uptime: i64,
@@ -152,7 +152,7 @@ pub(crate) enum InvoiceStatus {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct InvoiceCheckResponse {
+pub struct InvoiceCheckResponse {
     pub(crate) status: InvoiceStatus,
     pub(crate) pow_difficulty: String,
 }
@@ -189,7 +189,7 @@ pub struct PostAckResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct GetAckResponse {
+pub struct GetAckResponse {
     // transfers that have not been responded to yet (pending) are absent from both maps
     pub(crate) acks: HashMap<String, bool>,
     pub(crate) signatures: HashMap<String, String>,
@@ -197,7 +197,7 @@ pub(crate) struct GetAckResponse {
 
 /// Per-transfer data registered with `ack.prepare`, whose signed TX travels in the uploaded file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct AckTransferData {
+pub struct AckTransferData {
     pub(crate) recipient_pk: String,
     pub(crate) consignment_hash: String,
     pub(crate) signed_tx: String,

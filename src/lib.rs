@@ -642,6 +642,8 @@ use crate::utils::INDEXER_BATCH_SIZE;
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::utils::INDEXER_STOP_GAP;
+#[cfg(feature = "_online")]
+use crate::utils::hash_file_bytes;
 #[cfg(all(feature = "wallet", not(target_arch = "wasm32")))]
 use crate::utils::{
     LOG_FILE, RGB_RUNTIME_DELETING_DIR, atomic_write, atomic_write_with, setup_logger,
@@ -694,7 +696,6 @@ use crate::{
 use crate::{
     database::entities::reserved_txo::ActiveModel as DbReservedTxoActMod,
     encryption::{invoice_id, transfer_id},
-    utils::hash_file_bytes,
     wallet::AssignmentsCollection,
 };
 #[cfg(feature = "wallet")]

@@ -829,7 +829,7 @@ impl OperationHandler for SendRgbHandler {
         wallet: &mut MultisigWallet,
         combined_psbt: &Psbt,
     ) -> Result<String, Error> {
-        match wallet.send_end_impl(txn, combined_psbt) {
+        match drive_native(wallet.send_end_impl(txn, combined_psbt, None)) {
             Ok(res) => Ok(res.txid),
             // the operation has already been executed locally and the transfer has since failed
             // (as agreed through the hub transfer status) or progressed: there is nothing left to
@@ -2621,7 +2621,7 @@ impl MultisigWallet {
         self.check_online(online)?;
         self.check_is_cosigner()?;
         let txn = self.database().begin_transaction()?;
-        let data = self.send_begin_impl(
+        let data = drive_native(self.send_begin_impl(
             &txn,
             recipient_map,
             donation,
@@ -2630,7 +2630,8 @@ impl MultisigWallet {
             Some(expiration_timestamp as i64),
             Some(sender_transport_endpoint),
             true,
-        )?;
+            HashMap::new(),
+        ))?;
         let res = self.post_operation(
             OperationType::SendRgb,
             PostData::BeginOperationData(Box::new(data)),

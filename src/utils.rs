@@ -459,7 +459,10 @@ pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
 
 /// The max number of media per transfer advertised by a proxy (`max_media`), `None` if it doesn't
 /// advertise a valid one.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
     info.max_media.as_ref().and_then(|max| max.parse().ok())
 }

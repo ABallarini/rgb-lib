@@ -148,6 +148,26 @@ impl ProxyClient {
         )
     }
 
+    /// Post a consignment whose (possibly encrypted) bytes are already in memory, as the browser
+    /// transport does.
+    pub(crate) fn post_consignment_bytes(
+        &self,
+        data: &PostConsignmentData,
+        consignment: Vec<u8>,
+        file_name: &str,
+        pow_timestamp: &str,
+        pow_nonce: &str,
+    ) -> Result<JsonRpcResponse<bool>, Error> {
+        let params = params_json(&PostConsignmentParams {
+            data: data.clone(),
+            file_size: consignment.len().to_string(),
+            pow_timestamp: pow_timestamp.to_string(),
+            pow_nonce: pow_nonce.to_string(),
+        });
+        let file = multipart::Part::bytes(consignment).file_name(file_name.to_string());
+        self.call_multipart("consignment.post", params, file)
+    }
+
     pub(crate) fn get_media(
         &self,
         transfer_id: &str,
@@ -177,6 +197,26 @@ impl ProxyClient {
             signature: signature.to_string(),
         });
         self.call_multipart("media.post", params, multipart::Part::file(media_path)?)
+    }
+
+    /// Post media whose (possibly encrypted) bytes are already in memory, as the browser transport
+    /// does.
+    pub(crate) fn post_media_bytes(
+        &self,
+        transfer_id: &str,
+        media_id: &str,
+        media: Vec<u8>,
+        file_name: &str,
+        signature: &str,
+    ) -> Result<JsonRpcResponse<bool>, Error> {
+        let params = params_json(&PostMediaParams {
+            transfer_id: transfer_id.to_string(),
+            media_id: media_id.to_string(),
+            file_size: media.len().to_string(),
+            signature: signature.to_string(),
+        });
+        let file = multipart::Part::bytes(media).file_name(file_name.to_string());
+        self.call_multipart("media.post", params, file)
     }
 
     pub(crate) fn list_transfers(

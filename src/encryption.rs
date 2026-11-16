@@ -228,7 +228,10 @@ pub(crate) fn transfer_id(invoice_id: &str, sender_pk_hex: &str) -> String {
 
 /// Number of leading zero bits of a digest, starting from the most significant bit of its first
 /// byte.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 fn leading_zero_bits(digest: &[u8]) -> u32 {
     let mut bits = 0;
     for byte in digest {
@@ -243,7 +246,10 @@ fn leading_zero_bits(digest: &[u8]) -> u32 {
 /// Find a proof of work nonce for a `consignment.post` call, such that
 /// `SHA-256(transfer_id ‖ pow_timestamp ‖ pow_nonce)` has at least `difficulty` leading zero bits
 /// (see `v1.0-changes-spec.md` C.2).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn solve_pow(transfer_id: &str, pow_timestamp: &str, difficulty: u32) -> String {
     let prefix = format!("{transfer_id}{pow_timestamp}");
     (0u64..)
@@ -301,7 +307,10 @@ fn fill_upto(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, Error> {
 /// form the per-message nonce base. The plaintext is consumed one chunk at a time, looking one
 /// chunk ahead to flag the final one, so memory use is bounded by two plaintext chunks plus one
 /// ciphertext chunk regardless of the payload size.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn encrypt_stream(
     mut reader: impl Read,
     mut writer: impl Write,
@@ -396,7 +405,10 @@ pub(crate) fn decrypt_stream(
 }
 
 /// In-memory counterpart of [`encrypt_stream`], for small payloads such as the signed TX.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 pub(crate) fn encrypt_blob(
     plaintext: &[u8],
     sym_key: &[u8; 32],

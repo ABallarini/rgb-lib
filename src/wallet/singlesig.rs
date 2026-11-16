@@ -1270,7 +1270,7 @@ impl Wallet {
         self.check_xprv()?;
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let mut begin_op_data = self.send_begin_impl(
+        let mut begin_op_data = drive_native(self.send_begin_impl(
             &txn,
             recipient_map,
             donation,
@@ -1279,9 +1279,10 @@ impl Wallet {
             Some(expiration_timestamp as i64),
             sender_transport_endpoint,
             true,
-        )?;
+            HashMap::new(),
+        ))?;
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
-        let res = self.send_end_impl(&txn, &begin_op_data.psbt)?;
+        let res = drive_native(self.send_end_impl(&txn, &begin_op_data.psbt, None))?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Send completed");
@@ -1363,7 +1364,7 @@ impl Wallet {
         info!(self.logger(), "Sending (begin) to: {:?}...", recipient_map);
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let begin_op_data = self.send_begin_impl(
+        let begin_op_data = drive_native(self.send_begin_impl(
             &txn,
             recipient_map,
             donation,
@@ -1372,7 +1373,8 @@ impl Wallet {
             Some(expiration_timestamp as i64),
             sender_transport_endpoint,
             dry_run,
-        )?;
+            HashMap::new(),
+        ))?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
@@ -1412,7 +1414,7 @@ impl Wallet {
         self.check_online(online)?;
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
-        let res = self.send_end_impl(&txn, &psbt)?;
+        let res = drive_native(self.send_end_impl(&txn, &psbt, None))?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Send (end) completed");

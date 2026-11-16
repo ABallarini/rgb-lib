@@ -48,9 +48,8 @@ use rgb_lib::{
     no_wallet::validate_consignment_offchain as core_validate_consignment_offchain,
     wallet::{
         AssetFilter, DatabaseType, EvmReceiveConfig, EvmReceiveOptions, Invoice as CoreInvoice,
-        MultisigKeys, MultisigWallet, RgbWalletOpsOffline, SinglesigKeys, TransferScope, Wallet,
-        WalletData,
-        backup_info_bytes as core_backup_info_bytes,
+        MultisigKeys, MultisigWallet, Recipient, RgbWalletOpsOffline, SinglesigKeys, TransferScope,
+        Wallet, WalletData, backup_info_bytes as core_backup_info_bytes,
         persistence::{
             delete_snapshot as core_delete_snapshot, load_snapshot_record, new_writer_id,
             save_snapshot_record,
@@ -225,6 +224,23 @@ fn parse_assignment(assignment: &str) -> Result<Assignment, JsValue> {
             "cannot parse the assignment: {e}; use the core shape, e.g. {{\"Fungible\":1000}} or \"Any\""
         ))
     })
+}
+
+/// Parse the `sendBegin` recipient map from JSON, in the core serde shape: asset ID to a list of
+/// [`Recipient`] objects (`recipient_id`, `assignment`, `transport_endpoints`, `public_key`,
+/// `encryption`, `expiration_timestamp`, optional `witness_data`).
+fn parse_recipients(recipients: &str) -> Result<HashMap<String, Vec<Recipient>>, JsValue> {
+    let map: HashMap<String, Vec<Recipient>> = serde_json::from_str(recipients).map_err(|e| {
+        JsValue::from_str(&format!(
+            "cannot parse the send recipients: {e}; use a map from asset ID to the core recipient list"
+        ))
+    })?;
+    if map.is_empty() || map.values().any(|recipients| recipients.is_empty()) {
+        return Err(JsValue::from_str(
+            "the send recipients must map each asset ID to at least one recipient",
+        ));
+    }
+    Ok(map)
 }
 
 /// Parse an optional encryption preference: `required`, `unsupported` or `optional`.
@@ -1117,6 +1133,74 @@ impl RgbLibWallet {
             .map_err(|e| failure("cannot end the link", e))?;
         drop(wallet);
         json_result("cannot serialize the link result", &res)
+    }
+
+    /// Prepare the PSBT to send RGB assets to the given recipients, returning it with its details
+    /// as JSON.
+    ///
+    /// `recipientsJson` maps each asset ID to its core `Recipient` list, e.g.
+    /// `{"rgb:...": [{"recipient_id": "...", "assignment": {"Fungible": 1000},
+    /// "transport_endpoints": ["rpc://proxy.example"], "public_key": "...", "encryption":
+    /// "unsupported", "expiration_timestamp": 1700000000}]}`. A recipient with no transport
+    /// endpoints uses the out-of-band exchange. `senderTransportEndpoint` is the sender's own
+    /// proxy and is required when any recipient has transport endpoints.
+    ///
+    /// `indexerUrl` is the Esplora endpoint the matching [`RgbLibWallet::send_end`] broadcasts
+    /// over. `evm` has the shape [`RgbLibWallet::receive_transfer`] takes and is needed only for a
+    /// BFA asset, whose reject list lives on an EVM chain.
+    ///
+    /// Proxy-level authentication keys cannot be configured in the browser, so a proxy that
+    /// requires them refuses the send with its explicit authentication error.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = sendBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_begin(
+        &self,
+        recipients_json: String,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: u64,
+        sender_transport_endpoint: Option<String>,
+        indexer_url: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let recipient_map = parse_recipients(&recipients_json)?;
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .send_begin_async(
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+                &indexer_url,
+                evm,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the send", e))?;
+        drop(wallet);
+        json_result("cannot serialize the send begin result", &res)
+    }
+
+    /// Complete the send of the signed `signedPsbt`, broadcasting it over `indexerUrl` when it is
+    /// a donation, and return the result JSON.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = sendEnd)]
+    pub async fn send_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+    ) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .send_end_async(&indexer_url, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the send", e))?;
+        drop(wallet);
+        json_result("cannot serialize the send result", &res)
     }
 
     /// Delete eligible failed transfers and return whether any was deleted.
