@@ -27,17 +27,18 @@ The implementation is shared with the native wallet: the browser binding is a th
 | BFA mint receive | Supported when the caller supplies an EVM endpoint (`receiveTransfer`/`syncOnline` `evm` argument): claims, mint locks and EVM reject lists are prefetched before the transaction, and `getReceivedMint` reports the checked mint (`MintLockExpired`, `MintLockNotFound`, `NoEvmRpcUrl` and chain mismatches are typed errors) |
 | RGB send over a proxy (begin, sign, end, PoW retries, donation broadcast, consignment/media upload) | Supported and exported (`sendBegin`, `sendEnd`) over the Fetch proxy client and the async Esplora broadcast, using the shared send authoring |
 | RGB burn and link (begin, sign, end, PoW retries, broadcast) | Supported and exported (`burnBegin`/`burnEnd`, `linkBegin`/`linkEnd`) over the same shared authoring |
+| BFA mint (begin, sign, end, lock check, supply read, broadcast) | Supported and exported (`mintBegin`/`mintEnd`) over the same shared authoring, with the async Fetch proxy, EVM and Esplora transports; `evmBlockNumber` reads the chain tip the host picks `beforeBlock` from. A missing endpoint is `NoEvmRpcUrl`, a node on another chain is `EvmChainIdMismatch`, `beforeBlock` outside the configured bounds is `InvalidBeforeBlock` |
 | Proxy health check | Supported and exported (`checkProxyUrl`): read-only `server.info` over the Fetch proxy client |
-| Proxy invoice reservation, mint, inflate, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
+| Proxy invoice reservation, inflate, hub coordination | **Not assembled**; the native-only `_online` paths stay off |
 | Out-of-band consignment import and ACK | Native-only: `provide_out_of_band_consignment` and `provide_out_of_band_ack` take `Online` and may broadcast |
-| Async Esplora and Fetch transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive; the Fetch EVM client serves claim, mint-lock and reject-list prefetch for BFA receive |
+| Async Esplora and Fetch transports | Esplora is wired into the BDK sync and the receive validation; the Fetch proxy serves `checkProxyUrl` and the asynchronous receive; the Fetch EVM client serves claim, mint-lock and reject-list prefetch for BFA receive and the mint begin/end |
 | Backups | Encrypted byte backup/restore supported; path-based filesystem backups native only |
 | Legacy file migrations | Native only |
 | Web Worker | Not required; optional future seam only |
 
-The JS package exposes the singlesig subset over the shared wallet: create, restore, load, watch-only creation and restore, name, id, getAddress, blindReceive, witnessReceive, the balance, metadata, asset, transfer, unspent, transaction and wallet-data reads, getReceivedMint, signPsbt, finalizePsbt, burnBegin/burnEnd, linkBegin/linkEnd, sendBegin/sendEnd, deleteTransfers, NIA/UDA/CFA/IFA/BFA issuance, snapshot, flush and deleteSnapshot, sync, syncOnline, receiveTransfer, getTipHeight and getFeeEstimation, plus the free functions `generateKeys`, `restoreKeys` and `checkProxyUrl` and the hub-free `RgbLibMultisigWallet` class. Hub-coordinated multisig operations stay native-only.
+The JS package exposes the singlesig subset over the shared wallet: create, restore, load, watch-only creation and restore, name, id, getAddress, blindReceive, witnessReceive, the balance, metadata, asset, transfer, unspent, transaction and wallet-data reads, getReceivedMint, signPsbt, finalizePsbt, burnBegin/burnEnd, linkBegin/linkEnd, mintBegin/mintEnd/evmBlockNumber, sendBegin/sendEnd, deleteTransfers, NIA/UDA/CFA/IFA/BFA issuance, snapshot, flush and deleteSnapshot, sync, syncOnline, receiveTransfer, getTipHeight and getFeeEstimation, plus the free functions `generateKeys`, `restoreKeys` and `checkProxyUrl` and the hub-free `RgbLibMultisigWallet` class. Hub-coordinated multisig operations stay native-only.
 
-The browser wallet is **online for its own BDK wallet, for proxy receives and for outgoing sends, burns and links**: it can scan the chain, receive and ACK RGB consignments through a proxy, and author, post and broadcast an outgoing transfer with the shared wallet logic. It still cannot create a proxy receive invoice, mint or inflate.
+The browser wallet is **online for its own BDK wallet, for proxy receives and for outgoing sends, burns, links and BFA mints**: it can scan the chain, receive and ACK RGB consignments through a proxy, and author, post and broadcast an outgoing transfer with the shared wallet logic. It still cannot create a proxy receive invoice or inflate.
 
 ## Build
 
@@ -213,6 +214,9 @@ const restored = RgbLibWallet.restore("smoke", bytes, mnemonic, "regtest");
 | `listTransactions()` | JSON. Known Bitcoin transactions, newest first. |
 | `signPsbt(psbt)` | Sign a PSBT with the wallet keys, return the signed PSBT. |
 | `finalizePsbt(psbt)` | Finalize a signed PSBT, return the finalized PSBT. |
+| `mintBegin(indexer_url, asset_id, recipient_json, before_block, fee_rate, min_confirmations, sender_transport_endpoint, evm?)` | Async. Prepares the PSBT to mint a BFA asset to the core `Recipient` in `recipient_json`, which must carry at least one transport endpoint, and posts its consignment to that proxy. `before_block` is the external chain block the mint commits to, picked from `evmBlockNumber` and checked against the `min_mint_lock_blocks`/`max_mint_lock_blocks` bounds of `evm` (the same shape as in `syncOnline`, plus `min_mint_lock_blocks`); a chain the configuration doesn't name throws `No EVM RPC URL configured for chain ID …`, and a node answering with another chain ID throws `EvmChainIdMismatch` before any block is read. Returns JSON `MintBeginResult` (`psbt`, `batch_transfer_idx`, `details` with the `opid`). |
+| `mintEnd(indexer_url, signed_psbt, evm?)` | Async. Checks a finalized lock of the mint before broadcasting the signed PSBT over `indexer_url`, then saves the transfer and updates the known circulating supply from the bridge contract. A lock not final yet throws the core `MintLockNotFound` and leaves the mint initiated; an expired one fails the mint, releases its inputs and throws `MintLockExpired`. `evm` must name the same chain as the begin. |
+| `evmBlockNumber(chain_id, evm?)` | Async. Latest block of the configured EVM chain, after checking the endpoint answers with `chain_id`; returns a decimal string. |
 | `deleteTransfers(batch_transfer_idx?, no_asset_only)` | Delete eligible failed transfers; returns whether any was deleted. |
 | `issueNia(ticker, name, precision, amounts)` | Issue a NIA asset; returns the asset ID. `amounts` is a `BigUint64Array` (or `bigint[]`). |
 | `issueUda(ticker, name, details, precision)` | Issue a UDA asset; returns the asset ID. |
@@ -370,7 +374,7 @@ The root crate with `esplora_async` compiles the browser transport, resolver and
 | `ProxyFetchClient` | RGB proxy JSON-RPC over `fetch`, including in-memory multipart uploads |
 | `EvmFetchClient` | EVM JSON-RPC over `fetch`: chain ID, finalized block, `eth_call` and reject-list reads, over the shared `evm_abi` payloads and decoders |
 
-`EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transaction runs the native sync bookkeeping: pending witness state is reconciled and colored TXOs new to the DB are registered. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of an outgoing or released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`, `sendBegin`/`sendEnd`, `burnBegin`/`burnEnd` and `linkBegin`/`linkEnd`; the remaining proxy writes (invoice reservation, mint and inflate) stay in the native-only flow.
+`EsploraTransport` is wired into `Wallet::sync_async` (exported as `sync`): a BDK full scan of both keychains whose update is applied to the shared wallet and persisted through the normal database transaction and `persist_bdk` seam. The same transaction runs the native sync bookkeeping: pending witness state is reconciled and colored TXOs new to the DB are registered. The same transport answers tip height, fee estimation, the witness and header questions of a proxy receive through `EsploraResolver`, and the broadcast of an outgoing or released signed TX. `ProxyFetchClient` backs `checkProxyUrl` and every proxy call of `receiveTransfer`/`syncOnline`, `sendBegin`/`sendEnd`, `burnBegin`/`burnEnd`, `linkBegin`/`linkEnd` and `mintBegin`; `EvmFetchClient` backs the mint begin/end, the supply read and `evmBlockNumber`; the remaining proxy writes (invoice reservation and inflate) stay in the native-only flow.
 
 `EvmFetchClient` is built from the same `evm_abi` selectors, calldata builders and result decoders as the native
 blocking `EvmClient`, so the two transports cannot drift. It applies a 15 s deadline per request, caps a response body
@@ -391,7 +395,7 @@ finalized yet leaves the consignment waiting (`PendingMintLocks`, no colorings),
 and `before_block`. The ACK/NACK/retrieval ordering, the single-allocation rule and the per-UTXO slot limits are the
 native ones, because the same driver runs both paths.
 
-The browser can also send, burn and link RGB assets: `sendBegin`/`sendEnd`, `burnBegin`/`burnEnd` and `linkBegin`/`linkEnd` run the shared authoring over the Fetch proxy client, with the proof-of-work retry and the async Esplora broadcast. A send expects the caller to pass the indexer URL to both calls and the EVM configuration for a BFA reject list; proxy-level authentication keys cannot be configured in the browser. Still deferred on wasm: `mintBegin`/`mintEnd`, inflate and proxy invoice creation, which need the native `_online` flow.
+The browser can also send, burn, link and mint RGB assets: `sendBegin`/`sendEnd`, `burnBegin`/`burnEnd`, `linkBegin`/`linkEnd` and `mintBegin`/`mintEnd` run the shared authoring over the Fetch proxy client, with the proof-of-work retry and the async Esplora broadcast. A send expects the caller to pass the indexer URL to both calls and the EVM configuration for a BFA reject list. A mint expects the EVM configuration of the asset's bridge chain (with `min_mint_lock_blocks`) and a `before_block` the host picks from `evmBlockNumber` within the configured bounds; the begin checks the endpoint answers with that chain ID before reading the tip, posts the consignment, and the end checks a finalized lock before broadcasting, reading the bridge supply on success and failing an expired mint. Proxy-level authentication keys cannot be configured in the browser. Still deferred on wasm: inflate and proxy invoice creation, which need the native `_online` flow.
 
 The bindings crate enables `wallet,esplora_async`, so the generated package contains the transport and the three read-only methods. No native blocking transport is in the wasm graph: `bitcoind`, `electrum` and `esplora` are native-only, and the graph check rejects their crates.
 
@@ -411,14 +415,14 @@ Remaining caveat: the retry backoff sleeper still needs `window.setTimeout`, so 
 
 ### What is not assembled
 
-The remaining RGB online flow (`RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, proxy invoice reservation, mint, inflate, hub coordination) is gated by the native-only `_online` feature. `esplora_async` deliberately does not enable it: the browser receive, send, burn and link paths are additive async methods in `wasm_online`/`receive_wasm`/`send_wasm`/`transfer_wasm`, over the shared authoring, not the native online trait.
+The remaining RGB online flow (`RgbWalletOpsOnline`, `OnlineOptions`, `go_online`, proxy invoice reservation, inflate, hub coordination) is gated by the native-only `_online` feature. `esplora_async` deliberately does not enable it: the browser receive, send, burn, link and mint paths are additive async methods in `wasm_online`/`receive_wasm`/`send_wasm`/`transfer_wasm`/`mint_wasm`, over the shared authoring, not the native online trait.
 
 For a consumer this means:
 
 - a browser wallet can be created, restored, persisted, derive addresses, read its snapshot and **sync its BDK wallet** against Esplora, so new funding of its own addresses becomes visible in its BTC balance;
 - it can **receive and ACK a pending proxy consignment** whose invoice was created for its keys, coloring the UTXO and importing an unknown contract;
 - it can **send, burn and link RGB assets** to recipients whose endpoints it knows, signing locally and ending over the async transports;
-- proxy invoice creation, mint and inflate still need the native flow;
+- proxy invoice creation and inflate still need the native flow;
 - `syncOnline` resumes a receive left in `WaitingSafeHeight` or `WaitingBroadcast`, and a terminal (`Settled`/`Failed`) one is skipped, but `WaitingConfirmations` settlement, expiry-based failure and the rest of the native refresh lifecycle still need the native wallet.
 
 ## Unsupported features and explicit errors
@@ -430,7 +434,7 @@ For a consumer this means:
 | Legacy BDK file-store migration | Compile-time absent |
 | Legacy RGB filesystem-store migration | Finding an `rgb/` store in the adapter is an explicit error |
 | Multisig hub coordination | Native `_online` only; the hub client and the hub-coordinated `MultisigWallet::get_address` are absent. `RgbLibMultisigWallet.getAddress(index)` derives from the descriptors instead. |
-| RGB online flow (proxy invoice reservation, mint, inflate, hub) | Not assembled; BDK sync, proxy receive and outgoing send/burn/link are supported, see above |
+| RGB online flow (proxy invoice reservation, inflate, hub) | Not assembled; BDK sync, proxy receive and outgoing send/burn/link/mint are supported, see above |
 | Out-of-band consignment import (`provide_out_of_band_consignment`) and ACK (`provide_out_of_band_ack`) | Native `_online` only: both core methods take an `Online` indexer and may broadcast, so they have no wasm-reachable form |
 | Native log files | No file logger; the logger is discarded |
 | `bdk_pending.json` crash recovery | Not needed; the in-memory database and snapshot are the only persistence steps |

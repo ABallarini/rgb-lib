@@ -2058,7 +2058,10 @@ pub struct InflateDetails {
 
 /// The result of a mint begin operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct MintBeginResult {
     /// PSBT to inspect and sign
@@ -2071,7 +2074,10 @@ pub struct MintBeginResult {
 
 /// Details for mint operations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct MintDetails {
     /// Path to fascia file for inspection
@@ -2542,7 +2548,10 @@ pub struct ReceivedConsignmentMeta {
 }
 
 /// A mint sent by the wallet: what its lock on the external chain has to match.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub struct SentMint {
     /// ID of the minted asset
     pub contract_id: ContractId,

@@ -168,6 +168,13 @@ impl EvmReceiveOptions {
 pub struct EvmReceiveConfig {
     /// URL of the JSON-RPC endpoint connected to the bridge chain.
     pub rpc_url: String,
+    /// Minimum number of blocks after the latest one the block a mint commits to has to be, when
+    /// minting over the browser transport (see `Wallet::mint_begin_async`).
+    ///
+    /// It mirrors the native `EvmChain::min_mint_lock_blocks` on the online wallet, which the
+    /// browser has no `OnlineOptions` to carry: a value below 2 has the effect of 2, the lock
+    /// needing a block after the latest one to be included in. Receives don't use it.
+    pub min_mint_lock_blocks: u64,
     /// Maximum number of blocks after the latest one the block a received mint commits to can be.
     pub max_mint_lock_blocks: u64,
 }
@@ -436,6 +443,7 @@ mod tests {
     fn config() -> EvmReceiveConfig {
         EvmReceiveConfig {
             rpc_url: s!("http://evm.invalid"),
+            min_mint_lock_blocks: 2,
             max_mint_lock_blocks: 100,
         }
     }

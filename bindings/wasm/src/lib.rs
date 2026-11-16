@@ -144,6 +144,9 @@ fn failure(context: &str, e: Error) -> JsValue {
 struct EvmConfigArg {
     #[serde(alias = "rpc_url")]
     rpc_url: String,
+    /// Minimum blocks after the latest one a mint may commit to; only used by `mintBegin`.
+    #[serde(default, alias = "min_mint_lock_blocks")]
+    min_mint_lock_blocks: u64,
     #[serde(alias = "max_mint_lock_blocks")]
     max_mint_lock_blocks: u64,
 }
@@ -152,6 +155,7 @@ impl From<EvmConfigArg> for EvmReceiveConfig {
     fn from(arg: EvmConfigArg) -> Self {
         Self {
             rpc_url: arg.rpc_url,
+            min_mint_lock_blocks: arg.min_mint_lock_blocks,
             max_mint_lock_blocks: arg.max_mint_lock_blocks,
         }
     }
@@ -241,6 +245,15 @@ fn parse_recipients(recipients: &str) -> Result<HashMap<String, Vec<Recipient>>,
         ));
     }
     Ok(map)
+}
+
+/// Parse the `mintBegin` recipient from JSON, in the core [`Recipient`] serde shape.
+fn parse_recipient(recipient: &str) -> Result<Recipient, JsValue> {
+    serde_json::from_str(recipient).map_err(|e| {
+        JsValue::from_str(&format!(
+            "cannot parse the mint recipient: {e}; use the core recipient object"
+        ))
+    })
 }
 
 /// Parse an optional encryption preference: `required`, `unsupported` or `optional`.
@@ -1201,6 +1214,100 @@ impl RgbLibWallet {
             .map_err(|e| failure("cannot end the send", e))?;
         drop(wallet);
         json_result("cannot serialize the send result", &res)
+    }
+
+    /// Prepare the PSBT to mint a BFA asset to `recipientJson`, returning it with its details as
+    /// JSON.
+    ///
+    /// `recipientJson` is a single core `Recipient` object, as in the `sendBegin` recipient list,
+    /// with at least one transport endpoint: a mint recipient is always a proxy one. `beforeBlock`
+    /// is the external chain block the mint commits to, which the host reads with
+    /// [`RgbLibWallet::evm_block_number`] and picks within the configured bounds. `indexerUrl` is
+    /// the Esplora endpoint the matching [`RgbLibWallet::mint_end`] broadcasts over.
+    ///
+    /// `evm` has the shape [`RgbLibWallet::receive_transfer`] takes, with `minMintLockBlocks` too,
+    /// and must name the chain of the asset's bridge contract: a mint of a chain it doesn't name
+    /// fails with the core `NoEvmRpcUrl`. The endpoint is checked to answer with that chain ID
+    /// before any block is read.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = mintBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mint_begin(
+        &self,
+        indexer_url: String,
+        asset_id: String,
+        recipient_json: String,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let recipient = parse_recipient(&recipient_json)?;
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .mint_begin_async(
+                &indexer_url,
+                evm,
+                asset_id,
+                recipient,
+                before_block,
+                fee_rate,
+                min_confirmations,
+                sender_transport_endpoint,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the mint", e))?;
+        drop(wallet);
+        json_result("cannot serialize the mint begin result", &res)
+    }
+
+    /// Complete the mint of the signed `signedPsbt`, broadcasting it over `indexerUrl`, and return
+    /// the result JSON.
+    ///
+    /// A mint whose lock is not final yet is left as is and returns the core
+    /// `Mint lock not found`; one whose lock has expired is failed, releasing its inputs, and
+    /// returns `Mint lock expired`. `evm` is as in [`RgbLibWallet::mint_begin`] and must name the
+    /// same chain.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = mintEnd)]
+    pub async fn mint_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .mint_end_async(&indexer_url, evm, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the mint", e))?;
+        drop(wallet);
+        json_result("cannot serialize the mint result", &res)
+    }
+
+    /// Return the latest block of the EVM chain `chainId` as a string, after checking `evm`
+    /// answers with that chain ID.
+    ///
+    /// `evm` is as in [`RgbLibWallet::mint_begin`]. The result is a decimal string because a
+    /// JavaScript `number` cannot hold every block height exactly.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = evmBlockNumber)]
+    pub async fn evm_block_number(
+        &self,
+        chain_id: u64,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?
+            .ok_or_else(|| JsValue::from_str("the EVM configuration is required"))?;
+        let wallet = self.borrow_wallet()?;
+        let block = wallet
+            .evm_block_number_async(&evm, chain_id)
+            .await
+            .map_err(|e| failure("cannot read the EVM block number", e))?;
+        Ok(block.to_string())
     }
 
     /// Delete eligible failed transfers and return whether any was deleted.

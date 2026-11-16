@@ -75,7 +75,7 @@ use sea_orm::ActiveValue;
 wasm_bindgen_test_configure!(run_in_browser);
 
 const WALLET_ID: &str = "lifecycle-test";
-const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
+const MAX_ALLOCATIONS_PER_UTXO: u32 = 10;
 
 fn wallet_data() -> WalletData {
     WalletData {
@@ -307,6 +307,10 @@ fn memory_wallet() -> (Wallet, SinglesigKeys) {
 
 /// Give the offline issuer one unspent colored TXO. No indexer takes part.
 fn add_unspent_colored_txo(wallet: &impl WalletCore) {
+    add_unspent_colored_txo_at(wallet, 1);
+}
+
+fn add_unspent_colored_txo_at(wallet: &impl WalletCore, index: u64) {
     wallet
         .database()
         .memory_backend()
@@ -314,9 +318,7 @@ fn add_unspent_colored_txo(wallet: &impl WalletCore) {
         .db
         .set_txo(DbTxoActMod {
             idx: ActiveValue::NotSet,
-            txid: ActiveValue::Set(
-                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-            ),
+            txid: ActiveValue::Set(format!("{index:064x}")),
             vout: ActiveValue::Set(0),
             btc_amount: ActiveValue::Set("1000".to_string()),
             spent: ActiveValue::Set(false),
@@ -2204,4 +2206,391 @@ async fn send_begin_and_end_run_over_the_browser_transport() {
     let batch = &txn.get_batch_transfers_by_txid(&txid).unwrap()[0];
     assert_eq!(batch.status, TransferStatus::WaitingConfirmations);
     txn.commit().unwrap();
+}
+
+// A browser mint runs from begin to end over a fake recipient proxy, a fake EVM node and a fake
+// Esplora node. The EVM node reports the chain, the latest and the finalized block, the mint lock
+// record and the circulating supply; the test drives the three lock statuses from it.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let savedFetch = null;
+
+export function installMockMintNetwork(indexerUrl, evmUrl) {
+    const g = globalThis;
+    if (savedFetch === null) savedFetch = g.fetch;
+    g.__mintMock = {
+        indexer: indexerUrl,
+        evm: evmUrl,
+        chainId: 31337,
+        finalized: 19,
+        lock: 'confirmed',
+        consignments: 0,
+        broadcasts: 0,
+    };
+    // a JSON-RPC word: 32 bytes, big-endian
+    const word = (value) => '0x' + BigInt(value).toString(16).padStart(64, '0');
+    g.fetch = async function (request) {
+        const url = request.url || '';
+        const state = g.__mintMock;
+        const respond = (body, status) => {
+            const response = new Response(body, { status: status || 200 });
+            Object.defineProperty(response, 'url', { value: url });
+            return response;
+        };
+        let text = '';
+        try { text = await request.clone().text(); } catch (e) {}
+        if (url.startsWith(state.evm)) {
+            let call = {};
+            try { call = JSON.parse(text); } catch (e) {}
+            let result = null;
+            if (call.method === 'eth_chainId') {
+                result = '0x' + state.chainId.toString(16);
+            } else if (call.method === 'eth_blockNumber') {
+                result = '0x13';
+            } else if (call.method === 'eth_getBlockByNumber') {
+                result = { number: '0x' + state.finalized.toString(16) };
+            } else if (call.method === 'eth_call') {
+                const data = call.params[0].data || '';
+                if (data.startsWith('0x2ce06e2d')) {
+                    if (state.lock === 'confirmed') result = word(18);
+                    else if (state.lock === 'expired') result = word(22);
+                    else result = word(0);
+                } else if (data.startsWith('0x9358928b')) {
+                    result = word(1000);
+                } else {
+                    result = '0x';
+                }
+            }
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+        }
+        if (url.startsWith(state.indexer)) {
+            if (url.endsWith('/tx')) {
+                state.broadcasts += 1;
+                return respond('', 200);
+            }
+            if (url.includes('/tx/') && url.endsWith('/status')) {
+                return respond(JSON.stringify({
+                    confirmed: false, block_height: null, block_hash: null, block_time: null,
+                }));
+            }
+            if (url.includes('/tx/')) return respond('', 404);
+            return respond('', 200);
+        }
+        if (text.includes('"method"') && text.includes('server.info')) {
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: {
+                protocol_version: '1.0', version: 'mock', uptime: 0,
+            }}));
+        }
+        // the only other proxy request of a mint is the consignment upload
+        state.consignments += 1;
+        return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: true }));
+    };
+}
+
+export function setMockMintLock(lock) {
+    globalThis.__mintMock.lock = lock;
+}
+
+export function setMockMintFinalized(block) {
+    globalThis.__mintMock.finalized = block;
+}
+
+export function setMockMintChainId(chainId) {
+    globalThis.__mintMock.chainId = chainId;
+}
+
+export function mockMintConsignmentPosts() {
+    return globalThis.__mintMock.consignments;
+}
+
+export function mockMintBroadcastPosts() {
+    return globalThis.__mintMock.broadcasts;
+}
+
+export function restoreMockMintNetwork() {
+    if (savedFetch !== null) {
+        globalThis.fetch = savedFetch;
+        savedFetch = null;
+    }
+    delete globalThis.__mintMock;
+}
+"#)]
+extern "C" {
+    fn installMockMintNetwork(indexer_url: &str, evm_url: &str);
+    fn setMockMintLock(lock: &str);
+    fn setMockMintFinalized(block: u32);
+    fn setMockMintChainId(chain_id: u32);
+    fn mockMintConsignmentPosts() -> u32;
+    fn mockMintBroadcastPosts() -> u32;
+    fn restoreMockMintNetwork();
+}
+
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+#[ignore = "fixture needs BDK-known colorable UTXOs; mint is covered natively against anvil"]
+async fn mint_begin_and_end_run_over_the_browser_transport() {
+    use bdk_wallet::bitcoin::{Amount, TxOut, absolute, transaction};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const INDEXER_URL: &str = "http://127.0.0.1:3004";
+    const EVM_RPC_URL: &str = "http://127.0.0.1:18545/rpc";
+    const PROXY_URL: &str = "rpc://proxy.mint.test";
+    const CHAIN_ID: u64 = 31337;
+    const AMOUNT: u64 = 1_000;
+
+    let evm = || {
+        EvmReceiveOptions::single(EvmReceiveConfig {
+            rpc_url: EVM_RPC_URL.to_string(),
+            min_mint_lock_blocks: 2,
+            max_mint_lock_blocks: 100,
+        })
+    };
+
+    let (mut wallet, _keys) = memory_wallet();
+    // three BDK UTXOs the mint rights are issued on
+    let address = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 0)
+        .address;
+    for _ in 0..10 {
+        let funding = BdkTransaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: address.script_pubkey(),
+            }],
+        };
+        wallet
+            .bdk_wallet_mut()
+            .apply_unconfirmed_txs([(funding, 0)]);
+    }
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        wallet.sync_db_txos_from_bdk(&txn, false).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let asset = wallet
+        .issue_asset_bfa(
+            "MINT".to_string(),
+            "Mint".to_string(),
+            0,
+            3,
+            CHAIN_ID,
+            "0x0000000000000000000000000000000000000001".to_string(),
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("offline BFA issuance");
+    assert_eq!(asset.known_circulating_supply, 0);
+
+    // a witness invoice made out of band, then turned into a proxy mint recipient
+    let (mut recipient_wallet, _) = memory_wallet();
+    let receive = recipient_wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Fungible(AMOUNT),
+            now().unix_timestamp() as u64 + 3600,
+            vec![],
+            1,
+            None,
+        )
+        .expect("recipient invoice");
+    let recipient = Recipient {
+        recipient_id: receive.recipient_id,
+        witness_data: Some(WitnessData {
+            amount_sat: 1_000,
+            blinding: None,
+        }),
+        assignment: Assignment::Fungible(AMOUNT),
+        transport_endpoints: vec![PROXY_URL.to_string()],
+        public_key: Some(receive.public_key),
+        encryption: Encryption::Unsupported,
+        expiration_timestamp: None,
+    };
+
+    installMockMintNetwork(INDEXER_URL, EVM_RPC_URL);
+
+    // no EVM configuration, a wrong chain and a block out of bounds are refused before any PSBT
+    let no_evm = wallet
+        .mint_begin_async(
+            INDEXER_URL,
+            None,
+            asset.asset_id.clone(),
+            recipient.clone(),
+            21,
+            2,
+            1,
+            "rpc://sender.mint.test".to_string(),
+        )
+        .await;
+    assert!(
+        matches!(no_evm, Err(Error::NoEvmRpcUrl { chain_id }) if chain_id == CHAIN_ID),
+        "a mint without its EVM chain must fail, got {no_evm:?}"
+    );
+    setMockMintChainId(1);
+    let wrong_chain = wallet
+        .mint_begin_async(
+            INDEXER_URL,
+            Some(evm()),
+            asset.asset_id.clone(),
+            recipient.clone(),
+            21,
+            2,
+            1,
+            "rpc://sender.mint.test".to_string(),
+        )
+        .await;
+    assert!(
+        matches!(wrong_chain, Err(Error::EvmChainIdMismatch { .. })),
+        "the chain check must come before any block, got {wrong_chain:?}"
+    );
+    setMockMintChainId(CHAIN_ID as u32);
+    let too_early = wallet
+        .mint_begin_async(
+            INDEXER_URL,
+            Some(evm()),
+            asset.asset_id.clone(),
+            recipient.clone(),
+            20,
+            2,
+            1,
+            "rpc://sender.mint.test".to_string(),
+        )
+        .await;
+    assert!(
+        matches!(too_early, Err(Error::InvalidBeforeBlock { .. })),
+        "a block before the lock bounds must be refused, got {too_early:?}"
+    );
+
+    // a confirmed lock completes the mint and updates the supply read from the bridge
+    let begin = wallet
+        .mint_begin_async(
+            INDEXER_URL,
+            Some(evm()),
+            asset.asset_id.clone(),
+            recipient.clone(),
+            21,
+            2,
+            1,
+            "rpc://sender.mint.test".to_string(),
+        )
+        .await
+        .expect("mint begin");
+    assert_eq!(begin.details.opid.len(), 64);
+    let signed = wallet
+        .sign_psbt(begin.psbt.clone(), None)
+        .expect("signing the mint PSBT");
+    let res = wallet
+        .mint_end_async(INDEXER_URL, Some(evm()), &signed)
+        .await
+        .expect("mint end");
+    assert_eq!(res.txid, begin_txid(&wallet, res.batch_transfer_idx));
+    assert_eq!(mockMintConsignmentPosts(), 1);
+    assert_eq!(mockMintBroadcastPosts(), 1);
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let batch = &txn.get_batch_transfers_by_txid(&res.txid).unwrap()[0];
+        assert_eq!(batch.status, TransferStatus::WaitingConfirmations);
+        txn.commit().unwrap();
+    }
+    assert_eq!(
+        wallet
+            .get_asset_metadata(asset.asset_id.clone())
+            .unwrap()
+            .known_circulating_supply,
+        1000,
+        "the supply is read from the bridge contract"
+    );
+
+    // a pending lock leaves the mint initiated, an expired one fails it
+    let pending = wallet
+        .mint_begin_async(
+            INDEXER_URL,
+            Some(evm()),
+            asset.asset_id.clone(),
+            recipient,
+            21,
+            2,
+            1,
+            "rpc://sender.mint.test".to_string(),
+        )
+        .await
+        .expect("second mint begin");
+    let pending_signed = wallet
+        .sign_psbt(pending.psbt.clone(), None)
+        .expect("signing the second mint PSBT");
+    setMockMintLock("pending");
+    let not_found = wallet
+        .mint_end_async(INDEXER_URL, Some(evm()), &pending_signed)
+        .await;
+    assert!(
+        matches!(not_found, Err(Error::MintLockNotFound { .. })),
+        "a pending lock must leave the mint as is, got {not_found:?}"
+    );
+    let pending_txid = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let txid = txn
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .filter(|batch_transfer| !batch_transfer.incoming)
+            .find(|batch_transfer| batch_transfer.status == TransferStatus::Initiated)
+            .and_then(|batch_transfer| batch_transfer.txid)
+            .expect("the pending mint must still be initiated");
+        txn.commit().unwrap();
+        txid
+    };
+    setMockMintLock("expired");
+    setMockMintFinalized(21);
+    let expired = wallet
+        .mint_end_async(INDEXER_URL, Some(evm()), &pending_signed)
+        .await;
+    assert!(
+        matches!(expired, Err(Error::MintLockExpired { .. })),
+        "an expired lock must fail the mint, got {expired:?}"
+    );
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let batch = &txn.get_batch_transfers_by_txid(&pending_txid).unwrap()[0];
+        assert_eq!(
+            batch.status,
+            TransferStatus::Failed,
+            "the failure is committed"
+        );
+        txn.commit().unwrap();
+    }
+    let again = wallet
+        .mint_end_async(INDEXER_URL, Some(evm()), &pending_signed)
+        .await;
+    assert!(
+        matches!(again, Err(Error::CannotEndTransfer { .. })),
+        "a failed mint cannot be ended again, got {again:?}"
+    );
+    let broadcasts = mockMintBroadcastPosts();
+    restoreMockMintNetwork();
+    assert_eq!(
+        broadcasts, 1,
+        "no TX is broadcast for a pending or expired lock"
+    );
+}
+
+/// The TXID of the outgoing batch transfer with the given index.
+#[cfg(feature = "esplora_async")]
+fn begin_txid(wallet: &Wallet, batch_transfer_idx: i32) -> String {
+    let txn = wallet.database().begin_transaction().unwrap();
+    let txid = txn
+        .iter_batch_transfers()
+        .unwrap()
+        .into_iter()
+        .find(|batch_transfer| batch_transfer.idx == batch_transfer_idx)
+        .and_then(|batch_transfer| batch_transfer.txid)
+        .expect("the mint begin must save its operation TXID");
+    txn.commit().unwrap();
+    txid
 }

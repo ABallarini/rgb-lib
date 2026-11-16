@@ -2040,15 +2040,18 @@ impl Wallet {
         info!(self.logger(), "Minting (begin)...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let begin_op_data = self.mint_begin_impl(
+        let evm = NativeMint::new(self);
+        let begin_op_data = drive_native(self.mint_begin_impl(
             &txn,
+            &evm,
             asset_id,
             recipient,
             before_block,
             fee_rate,
             min_confirmations,
             sender_transport_endpoint,
-        )?;
+            HashMap::new(),
+        ))?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Minting (begin) completed");
@@ -2108,7 +2111,8 @@ impl Wallet {
         self.check_online(online)?;
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
-        let res = match self.mint_end_impl(&txn, &psbt) {
+        let evm = NativeMint::new(self);
+        let res = match drive_native(self.mint_end_impl(&txn, &evm, &psbt, None)) {
             Ok(res) => res,
             // the mint has been failed, which needs to be committed
             Err(e @ Error::MintLockExpired { .. }) => {

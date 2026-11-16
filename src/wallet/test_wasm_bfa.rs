@@ -45,6 +45,9 @@ const EXPIRED_AMOUNT: u64 = 300;
 /// Maximum number of blocks after the latest one a received mint may commit to, in the test
 /// config: only carried through, the prefetch never checks it.
 const MAX_MINT_LOCK_BLOCKS: u64 = 100;
+/// Minimum number of blocks after the latest one a mint may commit to, in the test config: only
+/// carried through, the prefetch never checks it.
+const MIN_MINT_LOCK_BLOCKS: u64 = 2;
 
 fn mock_base() -> &'static str {
     MOCK_RPC_URL
@@ -60,6 +63,7 @@ fn rpc_url(query: &str) -> String {
 fn config(query: &str) -> EvmReceiveConfig {
     EvmReceiveConfig {
         rpc_url: rpc_url(query),
+        min_mint_lock_blocks: MIN_MINT_LOCK_BLOCKS,
         max_mint_lock_blocks: MAX_MINT_LOCK_BLOCKS,
     }
 }

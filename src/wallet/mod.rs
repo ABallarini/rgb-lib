@@ -46,6 +46,12 @@ pub(crate) mod receive_wasm;
     target_arch = "wasm32",
     not(feature = "_online")
 ))]
+pub(crate) mod mint_wasm;
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
 pub(crate) mod send_wasm;
 #[cfg(all(
     feature = "esplora_async",
@@ -112,6 +118,13 @@ pub use objects::{
     LinkDetails, MintBeginResult, MintDetails, OnlineOptions, OperationResult, RefreshFilter,
     RefreshResult, RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
 };
+// the mint results are shared by the native online wallet and the browser operations
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
+pub use objects::{MintBeginResult, MintDetails};
 // the burn and link results are shared by the native online wallet and the browser operations
 #[cfg(all(
     feature = "esplora_async",
@@ -129,7 +142,7 @@ pub use online::{RgbWalletOpsOnline, check_indexer_url};
     feature = "_online",
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
-pub(crate) use prepare::{SendTransport, WalletPrepare};
+pub(crate) use prepare::{MintChainConfig, MintTransport, SendTransport, WalletPrepare};
 #[cfg(feature = "_online")]
 pub(crate) use prepare::{
     check_operation_expiration, clock_skew_margin, invoice_expiration_margin,
@@ -185,6 +198,11 @@ pub(crate) use objects::ReceivedConsignmentMeta;
     feature = "_online",
     all(feature = "esplora_async", target_arch = "wasm32")
 ))]
+pub(crate) use objects::SentMint;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots,
     ExtraAllocations, LocalRecipient, LocalRecipientData, LocalWitnessData, MainTransition,
@@ -197,7 +215,7 @@ pub(crate) use objects::{
 };
 #[cfg(feature = "_online")]
 pub(crate) use objects::{
-    CleanAckOutcome, FailTransfersOutcome, OnlineData, RefreshResultTrait, SentMint,
+    CleanAckOutcome, FailTransfersOutcome, OnlineData, RefreshResultTrait,
     TryFailBatchTransferOutcome,
 };
 // receive types shared with the browser driver
@@ -224,10 +242,17 @@ pub(crate) use offline::WalletOffline;
 ))]
 pub(crate) use offline::max_utxo_asset_allocations;
 #[cfg(feature = "_online")]
+pub(crate) use online::NativeMint;
+#[cfg(feature = "_online")]
 pub(crate) use online::WalletOnline;
 // the receive driver is shared by the native and browser paths
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use receive::ReceiveWallet;
 #[cfg(feature = "_online")]
-pub(crate) use receive::{NativeReceiveTransport, ReceiveDriver, ReceiveWallet, drive_native};
+pub(crate) use receive::{NativeReceiveTransport, ReceiveDriver, drive_native};
 
 use super::*;
 
