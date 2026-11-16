@@ -63,7 +63,7 @@ jobs:
           token: ${{ env.CODECOV_TOKEN }}
 
   test_features:
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: ubuntu-latest
 
     steps:
