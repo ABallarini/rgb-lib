@@ -35,7 +35,7 @@ const MAX_CONTROL_BODY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REJECT_LIST_BODY_BYTES: u64 = 1024 * 1024;
 
 /// Proxy client over the browser `fetch` API, the async counterpart of the blocking one.
-#[allow(dead_code)] // only the read-only health check (`new` + `get_info`) uses it until the online flow is wired
+#[allow(dead_code)] // some requests (e.g. the ACK queue) are only used by the native client so far
 pub(crate) struct ProxyFetchClient {
     client: Client,
     base_url: String,

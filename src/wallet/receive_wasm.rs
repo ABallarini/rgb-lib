@@ -14,6 +14,7 @@
 //! `receive.rs`.
 
 use super::indexer_async::{EsploraResolver, EsploraTransport};
+use super::offline::{InvoiceReservation, apply_invoice_reservations};
 use super::receive::{
     PendingReceive, PrefetchQuestions, ReceiveDriver, ReceiveTransport, ReceiveWallet,
     ack_signature, already_handled, broadcast_error, pending_receives, receive_transfer_idx,
@@ -24,7 +25,7 @@ use super::*;
 use crate::api::evm_claims::{EvmReceiveOptions, PrefetchedClaims};
 use crate::api::fetch::ProxyFetchClient;
 use crate::api::jsonrpc::{
-    PostAckResponse, ProxyTransferState, list_transfers_message, map_proxy_error,
+    PostAckResponse, ProxyTransferState, check_server_info, list_transfers_message, map_proxy_error,
 };
 use crate::encryption::sha256_digest;
 use crate::no_wallet::validation::{
@@ -997,6 +998,20 @@ impl Wallet {
                     Err(e @ Error::IO { .. }) => return Err(e),
                     Err(_) => {
                         let txn = self.database().begin_transaction()?;
+                        // record the proxy transfer ID before refusing, as the native download
+                        // does, so a retry finds the transfer this invoice already handled
+                        let mut updated_transfer: DbTransferActMod =
+                            candidate.transfer.clone().into();
+                        updated_transfer.consignment_hash =
+                            ActiveValue::Set(Some(data.consignment_hash.clone()));
+                        updated_transfer.proxy_transfer_id =
+                            ActiveValue::Set(Some(transfer_id.to_string()));
+                        txn.update_transfer(&mut updated_transfer)?;
+                        self.save_sender_transport_endpoint(
+                            &txn,
+                            candidate.transfer.idx,
+                            &data.sender_proxy,
+                        )?;
                         let mut updated: DbBatchTransferActMod = candidate.batch.clone().into();
                         {
                             let empty_lists = PrefetchedRejectLists::default();
@@ -1129,5 +1144,166 @@ impl Wallet {
                 Err(e)
             }
         }
+    }
+}
+
+/// Invoice creation over the browser transport: the shared preparation, the async reservation and
+/// the shared persistence, with no `Online` object and no blocking proxy client.
+impl Wallet {
+    /// Create a blind receive invoice and reserve it on `transport_endpoints` over the browser
+    /// transport, returning the same [`ReceiveData`] the native receive returns.
+    ///
+    /// An empty endpoint list selects the out-of-band exchange, exactly like the native receive:
+    /// the invoice carries no transport endpoints and no proxy is contacted. With endpoints, the
+    /// invoice is reserved on every reachable proxy and the retention deadline of the blind
+    /// allocation is set from the longest grace they advertise, as the native flow does.
+    ///
+    /// Proxy-level authentication keys cannot be configured in the browser, so the reservation is
+    /// sent unsigned; a proxy requiring authentication refuses it with its explicit error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blind_receive_proxy_async(
+        &mut self,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
+        self.receive_proxy_async(
+            RecipientType::Blind,
+            asset_id,
+            assignment,
+            expiration_timestamp,
+            transport_endpoints,
+            min_confirmations,
+            encryption,
+        )
+        .await
+    }
+
+    /// Same as [`Self::blind_receive_proxy_async`], for a witness recipient: a new script instead
+    /// of a colored UTXO, so no allocation and no retention deadline are involved.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn witness_receive_proxy_async(
+        &mut self,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
+        self.receive_proxy_async(
+            RecipientType::Witness,
+            asset_id,
+            assignment,
+            expiration_timestamp,
+            transport_endpoints,
+            min_confirmations,
+            encryption,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn receive_proxy_async(
+        &mut self,
+        recipient_type: RecipientType,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
+        // the invoice is built inside a read transaction, closed before the network wait: the
+        // single-threaded browser must not hold a transaction across a `fetch`
+        let mut receive_data_internal = {
+            let txn = self.database().begin_transaction()?;
+            let prepared = self.prepare_receive_data(
+                &txn,
+                asset_id,
+                assignment,
+                expiration_timestamp as i64,
+                transport_endpoints,
+                recipient_type,
+                encryption,
+            );
+            drop(txn);
+            prepared?
+        };
+        if !receive_data_internal.endpoints.is_empty() {
+            self.reserve_receive_data_async(&mut receive_data_internal)
+                .await?;
+        }
+
+        // only the invoice and its local rows are written once every proxy answered, so a failed
+        // reservation leaves the wallet untouched
+        let txn = self.database().begin_transaction()?;
+        let batch_transfer_idx =
+            self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+
+        Ok(ReceiveData {
+            invoice: receive_data_internal.invoice_string,
+            recipient_id: receive_data_internal.recipient_id,
+            expiration_timestamp: receive_data_internal.expiration_timestamp as u64,
+            batch_transfer_idx,
+            public_key: hex::encode(&receive_data_internal.recipient_pubkey),
+        })
+    }
+
+    /// Reserve the invoice of `receive_data` on its proxy endpoints over `fetch`.
+    async fn reserve_receive_data_async(
+        &self,
+        receive_data: &mut ReceiveDataInternal,
+    ) -> Result<(), Error> {
+        let recipient_pk = hex::encode(&receive_data.recipient_pubkey);
+        let invoice_id = crate::encryption::invoice_id(&receive_data.recipient_id, &recipient_pk);
+        let reservation_expiration = receive_data.expiration_timestamp.to_string();
+        let mut outcomes: Vec<Result<InvoiceReservation, Error>> =
+            Vec::with_capacity(receive_data.endpoints.len());
+        for endpoint in &receive_data.endpoints {
+            // skip endpoints that are unreachable or run an unsupported protocol version
+            let Ok(client) = ProxyFetchClient::new(endpoint) else {
+                outcomes.push(Ok(InvoiceReservation::Unreachable));
+                continue;
+            };
+            let info = match client.get_info().await {
+                Ok(info) => match check_server_info(info) {
+                    Ok(info) => info,
+                    Err(_) => {
+                        outcomes.push(Ok(InvoiceReservation::Unreachable));
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    outcomes.push(Ok(InvoiceReservation::Unreachable));
+                    continue;
+                }
+            };
+            // no host API configures proxy-level authentication keys in the browser, so the
+            // reservation is unsigned like the browser send
+            outcomes.push(
+                match client
+                    .prepare_invoice(&invoice_id, &reservation_expiration, &recipient_pk, None)
+                    .await
+                {
+                    Ok(res) if res.error.is_none() => Ok(InvoiceReservation::Reserved {
+                        retention_grace: crate::utils::proxy_retention_grace(&info),
+                    }),
+                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
+                        // a draining proxy, the invoice can be reserved on the other ones
+                        Error::ProxyDraining => Ok(InvoiceReservation::Draining),
+                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
+                        e => Err(e),
+                    },
+                    Err(_) => Ok(InvoiceReservation::Unreachable),
+                },
+            );
+        }
+        apply_invoice_reservations(receive_data, outcomes)
     }
 }

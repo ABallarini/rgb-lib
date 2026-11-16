@@ -320,10 +320,10 @@ async fn regtest_esplora_online_smoke() {
 ///
 /// Runs only when the Esplora and proxy URLs are set **and** the harness prepared a pending proxy
 /// transfer for the `RGB_REGTEST_MNEMONIC` wallet, named by `RGB_REGTEST_TRANSFER_ID`. Preparing it
-/// needs the native sender flow (the browser cannot reserve a proxy invoice yet): create a
-/// `blindReceive`/`witnessReceive` on a native wallet with these keys, with proxy transport
-/// endpoints, and send to it from another wallet. Without that setup the test returns early, as it
-/// does in the default browser CI job.
+/// still needs a sender, so the harness creates the receive with `blindReceiveProxy` or
+/// `witnessReceiveProxy` (or a native wallet with the same keys), sends to it from another wallet
+/// and hands the transfer ID over. Without that setup the test returns early, as it does in the
+/// default browser CI job.
 #[wasm_bindgen_test]
 #[ignore]
 async fn regtest_proxy_receive_smoke() {

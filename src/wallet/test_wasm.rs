@@ -2594,3 +2594,318 @@ fn begin_txid(wallet: &Wallet, batch_transfer_idx: i32) -> String {
     txn.commit().unwrap();
     txid
 }
+
+// A browser receive invoice is built and reserved over a fake proxy. The proxy answers
+// `server.info` (advertising a retention grace) and `invoice.prepare`, recording the invoice it
+// was asked to reserve. The test then brings a bogus consignment for the reserved invoice: the
+// shared receive must refuse it, which proves the reserved row is the one `receiveTransfer` uses.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let savedFetch = null;
+
+export function installMockReceiveProxy(indexerUrl) {
+    const g = globalThis;
+    if (savedFetch === null) savedFetch = g.fetch;
+    g.__receiveMock = {
+        indexer: indexerUrl,
+        prepareCount: 0,
+        prepared: null,
+        nacks: 0,
+        refusePrepare: false,
+        consignment: false,
+        transferId: '',
+        senderPk: '',
+    };
+    g.fetch = async function (request) {
+        const url = request.url || '';
+        const state = g.__receiveMock;
+        const respond = (body, status) => {
+            const response = new Response(body, { status: status || 200 });
+            Object.defineProperty(response, 'url', { value: url });
+            return response;
+        };
+        if (url.startsWith(state.indexer)) {
+            if (url.includes('/tx/') && url.endsWith('/status')) {
+                return respond(JSON.stringify({
+                    confirmed: false, block_height: null, block_hash: null, block_time: null,
+                }));
+            }
+            if (url.includes('/tx/')) return respond('', 404);
+            return respond('', 200);
+        }
+        let text = '';
+        try { text = await request.clone().text(); } catch (e) {}
+        let body = {};
+        try { body = JSON.parse(text); } catch (e) {}
+        const method = body.method || '';
+        if (method === 'server.info') {
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: {
+                protocol_version: '1.0', version: 'mock', uptime: 0,
+                retention_grace_secs: '3600', max_media: '20',
+            }}));
+        }
+        if (method === 'invoice.prepare') {
+            if (state.refusePrepare) {
+                return respond(JSON.stringify({ jsonrpc: '2.0', id: null, error: {
+                    code: -20, message: 'invoice refused',
+                }}));
+            }
+            state.prepareCount += 1;
+            state.prepared = body.params || null;
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: true }));
+        }
+        if (method === 'consignment.get') {
+            if (!state.consignment) {
+                return respond(JSON.stringify({ jsonrpc: '2.0', id: null, error: {
+                    code: -300, message: 'consignment not found',
+                }}));
+            }
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: {
+                consignment: btoa('not a consignment'),
+                sender_transport_endpoint: 'rpc://proxy.sender.test',
+                sender_pk: state.senderPk,
+                consignment_hash: '00'.repeat(32),
+                batch: false,
+            }}));
+        }
+        if (method === 'ack.post') {
+            if (body.params && body.params.ack === false) state.nacks += 1;
+            return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: {
+                result: true, sender_pk: null, signed_tx: null, signed_tx_hash: null,
+                expires_at: null,
+            }}));
+        }
+        return respond(JSON.stringify({ jsonrpc: '2.0', id: null, result: true }));
+    };
+}
+
+export function setMockRefusePrepare(refuse) {
+    globalThis.__receiveMock.refusePrepare = refuse;
+}
+
+export function setMockReceiveConsignment(transferId, senderPk) {
+    globalThis.__receiveMock.transferId = transferId;
+    globalThis.__receiveMock.senderPk = senderPk;
+    globalThis.__receiveMock.consignment = true;
+}
+
+export function mockPreparedInvoice() {
+    const prepared = globalThis.__receiveMock.prepared;
+    return prepared === null ? '' : JSON.stringify(prepared);
+}
+
+export function mockPrepareCount() {
+    return globalThis.__receiveMock.prepareCount;
+}
+
+export function mockNackCount() {
+    return globalThis.__receiveMock.nacks;
+}
+
+export function restoreMockReceiveProxy() {
+    if (savedFetch !== null) {
+        globalThis.fetch = savedFetch;
+        savedFetch = null;
+    }
+    delete globalThis.__receiveMock;
+}
+"#)]
+extern "C" {
+    fn installMockReceiveProxy(indexer_url: &str);
+    fn setMockRefusePrepare(refuse: bool);
+    fn setMockReceiveConsignment(transfer_id: &str, sender_pk: &str);
+    fn mockPreparedInvoice() -> String;
+    fn mockPrepareCount() -> u32;
+    fn mockNackCount() -> u32;
+    fn restoreMockReceiveProxy();
+}
+
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn proxy_receive_invoice_is_reserved_and_used_by_receive_transfer() {
+    use bdk_wallet::bitcoin::{Amount, TxOut, absolute, transaction};
+
+    const INDEXER_URL: &str = "http://127.0.0.1:3005";
+    const PROXY_URL: &str = "rpc://proxy.recv.test";
+    const SENDER_PK: &str = "abababababababababababababababababababababababababababababababab";
+
+    let (mut wallet, _keys) = memory_wallet();
+    // fund the wallet and issue an IFA asset, so the blind receive has a colored allocation
+    let address = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 0)
+        .address;
+    let funding = BdkTransaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    wallet
+        .bdk_wallet_mut()
+        .apply_unconfirmed_txs([(funding, 0)]);
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        wallet.sync_db_txos_from_bdk(&txn, false).unwrap();
+        txn.commit().unwrap();
+    }
+    let asset = wallet
+        .issue_asset_ifa(
+            "RCV".to_string(),
+            "Receive".to_string(),
+            0,
+            vec![100],
+            vec![],
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("offline issuance");
+
+    installMockReceiveProxy(INDEXER_URL);
+    let expiration = now().unix_timestamp() as u64 + 600;
+    let receive = wallet
+        .blind_receive_proxy_async(
+            Some(asset.asset_id),
+            Assignment::Fungible(10),
+            expiration,
+            vec![PROXY_URL.to_string()],
+            1,
+            None,
+        )
+        .await
+        .expect("blind receive reserved on the fake proxy");
+    assert_eq!(mockPrepareCount(), 1, "the invoice must be reserved once");
+
+    // the proxy was asked to reserve exactly this invoice
+    let prepared: serde_json::Value =
+        serde_json::from_str(&mockPreparedInvoice()).expect("the proxy recorded its params");
+    assert_eq!(
+        prepared["invoice_id"].as_str(),
+        Some(crate::encryption::invoice_id(&receive.recipient_id, &receive.public_key).as_str())
+    );
+    assert_eq!(
+        prepared["expires_at"].as_str(),
+        Some(expiration.to_string().as_str())
+    );
+    assert_eq!(
+        prepared["recipient_pk"].as_str(),
+        Some(receive.public_key.as_str())
+    );
+    assert!(
+        prepared.get("signature").is_none(),
+        "the browser reservation is unsigned"
+    );
+
+    // the receive stored the endpoint and the retention deadline the proxy advertises
+    let txn = wallet.database().begin_transaction().unwrap();
+    let transfer = txn
+        .get_db_data(false)
+        .unwrap()
+        .transfers
+        .into_iter()
+        .find(|transfer| transfer.recipient_id.as_deref() == Some(&receive.recipient_id))
+        .expect("the reserved invoice has a transfer row");
+    let endpoints = txn
+        .get_transfer_transport_endpoints_data(transfer.idx)
+        .unwrap();
+    assert_eq!(endpoints.len(), 1, "one endpoint row");
+    assert_eq!(endpoints[0].0.kind, TransportEndpointKind::RecipientProxy);
+    assert_eq!(endpoints[0].1.endpoint, "http://proxy.recv.test");
+    assert!(!endpoints[0].0.used);
+    let batch = txn
+        .get_db_data(false)
+        .unwrap()
+        .batch_transfers
+        .into_iter()
+        .find(|batch| batch.idx == receive.batch_transfer_idx)
+        .expect("the reserved invoice has a batch transfer");
+    assert_eq!(
+        batch.retention_deadline,
+        Some(expiration as i64 + 3600),
+        "the blind receive keeps the proxy retention grace"
+    );
+    txn.commit().unwrap();
+
+    // a refused reservation leaves the wallet untouched
+    let transfers_before = wallet
+        .database()
+        .begin_transaction()
+        .unwrap()
+        .get_db_data(false)
+        .unwrap()
+        .transfers
+        .len();
+    setMockRefusePrepare(true);
+    let failed = wallet
+        .witness_receive_proxy_async(
+            None,
+            Assignment::Fungible(10),
+            expiration,
+            vec![PROXY_URL.to_string()],
+            1,
+            None,
+        )
+        .await;
+    setMockRefusePrepare(false);
+    assert!(
+        failed.is_err(),
+        "a refused reservation must fail the receive"
+    );
+    assert_eq!(
+        wallet
+            .database()
+            .begin_transaction()
+            .unwrap()
+            .get_db_data(false)
+            .unwrap()
+            .transfers
+            .len(),
+        transfers_before,
+        "a failed reservation must not persist a transfer"
+    );
+
+    // a later receive of a transfer to the reserved invoice goes through the stored row
+    let receive2 = wallet
+        .witness_receive_proxy_async(
+            None,
+            Assignment::Fungible(10),
+            expiration,
+            vec![PROXY_URL.to_string()],
+            1,
+            None,
+        )
+        .await
+        .expect("witness receive reserved on the fake proxy");
+    let transfer_id = crate::encryption::transfer_id(
+        &crate::encryption::invoice_id(&receive2.recipient_id, &receive2.public_key),
+        SENDER_PK,
+    );
+    setMockReceiveConsignment(&transfer_id, SENDER_PK);
+    let received = wallet
+        .receive_transfer_async(PROXY_URL, INDEXER_URL, &transfer_id, None)
+        .await
+        .expect("the reserved invoice receives its transfer");
+    let nacks = mockNackCount();
+    restoreMockReceiveProxy();
+    assert_eq!(
+        received,
+        Some(receive2.batch_transfer_idx),
+        "the reserved receive is the one that handled the transfer"
+    );
+    assert_eq!(nacks, 1, "the bogus consignment must be NACKed");
+
+    let txn = wallet.database().begin_transaction().unwrap();
+    let batch = txn
+        .get_db_data(false)
+        .unwrap()
+        .batch_transfers
+        .into_iter()
+        .find(|batch| batch.idx == receive2.batch_transfer_idx)
+        .expect("the reserved receive is in the database");
+    assert_eq!(batch.status, TransferStatus::Failed);
+    txn.commit().unwrap();
+}

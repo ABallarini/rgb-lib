@@ -892,6 +892,81 @@ impl RgbLibWallet {
         json_result("cannot serialize the receive data", &receive_data)
     }
 
+    /// Create a blind receive invoice with transport endpoints and reserve it on its proxies.
+    ///
+    /// Same arguments and JSON `ReceiveData` as [`RgbLibWallet::blind_receive`], plus
+    /// `transportEndpoints` (at most 3 `rpc://`/`rpcs://` URLs, no duplicates): the invoice is
+    /// reserved on every reachable proxy over `fetch`, and the receive stores the endpoints and,
+    /// for a blind recipient, the retention deadline the proxies advertise, exactly like the
+    /// native flow. An empty list selects the out-of-band exchange instead. Proxy-level
+    /// authentication keys cannot be configured in the browser, so a proxy requiring them refuses
+    /// the reservation with its explicit error.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = blindReceiveProxy)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blind_receive_proxy(
+        &self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .blind_receive_proxy_async(
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    transport_endpoints,
+                    min_confirmations,
+                    encryption,
+                )
+                .await
+                .map_err(|e| failure("cannot create the blind receive", e))?
+        };
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
+    /// Create a witness receive invoice with transport endpoints and reserve it on its proxies.
+    ///
+    /// Same as [`RgbLibWallet::blind_receive_proxy`], but the recipient is a new script and no
+    /// colored UTXO is needed.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = witnessReceiveProxy)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn witness_receive_proxy(
+        &self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .witness_receive_proxy_async(
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    transport_endpoints,
+                    min_confirmations,
+                    encryption,
+                )
+                .await
+                .map_err(|e| failure("cannot create the witness receive", e))?
+        };
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
     /// Issue a NIA asset and return its asset ID.
     ///
     /// Like every RGB issuance, it allocates on an existing colored UTXO, so the wallet must

@@ -89,6 +89,67 @@ pub(crate) fn contract_link(
         })
 }
 
+/// A proxy's answer to an invoice reservation, before the shared decision.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) enum InvoiceReservation {
+    /// The invoice is reserved; the proxy keeps its data for this many seconds past its expiration.
+    Reserved { retention_grace: u32 },
+    /// The proxy is draining and refused the reservation.
+    Draining,
+    /// The proxy was unreachable or does not speak the supported protocol.
+    Unreachable,
+}
+
+/// Turn the per-endpoint reservation outcomes into the result of a receive invoice.
+///
+/// At least one proxy must have reserved the invoice; a draining proxy alone is reported as such,
+/// and a definite proxy-side rejection is returned as it is. Shared by the native blocking
+/// reservation and the browser one, so the retention deadline and the error choice cannot drift.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) fn apply_invoice_reservations(
+    receive_data: &mut ReceiveDataInternal,
+    outcomes: impl IntoIterator<Item = Result<InvoiceReservation, Error>>,
+) -> Result<(), Error> {
+    let mut reserved = false;
+    let mut draining = false;
+    for outcome in outcomes {
+        match outcome? {
+            InvoiceReservation::Reserved { retention_grace } => {
+                reserved = true;
+                // only a blind receive keeps its allocation reserved until the deadline
+                if matches!(
+                    receive_data.recipient_type_full,
+                    RecipientTypeFull::Blind { .. }
+                ) {
+                    let deadline = receive_data
+                        .expiration_timestamp
+                        .saturating_add(i64::from(retention_grace));
+                    receive_data.retention_deadline = Some(std::cmp::max(
+                        receive_data.retention_deadline.unwrap_or(deadline),
+                        deadline,
+                    ));
+                }
+            }
+            InvoiceReservation::Draining => draining = true,
+            InvoiceReservation::Unreachable => {}
+        }
+    }
+    if !reserved {
+        return Err(if draining {
+            Error::ProxyDraining
+        } else {
+            Error::NoValidTransportEndpoint
+        });
+    }
+    Ok(())
+}
+
 pub trait WalletOffline: WalletBackup {
     fn bitcoin_network(&self) -> BitcoinNetwork {
         self.wallet_data().bitcoin_network
@@ -1390,11 +1451,17 @@ pub trait WalletOffline: WalletBackup {
         Ok(endpoints)
     }
 
+    /// Everything a receive invoice needs before it is reserved on any proxy: the validation of
+    /// the endpoints and the expiration, the blind UTXO or witness script, the invoice and the
+    /// per-operation key.
+    ///
+    /// No network access and no database write. The native reservation runs right after this in
+    /// [`Self::create_receive_data`], inside the same transaction; the browser one runs after its
+    /// read transaction is closed, as it cannot hold a transaction across a `fetch`.
     #[allow(clippy::too_many_arguments)]
-    fn create_receive_data(
+    fn prepare_receive_data(
         &mut self,
         txn: &DbTxn,
-        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] online: Option<Online>,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: i64,
@@ -1406,16 +1473,6 @@ pub trait WalletOffline: WalletBackup {
 
         // no need to be online if an out-of-band exchange is requested
         let out_of_band = transport_endpoints.is_empty();
-        #[cfg(not(feature = "_online"))]
-        if !out_of_band {
-            return Err(Error::Offline);
-        }
-        #[cfg(feature = "_online")]
-        if let Some(online) = online {
-            self.check_online(online)?;
-        } else if !out_of_band {
-            return Err(Error::OnlineNeeded);
-        }
 
         let (beneficiary, recipient_type_full, blind_seal, script_pubkey) = match recipient_type {
             RecipientType::Blind => {
@@ -1541,70 +1598,6 @@ pub trait WalletOffline: WalletBackup {
         let invoice = invoice_builder.finish();
         let invoice_string = invoice.to_string();
 
-        // for a blind receive reserved on proxies, the invoice expiration plus the longest retention
-        // grace among them, until which a transfer to the invoice can still be downloaded
-        #[allow(unused_mut)]
-        let mut retention_deadline = None;
-
-        // reserve the invoice on the proxy/proxies; skipped for the out-of-band exchange
-        #[cfg(feature = "_online")]
-        if !out_of_band {
-            let recipient_pk = hex::encode(recipient_vk.to_bytes());
-            let invoice_id = invoice_id(&recipient_id, &recipient_pk);
-            let reservation_expiration = expiration_timestamp.to_string();
-            let mut reserved = false;
-            // whether a proxy refused the reservation as it is draining
-            let mut draining = false;
-            for endpoint in &endpoints {
-                // skip endpoints that are unreachable or run an unsupported protocol version
-                let Ok(info) = check_proxy(endpoint) else {
-                    continue;
-                };
-                let proxy_client = ProxyClient::new(endpoint)?;
-                // only needed by proxies with proxy-level authentication enabled
-                let signature = self.online_data().as_ref().and_then(|online_data| {
-                    online_data.proxy_auth_signature(
-                        endpoint,
-                        &prepare_invoice_auth_message(
-                            &invoice_id,
-                            &reservation_expiration,
-                            &recipient_pk,
-                        ),
-                    )
-                });
-                match proxy_client.prepare_invoice(
-                    &invoice_id,
-                    &reservation_expiration,
-                    &recipient_pk,
-                    signature,
-                ) {
-                    Ok(res) if res.error.is_none() => {
-                        reserved = true;
-                        if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
-                            let deadline = expiration_timestamp
-                                .saturating_add(i64::from(proxy_retention_grace(&info)));
-                            retention_deadline =
-                                Some(max(retention_deadline.unwrap_or(deadline), deadline));
-                        }
-                    }
-                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
-                        // a draining proxy, the invoice can be reserved on the other ones
-                        Error::ProxyDraining => draining = true,
-                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
-                        e => return Err(e),
-                    },
-                    Err(_) => continue,
-                }
-            }
-            if !reserved {
-                return Err(if draining {
-                    Error::ProxyDraining
-                } else {
-                    Error::NoValidTransportEndpoint
-                });
-            }
-        }
-
         Ok(ReceiveDataInternal {
             asset_id,
             detected_assignment,
@@ -1619,8 +1612,109 @@ pub trait WalletOffline: WalletBackup {
             operation_secret_key: recipient_sk.to_bytes().to_vec(),
             recipient_pubkey: recipient_vk.to_bytes().to_vec(),
             encryption,
-            retention_deadline,
+            // set once the invoice is reserved on its proxies
+            retention_deadline: None,
         })
+    }
+
+    /// Create a receive invoice, reserving it on its proxies when it has transport endpoints.
+    ///
+    /// The `online` object is required when transport endpoints are provided, since the recipient
+    /// ID is reserved on their proxies, and can be `None` for the out-of-band exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn create_receive_data(
+        &mut self,
+        txn: &DbTxn,
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] online: Option<Online>,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: i64,
+        transport_endpoints: Vec<String>,
+        recipient_type: RecipientType,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveDataInternal, Error> {
+        // no need to be online if an out-of-band exchange is requested
+        let out_of_band = transport_endpoints.is_empty();
+        #[cfg(not(feature = "_online"))]
+        if !out_of_band {
+            return Err(Error::Offline);
+        }
+        #[cfg(feature = "_online")]
+        if let Some(online) = online {
+            self.check_online(online)?;
+        } else if !out_of_band {
+            return Err(Error::OnlineNeeded);
+        }
+
+        #[allow(unused_mut)]
+        let mut receive_data = self.prepare_receive_data(
+            txn,
+            asset_id,
+            assignment,
+            expiration_timestamp,
+            transport_endpoints,
+            recipient_type,
+            encryption,
+        )?;
+        // reserve the invoice on the proxy/proxies; skipped for the out-of-band exchange
+        #[cfg(feature = "_online")]
+        if !out_of_band {
+            self.reserve_receive_data(&mut receive_data)?;
+        }
+        Ok(receive_data)
+    }
+
+    /// Reserve the invoice of `receive_data` on its proxy endpoints with the native blocking
+    /// client.
+    ///
+    /// The per-endpoint outcomes are turned into the final reservation by
+    /// [`apply_invoice_reservations`], the same decision the browser transport uses.
+    #[cfg(feature = "_online")]
+    fn reserve_receive_data(&self, receive_data: &mut ReceiveDataInternal) -> Result<(), Error> {
+        let recipient_pk = hex::encode(&receive_data.recipient_pubkey);
+        let invoice_id = invoice_id(&receive_data.recipient_id, &recipient_pk);
+        let reservation_expiration = receive_data.expiration_timestamp.to_string();
+        let mut outcomes: Vec<Result<InvoiceReservation, Error>> =
+            Vec::with_capacity(receive_data.endpoints.len());
+        for endpoint in &receive_data.endpoints {
+            // skip endpoints that are unreachable or run an unsupported protocol version
+            let Ok(info) = check_proxy(endpoint) else {
+                outcomes.push(Ok(InvoiceReservation::Unreachable));
+                continue;
+            };
+            let proxy_client = ProxyClient::new(endpoint)?;
+            // only needed by proxies with proxy-level authentication enabled
+            let signature = self.online_data().as_ref().and_then(|online_data| {
+                online_data.proxy_auth_signature(
+                    endpoint,
+                    &prepare_invoice_auth_message(
+                        &invoice_id,
+                        &reservation_expiration,
+                        &recipient_pk,
+                    ),
+                )
+            });
+            outcomes.push(
+                match proxy_client.prepare_invoice(
+                    &invoice_id,
+                    &reservation_expiration,
+                    &recipient_pk,
+                    signature,
+                ) {
+                    Ok(res) if res.error.is_none() => Ok(InvoiceReservation::Reserved {
+                        retention_grace: proxy_retention_grace(&info),
+                    }),
+                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
+                        // a draining proxy, the invoice can be reserved on the other ones
+                        Error::ProxyDraining => Ok(InvoiceReservation::Draining),
+                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
+                        e => Err(e),
+                    },
+                    Err(_) => Ok(InvoiceReservation::Unreachable),
+                },
+            );
+        }
+        apply_invoice_reservations(receive_data, outcomes)
     }
 
     fn store_receive_transfer(
@@ -3523,5 +3617,87 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         txn.commit()?;
         info!(self.logger(), "RGB transfer inspection completed");
         Ok(inspection)
+    }
+}
+
+#[cfg(all(test, feature = "_online"))]
+mod tests {
+    use super::*;
+
+    fn receive_data(recipient_type_full: RecipientTypeFull) -> ReceiveDataInternal {
+        ReceiveDataInternal {
+            asset_id: None,
+            detected_assignment: Assignment::Any,
+            invoice_string: String::new(),
+            recipient_id: String::new(),
+            endpoints: vec![],
+            created_at: 0,
+            expiration_timestamp: 1_000,
+            recipient_type_full,
+            blind_seal: None,
+            script_pubkey: None,
+            operation_secret_key: vec![],
+            recipient_pubkey: vec![],
+            encryption: Encryption::Required,
+            retention_deadline: None,
+        }
+    }
+
+    fn blind() -> RecipientTypeFull {
+        RecipientTypeFull::Blind {
+            unblinded_utxo: Outpoint {
+                txid: "00".repeat(32),
+                vout: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_blind_receive_keeps_the_longest_proxy_retention_grace() {
+        let mut data = receive_data(blind());
+        apply_invoice_reservations(
+            &mut data,
+            [
+                Ok(InvoiceReservation::Reserved {
+                    retention_grace: 10,
+                }),
+                Ok(InvoiceReservation::Unreachable),
+                Ok(InvoiceReservation::Reserved {
+                    retention_grace: 30,
+                }),
+            ],
+        )
+        .expect("a reserved invoice");
+        assert_eq!(data.retention_deadline, Some(1_030));
+    }
+
+    #[test]
+    fn a_witness_receive_has_no_retention_deadline() {
+        let mut data = receive_data(RecipientTypeFull::Witness { vout: None });
+        apply_invoice_reservations(
+            &mut data,
+            [Ok(InvoiceReservation::Reserved {
+                retention_grace: 30,
+            })],
+        )
+        .expect("a reserved invoice");
+        assert_eq!(data.retention_deadline, None);
+    }
+
+    #[test]
+    fn an_unreserved_invoice_reports_a_draining_or_invalid_proxy() {
+        let mut data = receive_data(blind());
+        let draining = apply_invoice_reservations(
+            &mut data,
+            [
+                Ok(InvoiceReservation::Unreachable),
+                Ok(InvoiceReservation::Draining),
+            ],
+        );
+        assert!(matches!(draining, Err(Error::ProxyDraining)));
+
+        let unreachable =
+            apply_invoice_reservations(&mut data, [Ok(InvoiceReservation::Unreachable)]);
+        assert!(matches!(unreachable, Err(Error::NoValidTransportEndpoint)));
     }
 }

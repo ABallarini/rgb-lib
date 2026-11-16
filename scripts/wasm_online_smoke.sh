@@ -18,13 +18,13 @@
 # `RGB_REGTEST_MNEMONIC` and `RGB_REGTEST_TRANSFER_ID` are set: it runs `sync_online_async` and
 # `receive_transfer_async` against a real pending proxy transfer prepared by the harness, asserts
 # the second receive is idempotent, and checks the recorded ACK and the transfer status. Preparing
-# the transfer needs the native sender flow (the browser cannot reserve a proxy invoice yet):
-# create a proxy receive on a native wallet with these keys and send to it. Without that setup the
-# test returns early.
+# the transfer needs a sender: create the proxy receive with `blindReceiveProxy` or
+# `witnessReceiveProxy` (or on a native wallet with these keys) and send to it. Without that setup
+# the test returns early.
 #
-# What is NOT proven: transfers, send, proxy invoice reservation, media upload and hub
-# coordination. Those still live behind the native-only `_online` feature; `esplora_async` does not
-# enable it, and the regression test still asserts that gate.
+# What is NOT proven: transfers, send, media upload and hub coordination. Those still live behind
+# the native-only `_online` feature; `esplora_async` does not enable it, and the regression test
+# still asserts that gate.
 #
 # Controlled environment (a fresh regtest chain has only genesis, so mine first):
 #
