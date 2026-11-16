@@ -79,11 +79,15 @@ fn install_esplora_request_timeout(base: &str, timeout_millis: u32) -> Result<()
 
     let wrapped = js_sys::Reflect::get(&global, &key("__rgbLibEsploraWrapped"))
         .map_err(|_| internal("cannot read the fetch wrapper state"))?;
-    if wrapped.is_truthy() {
-        return Ok(());
-    }
     let inner = js_sys::Reflect::get(&global, &key("fetch"))
         .map_err(|_| internal("cannot read the browser fetch function"))?;
+    // Tests and hosts may replace `fetch`; only skip when the current function is our wrapper.
+    let current_is_wrapper = js_sys::Reflect::get(&inner, &key("__rgbLibEsploraWrapped"))
+        .map(|marker| marker.is_truthy())
+        .unwrap_or(false);
+    if wrapped.is_truthy() && current_is_wrapper {
+        return Ok(());
+    }
     js_sys::Reflect::set(&global, &key("__rgbLibOriginalFetch"), &inner)
         .map_err(|_| internal("cannot store the original fetch function"))?;
 
@@ -114,6 +118,12 @@ fn install_esplora_request_timeout(base: &str, timeout_millis: u32) -> Result<()
         return g.__rgbLibOriginalFetch.call(g, new Request(input, options));
         "#,
     );
+    js_sys::Reflect::set(
+        wrapper.as_ref(),
+        &key("__rgbLibEsploraWrapped"),
+        &JsValue::TRUE,
+    )
+    .map_err(|_| internal("cannot mark the fetch wrapper"))?;
     js_sys::Reflect::set(&global, &key("fetch"), wrapper.as_ref())
         .map_err(|_| internal("cannot install the fetch wrapper"))?;
     js_sys::Reflect::set(&global, &key("__rgbLibEsploraWrapped"), &JsValue::TRUE)
