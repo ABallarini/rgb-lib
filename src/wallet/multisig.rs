@@ -2712,6 +2712,7 @@ impl MultisigWallet {
             burn_reason,
             fee_rate,
             min_confirmations,
+            HashMap::new(),
             true,
         )?;
         let res = self.post_operation(

@@ -1727,6 +1727,7 @@ impl Wallet {
             burn_reason,
             fee_rate,
             min_confirmations,
+            HashMap::new(),
             true,
         )?;
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
@@ -1777,6 +1778,7 @@ impl Wallet {
             burn_reason,
             fee_rate,
             min_confirmations,
+            HashMap::new(),
             dry_run,
         )?;
         if !dry_run {
@@ -1866,6 +1868,7 @@ impl Wallet {
             fee_rate,
             min_confirmations,
             skip_contract_checks,
+            HashMap::new(),
             true,
         )?;
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
@@ -1922,6 +1925,7 @@ impl Wallet {
             fee_rate,
             min_confirmations,
             skip_contract_checks,
+            HashMap::new(),
             dry_run,
         )?;
         if !dry_run {

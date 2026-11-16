@@ -1966,7 +1966,10 @@ pub struct PsbtInspection {
 
 /// The result of a burn begin operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct BurnBeginResult {
     /// PSBT to inspect and sign
@@ -1979,7 +1982,10 @@ pub struct BurnBeginResult {
 
 /// Details for burn operations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct BurnDetails {
     /// Path to the strict-encoded fascia file, for inspection
@@ -1994,7 +2000,10 @@ pub struct BurnDetails {
 
 /// The result of a link begin operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct LinkBeginResult {
     /// PSBT to inspect and sign
@@ -2007,7 +2016,10 @@ pub struct LinkBeginResult {
 
 /// Details for link operations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct LinkDetails {
     /// Path to the strict-encoded fascia file, for inspection
@@ -2125,7 +2137,10 @@ pub struct SendDetails {
 
 /// The result of an operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct OperationResult {
     /// ID of the transaction

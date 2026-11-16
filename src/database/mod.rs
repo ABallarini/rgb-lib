@@ -677,7 +677,10 @@ impl SqliteTxn {
         Ok(())
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn del_colored_reserved_txos_by_outpoints(
         &self,
         outpoints: &[Outpoint],
@@ -2043,7 +2046,10 @@ impl DbTxn {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn del_colored_reserved_txos_by_outpoints(
         &self,
         outpoints: &[Outpoint],

@@ -1862,3 +1862,116 @@ async fn check_proxy_url_async_rejects_an_invalid_endpoint() {
         );
     }
 }
+
+/// A browser burn runs from begin to end: the shared authoring builds and signs the PSBT, the end
+/// broadcasts it over the async Esplora transport (a fake `fetch` stands in for the node) and the
+/// shared end steps apply the TX and record the transfer.
+#[cfg(feature = "esplora_async")]
+#[wasm_bindgen_test]
+async fn burn_begin_and_end_run_over_the_browser_transport() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use bdk_wallet::bitcoin::{Amount, TxOut, absolute, transaction};
+    use js_sys::Reflect;
+
+    const INDEXER_URL: &str = "http://127.0.0.1:3002";
+
+    let (mut wallet, _keys) = memory_wallet();
+    // one real BDK UTXO the PSBT can spend, registered in the wallet DB the way a scan does
+    let address = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 0)
+        .address;
+    let funding = BdkTransaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    let funding_outpoint = Outpoint {
+        txid: funding.compute_txid().to_string(),
+        vout: 0,
+    };
+    wallet
+        .bdk_wallet_mut()
+        .apply_unconfirmed_txs([(funding, 0)]);
+    {
+        let txn = wallet.database().begin_transaction().unwrap();
+        wallet.sync_db_txos_from_bdk(&txn, false).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // an IFA asset is burnable and its genesis declares no reject list, so the begin needs no fetch
+    let asset = wallet
+        .issue_asset_ifa(
+            "BURN".to_string(),
+            "Burn".to_string(),
+            0,
+            vec![100],
+            vec![],
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("offline issuance");
+    let begin = wallet
+        .burn_begin_async(asset.asset_id.clone(), 100, None, 2, 1, None, false)
+        .await
+        .expect("burn begin");
+    let signed = wallet
+        .sign_psbt(begin.psbt.clone(), None)
+        .expect("signing the burn PSBT");
+    assert!(begin.batch_transfer_idx.is_some());
+    // the begin saved the operation, so its TXID is the one the end must broadcast and record
+    let txid = {
+        let txn = wallet.database().begin_transaction().unwrap();
+        let txid = txn
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|batch_transfer| !batch_transfer.incoming)
+            .and_then(|batch_transfer| batch_transfer.txid.clone())
+            .expect("the burn begin must save its operation");
+        txn.commit().unwrap();
+        txid
+    };
+
+    // the fake node answers the only request of the end, the broadcast, with a success
+    let global = js_sys::global();
+    let saved_fetch = Reflect::get(&global, &JsValue::from_str("fetch")).unwrap();
+    let broadcasts = Rc::new(Cell::new(0));
+    let fetch = {
+        let broadcasts = broadcasts.clone();
+        Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |request: JsValue| {
+            broadcasts.set(broadcasts.get() + 1);
+            let url = Reflect::get(&request, &JsValue::from_str("url"))
+                .ok()
+                .and_then(|url| url.as_string())
+                .unwrap_or_default();
+            assert!(url.ends_with("/tx"), "unexpected request to {url}");
+            js_sys::Promise::resolve(&mock_response("", INDEXER_URL))
+        })
+    };
+    Reflect::set(&global, &JsValue::from_str("fetch"), fetch.as_ref()).unwrap();
+
+    let res = wallet.burn_end_async(INDEXER_URL, &signed).await;
+    Reflect::set(&global, &JsValue::from_str("fetch"), &saved_fetch).unwrap();
+    let res = res.expect("burn end");
+    assert_eq!(broadcasts.get(), 1, "the burn must be broadcast once");
+    assert_eq!(res.txid, txid);
+
+    let txn = wallet.database().begin_transaction().unwrap();
+    let batch = &txn.get_batch_transfers_by_txid(&txid).unwrap()[0];
+    assert_eq!(batch.status, TransferStatus::WaitingConfirmations);
+    let input = txn
+        .get_txo(&funding_outpoint)
+        .unwrap()
+        .expect("the spent TXO must be known");
+    assert!(input.spent, "the burn input must be marked spent");
+    txn.commit().unwrap();
+}

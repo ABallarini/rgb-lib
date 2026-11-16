@@ -1015,6 +1015,110 @@ impl RgbLibWallet {
             .map_err(|e| failure("cannot finalize the PSBT", e))
     }
 
+    /// Prepare the PSBT to burn `amount` of an RGB asset, returning it with its details as JSON.
+    ///
+    /// `evm` has the shape [`RgbLibWallet::receive_transfer`] takes and is needed only for a BFA
+    /// asset, whose reject list lives on an EVM chain. `dryRun` skips persisting the operation.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = burnBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn burn_begin(
+        &self,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .burn_begin_async(
+                asset_id,
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+                evm,
+                dry_run,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the burn", e))?;
+        drop(wallet);
+        json_result("cannot serialize the burn begin result", &res)
+    }
+
+    /// Burn the signed `signedPsbt`, broadcasting it over `indexerUrl`, and return the result JSON.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = burnEnd)]
+    pub async fn burn_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+    ) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .burn_end_async(&indexer_url, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the burn", e))?;
+        drop(wallet);
+        json_result("cannot serialize the burn result", &res)
+    }
+
+    /// Prepare the PSBT to link an RGB asset to `linkedToContract`, returning it with its details.
+    ///
+    /// `evm` and `dryRun` are as in [`RgbLibWallet::burn_begin`]; `skipContractChecks` skips the
+    /// checks the wallet can make on its own data.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = linkBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_begin(
+        &self,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+        dry_run: bool,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .link_begin_async(
+                asset_id,
+                linked_to_contract,
+                fee_rate,
+                min_confirmations,
+                skip_contract_checks,
+                evm,
+                dry_run,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the link", e))?;
+        drop(wallet);
+        json_result("cannot serialize the link begin result", &res)
+    }
+
+    /// Link the signed `signedPsbt`, broadcasting it over `indexerUrl`, and return the result JSON.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = linkEnd)]
+    pub async fn link_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+    ) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .link_end_async(&indexer_url, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the link", e))?;
+        drop(wallet);
+        json_result("cannot serialize the link result", &res)
+    }
+
     /// Delete eligible failed transfers and return whether any was deleted.
     ///
     /// With `batch_transfer_idx` it operates on that batch transfer only; without it, all failed

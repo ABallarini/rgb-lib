@@ -71,7 +71,21 @@ async fn prefetch_reject_lists(
     let Some(source) = genesis_reject_list_source(asset_schema, consignment.genesis())? else {
         return Ok(PrefetchedRejectLists { lists });
     };
-    match &source {
+    let reject_list = fetch_reject_list(wallet, &source, evm).await?;
+    lists.insert(source, reject_list);
+    Ok(PrefetchedRejectLists { lists })
+}
+
+/// Read one reject list over the browser transports: the URL it is served at, or the EVM contract
+/// keeping it, which needs the configuration of the chain it lives on.
+///
+/// Shared with the burn and link begin, which prefetch the list of their asset the same way.
+pub(super) async fn fetch_reject_list(
+    wallet: &Wallet,
+    source: &RejectListSource,
+    evm: Option<&EvmReceiveOptions>,
+) -> Result<RejectList, Error> {
+    Ok(match source {
         RejectListSource::Url(url) => {
             let client = ProxyFetchClient::new(url)?;
             let list = client.get_reject_list().await?;
@@ -82,7 +96,7 @@ async fn prefetch_reject_lists(
                     "Ignoring {invalid} invalid opout(s) in reject list"
                 );
             }
-            lists.insert(source, reject_list);
+            reject_list
         }
         RejectListSource::Evm(contract) => {
             let config =
@@ -90,11 +104,9 @@ async fn prefetch_reject_lists(
                     .ok_or(Error::NoEvmRpcUrl {
                         chain_id: contract.chain_id,
                     })?;
-            let reject_list = PrefetchedClaims::fetch_reject_list(config, contract).await?;
-            lists.insert(source, reject_list);
+            PrefetchedClaims::fetch_reject_list(config, contract).await?
         }
-    }
-    Ok(PrefetchedRejectLists { lists })
+    })
 }
 
 /// The claims the consignment's deterministic validation leaves to confirm, read before the
@@ -307,24 +319,36 @@ impl<W: WalletOffline + ?Sized> ReceiveTransport for WasmReceiveTransport<'_, W>
     }
 
     async fn broadcast(&self, tx: BdkTransaction) -> Result<(), Error> {
-        let txid = tx.compute_txid().to_string();
-        let indexer = EsploraTransport::new(self.indexer_url)?;
-        match indexer.broadcast(&tx).await {
-            Ok(()) => {
-                debug!(self.wallet.logger(), "Broadcasted TX with ID '{}'", txid);
-                Ok(())
+        broadcast_tx_async(self.wallet, self.indexer_url, &tx).await
+    }
+}
+
+/// Broadcast a signed TX over the async Esplora transport, mapping the node's refusal exactly like
+/// the native indexer does.
+///
+/// Shared with the burn and link end, which broadcast their own signed TX the same way.
+pub(super) async fn broadcast_tx_async<W: WalletOffline + ?Sized>(
+    wallet: &W,
+    indexer_url: &str,
+    tx: &BdkTransaction,
+) -> Result<(), Error> {
+    let txid = tx.compute_txid().to_string();
+    let indexer = EsploraTransport::new(indexer_url)?;
+    match indexer.broadcast(tx).await {
+        Ok(()) => {
+            debug!(wallet.logger(), "Broadcasted TX with ID '{}'", txid);
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(err) = broadcast_error(&txid, &e) {
+                return Err(err);
             }
-            Err(e) => {
-                if let Some(err) = broadcast_error(&txid, &e) {
-                    return Err(err);
-                }
-                if indexer.get_tx_confirmations(&txid).await?.is_none() {
-                    return Err(Error::FailedBroadcast {
-                        details: e.to_string(),
-                    });
-                }
-                Ok(())
+            if indexer.get_tx_confirmations(&txid).await?.is_none() {
+                return Err(Error::FailedBroadcast {
+                    details: e.to_string(),
+                });
             }
+            Ok(())
         }
     }
 }

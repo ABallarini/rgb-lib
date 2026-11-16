@@ -110,7 +110,7 @@ pub trait WalletPrepare: WalletOffline {
     }
 
     fn check_fee_rate(&self, fee_rate: u64) -> Result<FeeRate, Error> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "_online"))]
         if skip_check_fee_rate() {
             return Ok(FeeRate::from_sat_per_vb(fee_rate).unwrap());
         };
@@ -125,6 +125,92 @@ pub trait WalletPrepare: WalletOffline {
             });
         };
         Ok(fee_rate)
+    }
+
+    /// Apply to the local state a signed TX that has just been broadcast, so that its outputs show
+    /// up without a sync and its inputs are spent: BDK, the DB TXOs and the reservations.
+    ///
+    /// Split from the broadcast itself (the native blocking indexer, the async transport on wasm),
+    /// so that both transports end an operation here, in the same order.
+    fn apply_broadcasted_tx(&mut self, txn: &DbTxn, tx: &BdkTransaction) -> Result<(), Error> {
+        // apply the broadcast TX into BDK directly so its outputs are immediately visible
+        // (revealed change SPKs match without needing a wallet sync)
+        let seen_at = now().unix_timestamp() as u64;
+        self.bdk_wallet_mut()
+            .apply_unconfirmed_txs([(tx.clone(), seen_at)]);
+        // the TX is on the network now and the enclosing transaction may still fail or take a
+        // while to commit: keep a copy on disk so a crash cannot lose it
+        self.flush_bdk_pending()?;
+
+        // promote any newly-known colored UTXOs (e.g. the change output) from
+        // exists=false to exists=true in the rgb_lib DB
+        let pending_witness_scripts = self.reconcile_pending_witness(txn)?;
+        self.update_db_colored_txos_from_bdk(txn, false, &pending_witness_scripts)?;
+
+        let input_outpoints: Vec<Outpoint> = tx
+            .input
+            .iter()
+            .map(|i| Outpoint::from(i.previous_output))
+            .collect();
+        for outpoint in &input_outpoints {
+            if let Some(db_txo) = txn.get_txo(outpoint)? {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(true);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        // the inputs are spent now, release the reservations of the pending transfer
+        txn.del_colored_reserved_txos_by_outpoints(&input_outpoints)?;
+
+        Ok(())
+    }
+
+    /// The local half of ending an operation, once its signed TX has been broadcast: the broadcast
+    /// TX is applied (see [`Self::apply_broadcasted_tx`]), the fascia is consumed and the transfer
+    /// data is saved or updated. The network call stays with the caller, so the native blocking
+    /// indexer and the browser transport share this step.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_transfer_end_after_broadcast(
+        &mut self,
+        txn: &DbTxn,
+        txid: String,
+        tx: &BdkTransaction,
+        psbt: &Psbt,
+        info_contents: &InfoBatchTransfer,
+        status: TransferStatus,
+        consignment_hashes: &HashMap<String, String>,
+        fascia: Fascia,
+        sync_tte_used: bool,
+    ) -> Result<i32, Error> {
+        self.apply_broadcasted_tx(txn, tx)?;
+        let mut stock = self.rgb_stock(txn)?;
+        stock.consume_fascia(fascia, None)?;
+        self.update_or_save_transfers(
+            txn,
+            txid,
+            info_contents,
+            status,
+            consignment_hashes,
+            sync_tte_used,
+            psbt,
+        )
+    }
+
+    /// Check that the operation of the given signed PSBT can still be ended. An operation saved by
+    /// a non-dry-run begin is ended (e.g. again, retried after a crash) only while it's still
+    /// initiated: one that has failed or progressed must not be broadcast again nor have its
+    /// status brought back.
+    fn check_end_initiated(&self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<(), Error> {
+        let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+        if let Some(existing) = txn
+            .get_batch_transfers_by_txid(&txid)?
+            .into_iter()
+            .find(|batch_transfer| !batch_transfer.incoming)
+            && existing.status != TransferStatus::Initiated
+        {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+        Ok(())
     }
 
     fn reserve_colored_txos(
@@ -915,7 +1001,7 @@ pub trait WalletPrepare: WalletOffline {
                         .iter()
                         .map(|r| r.assignment.main_amount())
                         .sum::<u64>();
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "_online"))]
                     if let Some(kept) = mock_mint_kept_amount() {
                         asset_transition_builder = asset_transition_builder.add_owned_state_raw(
                             OS_ASSET,
@@ -937,9 +1023,9 @@ pub trait WalletPrepare: WalletOffline {
             // create it from nothing
             if asset_transition_builder.has_inputs() {
                 let transition = asset_transition_builder.complete_transition()?;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "_online"))]
                 let transition = mock_spam_recipient_assignments(transition);
-                #[cfg(test)]
+                #[cfg(all(test, feature = "_online"))]
                 mock_spam_hidden_spends(psbt, &transition);
                 if matches!(transfer_info.main_transition, MainTransition::Mint { .. }) {
                     opid = Some(transition.id().to_string());
@@ -1071,7 +1157,7 @@ pub trait WalletPrepare: WalletOffline {
             )?;
             let should_build_dag = reject_list_source.is_some();
 
-            #[cfg(test)]
+            #[cfg(all(test, feature = "_online"))]
             let should_build_dag = if skip_build_dag() {
                 false
             } else {
@@ -1544,9 +1630,9 @@ pub trait WalletPrepare: WalletOffline {
             .collect();
         unspents.retain(|u| !reserved.contains(&u.utxo.outpoint()));
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "_online"))]
         let input_unspents = mock_input_unspents(self, &unspents);
-        #[cfg(not(test))]
+        #[cfg(not(all(test, feature = "_online")))]
         let input_unspents = self.get_input_unspents(&unspents)?;
 
         let stock = self.rgb_stock(txn)?;
@@ -1788,11 +1874,11 @@ pub trait WalletPrepare: WalletOffline {
         sender_transport_endpoint: Option<String>,
         operation_secret_key: Option<Vec<u8>>,
         stock: &mut RgbStock<'_>,
+        mut reject_lists: HashMap<RejectListSource, RejectList>,
         dry_run: bool,
     ) -> Result<BeginOperationData, Error> {
         let asset_id = transfer_info.asset_info.contract_id.to_string();
         let mut rejected = HashSet::new();
-        let mut reject_lists = HashMap::new();
         let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
         loop {
             match self.prepare_transfer_psbt(
@@ -2247,6 +2333,268 @@ pub trait WalletPrepare: WalletOffline {
         Ok(idx)
     }
 
+    /// Prepare the PSBT of an operation that pays no one (a burn or a link), spending the
+    /// `assignments_needed` of `asset` with the `main_transition`.
+    ///
+    /// The operation assigns nothing to anyone, so it gets no recipient output and records no
+    /// recipient: a random ID names its transfer directory until the TXID replaces it, and the
+    /// transfer row recording the operation is saved on its own.
+    ///
+    /// `reject_lists` carries the lists the caller already resolved: the browser resolves them
+    /// before its transaction opens, as it cannot fetch while one is.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_without_recipient_impl(
+        &mut self,
+        txn: &DbTxn,
+        asset: DbAsset,
+        assignments_needed: AssignmentsCollection,
+        main_transition: MainTransition,
+        fee_rate: u64,
+        min_confirmations: u8,
+        reject_lists: HashMap<RejectListSource, RejectList>,
+        dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        let (fee_rate_checked, unspents, input_unspents, mut stock) =
+            self.get_transfer_begin_data(txn, fee_rate)?;
+
+        let asset_spend = self.select_rgb_inputs(
+            asset.id.clone(),
+            &assignments_needed,
+            input_unspents.clone(),
+            &mut SelectedInputs::default(),
+            Self::max_input_allocations(&main_transition.transition_type()),
+        )?;
+
+        let contract_id = ContractId::from_str(&asset.id).expect("invalid contract ID");
+        let asset_info = AssetInfo {
+            contract_id,
+            schema: asset.schema,
+            reject_list_url: asset.reject_list_url,
+        };
+        let transfer_info = InfoAssetTransfer {
+            asset_info,
+            recipients: vec![],
+            asset_spend,
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: assignments_needed.clone(),
+            assignments_needed,
+            assignments_spent: HashMap::new(),
+            change_destinations: vec![],
+            main_transition,
+            beneficiaries_blinded: vec![],
+            beneficiaries_witness: vec![],
+        };
+        // the operation has no recipient, so there's no recipient ID to name its transfer
+        // directory: a random one keeps concurrent operations apart until the TXID replaces it
+        let dir_id = rand::rng().random_range(0..u64::MAX).to_string();
+        let transfer_dir = self.setup_transfer_directory(vec![dir_id])?;
+
+        self.prepare_single_asset_psbt(
+            txn,
+            transfer_info,
+            transfer_dir,
+            unspents,
+            &input_unspents,
+            &vec![],
+            fee_rate_checked,
+            min_confirmations,
+            None,
+            None,
+            &mut stock,
+            reject_lists,
+            dry_run,
+        )
+    }
+
+    /// Prepare the PSBT to burn the given `amount` of the asset `asset_id`, checking the burn is
+    /// supported by its schema and the reason is well-formed.
+    #[allow(clippy::too_many_arguments)]
+    fn burn_begin_impl(
+        &mut self,
+        txn: &DbTxn,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        reject_lists: HashMap<RejectListSource, RejectList>,
+        dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        let asset = txn.check_asset_exists(asset_id)?;
+        let schema = asset.schema;
+        self.check_schema_support(&schema)?;
+        if !schema.supports_burn() {
+            return Err(Error::UnsupportedBurn {
+                asset_schema: schema,
+            });
+        }
+
+        if amount == 0 {
+            return Err(Error::NoBurnAmount);
+        }
+
+        let burn_reason = burn_reason
+            .map(|reason| self.check_burn_reason(reason))
+            .transpose()?;
+
+        let assignments_needed = AssignmentsCollection {
+            fungible: amount,
+            ..Default::default()
+        };
+        self.begin_without_recipient_impl(
+            txn,
+            asset,
+            assignments_needed,
+            MainTransition::Burn { burn_reason },
+            fee_rate,
+            min_confirmations,
+            reject_lists,
+            dry_run,
+        )
+    }
+
+    /// Prepare the PSBT to link the asset `asset_id` to `linked_to_contract`, checking the link is
+    /// supported by its schema and the contract it points to, unless `skip_contract_checks` is
+    /// set.
+    #[allow(clippy::too_many_arguments)]
+    fn link_begin_impl(
+        &mut self,
+        txn: &DbTxn,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+        reject_lists: HashMap<RejectListSource, RejectList>,
+        dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        let asset = txn.check_asset_exists(asset_id)?;
+        let schema = asset.schema;
+        self.check_schema_support(&schema)?;
+        if !schema.supports_link() {
+            return Err(Error::UnsupportedLink {
+                asset_schema: schema,
+            });
+        }
+
+        let linked_to_contract =
+            ContractId::from_str(&linked_to_contract).map_err(|_| Error::InvalidContractId {
+                contract_id: linked_to_contract,
+            })?;
+        // the link right can be spent only once, linking the asset to itself would waste it
+        if linked_to_contract.to_string() == asset.id {
+            return Err(Error::CannotLinkToItself);
+        }
+        if !skip_contract_checks {
+            self.check_linked_to_contract(txn, &linked_to_contract, &asset.id)?;
+        }
+
+        let assignments_needed = AssignmentsCollection {
+            link: true,
+            ..Default::default()
+        };
+        self.begin_without_recipient_impl(
+            txn,
+            asset,
+            assignments_needed,
+            MainTransition::Link { linked_to_contract },
+            fee_rate,
+            min_confirmations,
+            reject_lists,
+            dry_run,
+        )
+    }
+
+    /// Everything ending an operation that pays no one (a burn or a link) produces before its
+    /// signed TX reaches the network: the checks, the witness TX in the transfer data and the
+    /// consignment proving the operation.
+    fn prepare_without_recipient_end(
+        &self,
+        txn: &DbTxn,
+        signed_psbt: &Psbt,
+        main_transition: TypeOfTransition,
+    ) -> Result<WithoutRecipientEnd, Error> {
+        self.check_end_initiated(txn, signed_psbt)?;
+        let (txid, transfer_dir, info_contents, mut fascia) =
+            self.get_transfer_end_data(signed_psbt)?;
+
+        // the data must be of this operation: another one would be completed skipping its checks
+        // and steps
+        if !info_contents.is_operation(&main_transition) {
+            return Err(Error::WrongOperation { txid });
+        }
+
+        // embed the signed transaction, then generate the consignment proving the operation
+        let tx = signed_psbt
+            .clone()
+            .extract_tx()
+            .map_err(InternalError::from)?;
+        fascia.update_witness_tx(tx);
+        self.gen_consignments(txn, &fascia, &info_contents.transfers, &transfer_dir)?;
+        let consignment_hashes = self.consignment_hashes(&transfer_dir, &info_contents)?;
+
+        Ok(WithoutRecipientEnd {
+            txid,
+            info_contents,
+            consignment_hashes,
+            fascia,
+        })
+    }
+
+    /// Complete an operation that pays no one (a burn or a link) once its signed TX has been
+    /// broadcast, recording the transfer and the contract a link points to.
+    fn finalize_without_recipient_end(
+        &mut self,
+        txn: &DbTxn,
+        signed_psbt: &Psbt,
+        end: WithoutRecipientEnd,
+        tx: &BdkTransaction,
+    ) -> Result<(OperationResult, InfoBatchTransfer), Error> {
+        let WithoutRecipientEnd {
+            txid,
+            info_contents,
+            consignment_hashes,
+            fascia,
+        } = end;
+        let batch_transfer_idx = self.finalize_transfer_end_after_broadcast(
+            txn,
+            txid.clone(),
+            tx,
+            signed_psbt,
+            &info_contents,
+            TransferStatus::WaitingConfirmations,
+            &consignment_hashes,
+            fascia,
+            false,
+        )?;
+        self.record_link_contract(txn, &info_contents)?;
+
+        let res = OperationResult {
+            txid,
+            batch_transfer_idx,
+            entropy: info_contents.entropy,
+        };
+        Ok((res, info_contents))
+    }
+
+    /// Record the contract each link transition of `info_contents` points to on its asset: the link
+    /// transition assigns nothing, so no consignment of a later operation carries it and the link
+    /// is known only to this wallet, once broadcast.
+    fn record_link_contract(
+        &self,
+        txn: &DbTxn,
+        info_contents: &InfoBatchTransfer,
+    ) -> Result<(), Error> {
+        for (asset_id, transfer_info) in &info_contents.transfers {
+            if let MainTransition::Link { linked_to_contract } = transfer_info.main_transition {
+                let mut asset: DbAssetActMod = txn.check_asset_exists(asset_id.clone())?.into();
+                asset.linked_to_contract = ActiveValue::Set(Some(linked_to_contract.to_string()));
+                txn.update_asset(&mut asset)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The index of the TXO at `outpoint`, syncing the wallet first if it's not known yet.
     fn get_or_sync_txo_idx(&mut self, txn: &DbTxn, outpoint: &Outpoint) -> Result<i32, Error> {
         Ok(match txn.get_txo(outpoint)? {
@@ -2259,4 +2607,18 @@ pub trait WalletPrepare: WalletOffline {
             }
         })
     }
+}
+
+/// What ending an operation that pays no one (a burn or a link) produces before its signed TX is
+/// broadcast (see [`WalletPrepare::prepare_without_recipient_end`]): the network step stays with
+/// the transport, the rest is shared.
+pub struct WithoutRecipientEnd {
+    /// ID of the TX anchoring the operation
+    pub(crate) txid: String,
+    /// The transfer data of the operation, updated with the TX of the witness
+    pub(crate) info_contents: InfoBatchTransfer,
+    /// SHA-256 hash of the consignment generated for each asset of the operation
+    pub(crate) consignment_hashes: HashMap<String, String>,
+    /// The fascia of the operation, to consume once the TX is broadcast
+    pub(crate) fascia: Fascia,
 }

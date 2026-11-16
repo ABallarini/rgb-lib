@@ -198,7 +198,10 @@ impl AssetSchema {
     }
 
     /// Whether the schema supports burning.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn supports_burn(&self) -> bool {
         match self {
             Self::Bfa | Self::Ifa => true,
