@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use super::*;
 
 /// Maximum size, in bytes, of a reject list line: the allow prefix (`!`), the opout

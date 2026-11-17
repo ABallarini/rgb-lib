@@ -2,6 +2,11 @@
 //!
 //! This module defines the methods of the [`Wallet`] structure.
 
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use super::receive::ReceiveWallet;
 use super::*;
 
 /// Keys for the singlesig wallet.
@@ -113,9 +118,51 @@ impl WalletCore for Wallet {
     }
 }
 
-impl WalletBackup for Wallet {}
+impl WalletBackup for Wallet {
+    #[cfg(target_arch = "wasm32")]
+    fn backup_bytes_impl(&self, password: &str) -> Result<Vec<u8>, Error> {
+        let snapshot = self.snapshot()?.ok_or_else(|| Error::Internal {
+            details: "the wallet runs without a snapshot-capable backend".to_string(),
+        })?;
+        crate::wallet::backup::wasm_backup_bytes(
+            &self.keys.master_fingerprint,
+            snapshot,
+            password,
+            self.logger(),
+        )
+    }
+}
 
 impl WalletOffline for Wallet {}
+
+// the shared receive driver runs on the singlesig wallet, with the defaults its trait provides
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+impl ReceiveWallet for Wallet {
+    // A browser mint receive is accepted when the caller supplies the EVM configuration: the
+    // prefetch turns a missing endpoint into `NoEvmRpcUrl` before the transaction opens, so
+    // reaching the driver without one is impossible.
+}
+
+#[cfg(feature = "_online")]
+impl WalletPrepare for Wallet {
+    fn resolve_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        self.reject_list_resolver().get_reject_list(source)
+    }
+
+    fn sync_colored_fast(&mut self, txn: &DbTxn) -> Result<(), Error> {
+        self.sync_wallet(
+            txn,
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FastSync,
+            },
+            true,
+        )
+    }
+}
 
 #[cfg(feature = "_online")]
 impl WalletOnline for Wallet {
@@ -200,6 +247,36 @@ impl Wallet {
     /// Create a new RGB singlesig wallet based on the provided [`WalletData`] and
     /// [`SinglesigKeys`].
     pub fn new(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
+        Self::new_with_database(wallet_data, keys, None)
+    }
+
+    /// Create a new RGB singlesig wallet over the in-memory backend.
+    ///
+    /// Unlike [`Wallet::new`], which opens the target's default backend (SQLite natively), this
+    /// always builds the wallet over the in-memory backend, which the host persists itself. It is
+    /// the construction path for a host that has no filesystem or SQLite driver, such as a
+    /// `wasm32` binding: the wallet owns the backend for its whole lifetime, and the host makes the
+    /// state durable with [`Wallet::snapshot`] followed by
+    /// `wallet::persistence::save_snapshot`, or with `Wallet::flush` on `wasm32`.
+    /// `Wallet::from_snapshot` rebuilds the wallet from those bytes.
+    ///
+    /// `wallet_data` is validated the same way as in [`Wallet::new`]; the in-memory backend has no
+    /// directory to create, so its `data_dir` is unused.
+    ///
+    /// Only available where the in-memory backend exists: on `wasm32`, without the `sqlite`
+    /// feature, and in tests.
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
+    pub fn new_in_memory(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
+        Self::new_with_database(wallet_data, keys, Some(RgbLibDatabase::new_memory()))
+    }
+
+    // on wasm the in-memory database is single-threaded, so its `Arc` is intentional
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+    pub(crate) fn new_with_database(
+        wallet_data: WalletData,
+        keys: SinglesigKeys,
+        database: Option<RgbLibDatabase>,
+    ) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
 
         // wallet keys
@@ -208,16 +285,19 @@ impl Wallet {
         // wallet directory and file logging setup
         let (wallet_dir, logger, _logger_guard) =
             setup_new_wallet(&wallet_data, &keys.master_fingerprint)?;
+        // one adapter per wallet, rooted exactly at the wallet directory
+        let files = default_files(wallet_dir.clone());
 
         // reject settings the wallet wasn't created with before any of them reaches the database
-        WalletManifest::check_settings_unchanged(&wallet_dir, &wallet_data, &keys)?;
+        WalletManifest::check_settings_unchanged(&*files, &wallet_dir, &wallet_data, &keys)?;
 
         // setup rgb-lib DB
-        let database = setup_db(&wallet_dir)?;
+        let database = setup_db_with_backend(&wallet_dir, database)?;
 
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(
             &database,
+            &*files,
             &wallet_dir,
             descs.colored.clone(),
             descs.vanilla.clone(),
@@ -225,7 +305,7 @@ impl Wallet {
         )?;
 
         // migrate any legacy filesystem RGB data into the DB (one-time, no-op otherwise)
-        migrate_rgb_fs_to_db(&wallet_dir, &database)?;
+        migrate_rgb_fs_to_db(&*files, &wallet_dir, &database)?;
 
         // keep the signing keys outside the BDK wallet
         let signers = if watch_only {
@@ -258,8 +338,17 @@ impl Wallet {
             &logger,
         )?;
 
-        // persist the settings needed to load the wallet back
-        WalletManifest::new(&wallet_data, &keys).write(&wallet_dir)?;
+        // persist the settings needed to load the wallet back: the manifest file natively, and the
+        // in-memory backend on wasm so a snapshot can carry it
+        let manifest = WalletManifest::new(&wallet_data, &keys);
+        manifest.write(&*files)?;
+        #[cfg(any(test, target_arch = "wasm32"))]
+        if let Some(backend) = database.memory_backend() {
+            let json = serde_json::to_string(&manifest).map_err(|e| Error::Internal {
+                details: format!("cannot serialize the wallet manifest: {e}"),
+            })?;
+            backend.set_wallet_manifest(json);
+        }
 
         info!(logger, "New wallet completed");
         Ok(Self {
@@ -267,8 +356,10 @@ impl Wallet {
                 wallet_data,
                 logger,
                 _logger_guard,
+                #[allow(clippy::arc_with_non_send_sync)]
                 database: Arc::new(database),
                 wallet_dir,
+                files,
                 bdk_wallet,
                 bdk_pending: Arc::new(Mutex::new(ChangeSet::default())),
                 #[cfg(feature = "_online")]
@@ -277,6 +368,146 @@ impl Wallet {
             keys,
             signers,
         })
+    }
+
+    /// Create an encrypted backup of the wallet and return its bytes.
+    ///
+    /// No filesystem is touched, so this works on every target. The archive and encryption format
+    /// is the one of [`backup`](crate::wallet::RgbWalletOpsOffline::backup): an outer ZIP with the
+    /// public scrypt parameters and nonce next to the XChaCha20Poly1305-encrypted wallet state.
+    /// The password is used only to derive the key and is never stored.
+    pub fn backup_bytes(&self, password: &str) -> Result<Vec<u8>, Error> {
+        <Self as WalletBackup>::backup_bytes(self, password)
+    }
+
+    /// Serialize the wallet state when the wallet runs over the in-memory backend.
+    ///
+    /// Returns `Some` only for wallets constructed over the in-memory backend and `None` for
+    /// SQLite wallets, which persist themselves. The bytes are an envelope carrying the wallet
+    /// manifest (non-secret settings, never the mnemonic), the browser files when the adapter keeps
+    /// them in memory, and then the memory-backend snapshot;
+    /// `Wallet::from_snapshot` validates the manifest against the supplied settings before
+    /// rebuilding the wallet. Writing the returned bytes somewhere durable
+    /// (for example IndexedDB) is up to the host: on wasm32 use
+    /// `persistence::save_snapshot` on an explicit
+    /// flush boundary. Two overlapping writes for one wallet id are serialized by IndexedDB and the
+    /// last committed write wins.
+    pub fn snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        #[cfg(any(test, target_arch = "wasm32"))]
+        if let Some(bytes) = self.memory_snapshot()? {
+            return Ok(Some(bytes));
+        }
+        self.internals.database.snapshot()
+    }
+
+    /// Build the wallet snapshot envelope over the in-memory backend.
+    ///
+    /// Returns `None` when the wallet does not run over the memory backend, so SQLite wallets keep
+    /// returning `None` from [`Wallet::snapshot`].
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn memory_snapshot(&self) -> Result<Option<Vec<u8>>, Error> {
+        let Some(backend) = self.internals.database.memory_backend() else {
+            return Ok(None);
+        };
+        let manifest_json = backend.wallet_manifest().ok_or_else(|| Error::Internal {
+            details: "the wallet manifest is missing from the in-memory backend".to_string(),
+        })?;
+        let manifest: WalletManifest =
+            serde_json::from_str(&manifest_json).map_err(|e| Error::Internal {
+                details: format!("cannot deserialize the stored wallet manifest: {e}"),
+            })?;
+        let db_snapshot = self
+            .internals
+            .database
+            .snapshot()?
+            .ok_or_else(|| Error::Internal {
+                details: "the in-memory backend produced no database snapshot".to_string(),
+            })?;
+        let files = self.internals.files.snapshot_state();
+        crate::wallet::core::encode_wasm_snapshot(Some(&manifest), files.as_ref(), &db_snapshot)
+            .map(Some)
+    }
+
+    /// Flush the current wallet state to the browser's durable storage.
+    ///
+    /// This is the only durable-write boundary for a wasm wallet: the in-memory backend keeps
+    /// every change in memory until this call, which serializes the wallet with [`Wallet::snapshot`]
+    /// and delegates the write to
+    /// [`persistence::save_snapshot_record`](crate::wallet::persistence::save_snapshot_record).
+    /// The record is written only when the stored sequence does not exceed `expected_sequence`, so
+    /// a stale instance cannot overwrite a newer snapshot. The future resolves once the IndexedDB
+    /// transaction commits and returns the new sequence to pass to the next call.
+    ///
+    /// Pass the writer id and sequence this instance last loaded or wrote (`0` for a wallet with no
+    /// record yet). A rejected stale write names the stored sequence and its writer; the instance
+    /// must reload instead of retrying. An error leaves the in-memory state unchanged, so the
+    /// wallet stays usable.
+    ///
+    /// Native builds expose no `flush`: their SQLite backend writes every change itself, so a
+    /// native flush would be a no-op.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn flush(
+        &self,
+        wallet_id: &str,
+        writer: &str,
+        expected_sequence: u64,
+    ) -> Result<u64, Error> {
+        let bytes = self.snapshot()?.ok_or_else(|| Error::Internal {
+            details: "a wasm memory wallet must produce a snapshot".to_string(),
+        })?;
+        crate::wallet::persistence::save_snapshot_record(
+            wallet_id,
+            &bytes,
+            writer,
+            expected_sequence,
+        )
+        .await
+    }
+
+    /// Rebuild a wallet from the bytes returned by [`Wallet::snapshot`], over the in-memory
+    /// backend.
+    ///
+    /// The snapshot carries the wallet manifest, so the settings the wallet was created with are
+    /// validated against `wallet_data` and `keys` before the database is rebuilt; a mismatch
+    /// returns [`Error::WalletSettingMismatch`] and the raw database snapshot is not the accepted
+    /// input format. The schemas the snapshot was created with are taken from the manifest rather
+    /// than from `wallet_data`, so a wallet whose code gained a schema keeps restoring the
+    /// snapshots it wrote before; `allow_reckless_schemas` still comes from the caller, so a
+    /// mainnet wallet only operates non-mainnet-safe schemas when it explicitly opts in. The
+    /// browser files stored in the snapshot are restored into the wallet's adapter before it is
+    /// returned, so the caller sees the files the flushed wallet had.
+    ///
+    /// Constructors are synchronous, so the host restores the snapshot asynchronously with
+    /// [`persistence::load_snapshot`](crate::wallet::persistence::load_snapshot) and then calls
+    /// this. The host owns the durable flush with
+    /// `Wallet::flush`(crate::wallet::Wallet::flush), passing the writer id and the sequence it
+    /// last loaded or wrote.
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub fn from_snapshot(
+        snapshot: &[u8],
+        wallet_data: WalletData,
+        keys: SinglesigKeys,
+    ) -> Result<Self, Error> {
+        let (manifest, files, db_snapshot) = crate::wallet::core::decode_wasm_snapshot(snapshot)?;
+        let manifest = manifest.ok_or_else(|| Error::Internal {
+            details: "the wallet snapshot carries no wallet manifest".to_string(),
+        })?;
+        // the schemas are part of the state the snapshot carries: a wallet updated to support more
+        // of them must not reject the snapshots it wrote before, and the restored wallet keeps the
+        // set its database was built with
+        let wallet_data = WalletData {
+            supported_schemas: manifest.supported_schemas.clone(),
+            ..wallet_data
+        };
+        manifest.check_unchanged(&wallet_data, &keys)?;
+        let database = RgbLibDatabase::new_memory_from_snapshot(&db_snapshot)?;
+        // construction stores the manifest back into the backend, so the restored wallet can be
+        // flushed again
+        let wallet = Self::new_with_database(wallet_data, keys, Some(database))?;
+        // the blobs travel in the snapshot, so the adapter is filled in before the wallet is handed
+        // back: a restored wallet sees exactly the files the flushed one had
+        wallet.internals.files.restore_snapshot_state(files);
+        Ok(wallet)
     }
 
     /// Load an existing RGB singlesig wallet, identified by its master fingerprint, from the
@@ -298,7 +529,9 @@ impl Wallet {
             return Err(Error::InexistentDataDir);
         }
         let wallet_dir = fs::canonicalize(data_dir_path)?.join(master_fingerprint);
-        let manifest = WalletManifest::read(&wallet_dir)?;
+        // the adapter is built before the wallet so the manifest is read through it; `new` then
+        // builds the wallet's own adapter at the same directory
+        let manifest = WalletManifest::read(&*default_files(wallet_dir.clone()), &wallet_dir)?;
         // a manifest reached via a renamed wallet directory would make `new` set up a second,
         // unrelated wallet at the fingerprint the manifest names
         if manifest.master_fingerprint != master_fingerprint {
@@ -1037,7 +1270,7 @@ impl Wallet {
         self.check_xprv()?;
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let mut begin_op_data = self.send_begin_impl(
+        let mut begin_op_data = drive_native(self.send_begin_impl(
             &txn,
             recipient_map,
             donation,
@@ -1046,9 +1279,10 @@ impl Wallet {
             Some(expiration_timestamp as i64),
             sender_transport_endpoint,
             true,
-        )?;
+            HashMap::new(),
+        ))?;
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
-        let res = self.send_end_impl(&txn, &begin_op_data.psbt)?;
+        let res = drive_native(self.send_end_impl(&txn, &begin_op_data.psbt, None))?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Send completed");
@@ -1130,7 +1364,7 @@ impl Wallet {
         info!(self.logger(), "Sending (begin) to: {:?}...", recipient_map);
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let begin_op_data = self.send_begin_impl(
+        let begin_op_data = drive_native(self.send_begin_impl(
             &txn,
             recipient_map,
             donation,
@@ -1139,7 +1373,8 @@ impl Wallet {
             Some(expiration_timestamp as i64),
             sender_transport_endpoint,
             dry_run,
-        )?;
+            HashMap::new(),
+        ))?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }
@@ -1179,7 +1414,7 @@ impl Wallet {
         self.check_online(online)?;
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
-        let res = self.send_end_impl(&txn, &psbt)?;
+        let res = drive_native(self.send_end_impl(&txn, &psbt, None))?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Send (end) completed");
@@ -1494,6 +1729,7 @@ impl Wallet {
             burn_reason,
             fee_rate,
             min_confirmations,
+            HashMap::new(),
             true,
         )?;
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
@@ -1544,6 +1780,7 @@ impl Wallet {
             burn_reason,
             fee_rate,
             min_confirmations,
+            HashMap::new(),
             dry_run,
         )?;
         if !dry_run {
@@ -1633,6 +1870,7 @@ impl Wallet {
             fee_rate,
             min_confirmations,
             skip_contract_checks,
+            HashMap::new(),
             true,
         )?;
         self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
@@ -1689,6 +1927,7 @@ impl Wallet {
             fee_rate,
             min_confirmations,
             skip_contract_checks,
+            HashMap::new(),
             dry_run,
         )?;
         if !dry_run {
@@ -1801,15 +2040,18 @@ impl Wallet {
         info!(self.logger(), "Minting (begin)...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let begin_op_data = self.mint_begin_impl(
+        let evm = NativeMint::new(self);
+        let begin_op_data = drive_native(self.mint_begin_impl(
             &txn,
+            &evm,
             asset_id,
             recipient,
             before_block,
             fee_rate,
             min_confirmations,
             sender_transport_endpoint,
-        )?;
+            HashMap::new(),
+        ))?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Minting (begin) completed");
@@ -1869,7 +2111,8 @@ impl Wallet {
         self.check_online(online)?;
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
-        let res = match self.mint_end_impl(&txn, &psbt) {
+        let evm = NativeMint::new(self);
+        let res = match drive_native(self.mint_end_impl(&txn, &evm, &psbt, None)) {
             Ok(res) => res,
             // the mint has been failed, which needs to be committed
             Err(e @ Error::MintLockExpired { .. }) => {

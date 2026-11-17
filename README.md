@@ -46,6 +46,8 @@ error is returned in case discrepancies are detected.
 ## Language bindings
 Bindings for other languages are available. Check the [bindings] directory.
 
+The browser (WASM) package, its build commands, API and current limitations are documented in [docs/wasm.md](docs/wasm.md).
+
 ## Tests
 In order to run the available tests, execute:
 ```sh

@@ -143,35 +143,12 @@ fn fail() {
     // restore with wrong version
     let target_dir_path = restore_dir("wrong_version");
     let target_dir = target_dir_path.to_str().unwrap();
-    let backup_parent = backup_file_path.parent().unwrap().to_path_buf();
-    let files = get_backup_paths(&backup_parent).unwrap();
-    std::fs::create_dir_all(target_dir).unwrap();
-    let (logger, _logger_guard) =
-        setup_logger(Path::new(&target_dir), Some("restore_bad_version")).unwrap();
-    unzip(
-        &backup_file_path,
-        &PathBuf::from(files.tempdir.path()),
-        &logger,
-    )
-    .unwrap();
-    let json_pub_data = fs::read_to_string(&files.backup_pub_data).unwrap();
-    let mut backup_pub_data: BackupPubData = serde_json::from_str(json_pub_data.as_str()).unwrap();
     let wrong_ver = 0;
-    backup_pub_data.version = wrong_ver;
-    fs::write(
-        &files.backup_pub_data,
-        serde_json::to_string(&backup_pub_data).unwrap(),
-    )
-    .unwrap();
+    let original = fs::read(&backup_file_path).unwrap();
+    let wrong_version = rewrite_backup_version(&original, wrong_ver).unwrap();
     let backup_file_wrong_ver_path = data_dir.sub_path("test_backup_fail.rgb-lib_backup.wrong_ver");
     let backup_file_wrong_ver = backup_file_wrong_ver_path.to_str().unwrap();
-    zip_dir(
-        &PathBuf::from(files.tempdir.path()),
-        &PathBuf::from(backup_file_wrong_ver),
-        false,
-        &logger,
-    )
-    .unwrap();
+    fs::write(backup_file_wrong_ver, &wrong_version).unwrap();
     let result = restore_backup(backup_file_wrong_ver, PASSWORD, target_dir);
     assert!(
         matches!(result, Err(Error::UnsupportedBackupVersion { version: v }) if v == wrong_ver.to_string())
@@ -337,4 +314,46 @@ fn backup_info() {
     // backup not required for new wallets
     let backup_required = wallet.backup_info().unwrap();
     assert!(!backup_required);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[parallel]
+fn byte_backup_round_trip() {
+    let data_dir = PrivateDataDir::new();
+    let wallet = data_dir.wallet(true, None);
+    let fingerprint = wallet.get_keys().master_fingerprint;
+
+    // cheap params keep the test fast; the restore reads them from the archive
+    let params = ScryptParams::new(Some(4), Some(1), Some(1));
+
+    // the native file wrapper writes exactly the bytes of the shared byte core
+    let backup_file_path = data_dir.sub_path("test_backup_bytes.rgb-lib_backup");
+    let backup_file = backup_file_path.to_str().unwrap();
+    let written = wallet
+        .write_backup_file(backup_file, PASSWORD, Some(params))
+        .unwrap();
+    assert_eq!(fs::read(backup_file).unwrap(), written);
+
+    // the public byte API decrypts without a file and restores the same wallet layout
+    let bytes = wallet.backup_bytes(PASSWORD).unwrap();
+    let info = backup_info_bytes(&bytes).unwrap();
+    assert_eq!(info.version, 1);
+    let restored = restore_backup_bytes(&bytes, PASSWORD).unwrap();
+    assert_eq!(restored.fingerprint(), fingerprint);
+    assert!(
+        restored
+            .entries
+            .iter()
+            .any(|entry| entry.path.ends_with("wallet_manifest.json"))
+    );
+    assert!(matches!(
+        restore_backup_bytes(&bytes, "wrong password"),
+        Err(Error::WrongPassword)
+    ));
+
+    // the file backup and the byte backup carry the same archive
+    let from_file = restore_backup_bytes(&fs::read(backup_file).unwrap(), PASSWORD).unwrap();
+    assert_eq!(from_file.fingerprint, restored.fingerprint);
+    assert_eq!(from_file.entries.len(), restored.entries.len());
 }

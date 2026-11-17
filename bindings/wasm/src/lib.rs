@@ -1,0 +1,2033 @@
+//! `wasm-bindgen` API for the [`rgb-lib`] wallet, for browsers and other JavaScript runtimes
+//! with no filesystem and no SQLite driver.
+//!
+//! The bindings are a thin shell: every wallet operation is the shared `rgb-lib` implementation,
+//! built over the in-memory backend with [`Wallet::new_in_memory`] and restored with
+//! [`Wallet::from_snapshot`]. There is no copied wallet logic here.
+//!
+//! # Lifecycle
+//!
+//! * [`RgbLibWallet::create`] builds a fresh wallet; [`RgbLibWallet::restore`] rebuilds one from
+//!   the bytes of [`RgbLibWallet::snapshot`]. [`RgbLibWallet::load`] does the same asynchronously,
+//!   reading the snapshot from IndexedDB first.
+//! * [`RgbLibWallet::snapshot`] serializes the whole state (database, BDK data and browser blobs,
+//!   never the mnemonic) into bytes the host can store wherever it wants.
+//! * [`RgbLibWallet::flush`] is the durable-write boundary: it stores those bytes in IndexedDB
+//!   (database `rgb-lib`, store `snapshots`, keyed by the wallet name) and resolves once the
+//!   transaction commits. The write carries this instance's writer id and snapshot sequence, so a
+//!   stale instance is rejected instead of overwriting a newer snapshot; `load` adopts the stored
+//!   writer and sequence, while the synchronous `restore` starts a fresh writer at sequence `0`.
+//!   Only available where IndexedDB exists, i.e. in a browser.
+//! * [`RgbLibWallet::delete_snapshot`] removes that record and detaches the instance: it refuses a
+//!   name other than the wallet's own, and every later `flush` fails instead of recreating the
+//!   deleted snapshot, so the host must `load` a new instance to start over.
+//!
+//! `name` is the durable key: two wallets created with the same name share one snapshot entry, so
+//! keep it stable per wallet. The wallet identity itself is the master fingerprint returned by
+//! [`RgbLibWallet::id`].
+//!
+//! # Secrets
+//!
+//! The mnemonic is only used to derive the keys: it is not stored in the snapshot and no error
+//! returned here echoes it. Errors carry the failing operation and the `rgb-lib` message, which
+//! describes settings and state, never key material.
+
+use std::cell::{Cell, RefCell, RefMut};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+
+use rgb_lib::{
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error,
+    keys::{
+        Keys, WitnessVersion, generate_keys as core_generate_keys,
+        restore_keys as core_restore_keys,
+    },
+    no_wallet::validate_consignment_offchain as core_validate_consignment_offchain,
+    wallet::{
+        AssetFilter, DatabaseType, EvmReceiveConfig, EvmReceiveOptions, Invoice as CoreInvoice,
+        MultisigKeys, MultisigWallet, Recipient, RgbWalletOpsOffline, SinglesigKeys, TransferScope,
+        Wallet, WalletData, backup_info_bytes as core_backup_info_bytes,
+        persistence::{
+            delete_snapshot as core_delete_snapshot, load_snapshot_record, new_writer_id,
+            save_snapshot_record,
+        },
+        restore_backup_bytes as core_restore_backup_bytes,
+    },
+};
+
+#[cfg(target_arch = "wasm32")]
+use rgb_lib::wallet::rust_only::check_proxy_url_async as core_check_proxy_url_async;
+
+/// `rgb-lib` default: allocations allowed per UTXO.
+const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
+
+/// Settings of a browser wallet, over the in-memory backend.
+///
+/// Only the schemas the network allows are listed: IFA is inflatable and BFA is bridged from an EVM
+/// chain, and neither is allowed on mainnet. `allow_reckless_schemas` stays off, so a mainnet wallet
+/// never silently supports a schema it has to refuse.
+fn wallet_data(network: BitcoinNetwork) -> WalletData {
+    let supported_schemas = match network {
+        BitcoinNetwork::Mainnet => vec![AssetSchema::Nia, AssetSchema::Uda, AssetSchema::Cfa],
+        _ => vec![
+            AssetSchema::Nia,
+            AssetSchema::Uda,
+            AssetSchema::Cfa,
+            AssetSchema::Ifa,
+            AssetSchema::Bfa,
+        ],
+    };
+    WalletData {
+        // no filesystem on the host: the wallet data lives in memory and travels in snapshots
+        data_dir: String::new(),
+        bitcoin_network: network,
+        // the only `DatabaseType` value; an injected in-memory backend ignores it
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+        supported_schemas,
+        allow_reckless_schemas: false,
+    }
+}
+
+fn parse_network(network: &str) -> Result<BitcoinNetwork, JsValue> {
+    network.parse().map_err(|_| {
+        JsValue::from_str(&format!(
+            "unsupported bitcoin network '{network}': use mainnet, testnet, testnet4, regtest or signet"
+        ))
+    })
+}
+
+/// Derive the signing keys from a mnemonic.
+///
+/// The reason is deliberately opaque: the underlying parser can echo a word of the phrase, so it
+/// never reaches the caller.
+fn taproot_keys(network: BitcoinNetwork, mnemonic: &str) -> Result<Keys, JsValue> {
+    core_restore_keys(network, mnemonic.to_string(), WitnessVersion::Taproot)
+        .map_err(|_| JsValue::from_str("invalid mnemonic phrase for the given network"))
+}
+
+fn derived_keys(network: BitcoinNetwork, mnemonic: &str) -> Result<SinglesigKeys, JsValue> {
+    Ok(SinglesigKeys::from_keys(
+        &taproot_keys(network, mnemonic)?,
+        None,
+    ))
+}
+
+/// Parse the public keys of a watch-only wallet, in the `rgb-lib` [`SinglesigKeys`] JSON shape.
+///
+/// A mnemonic is refused instead of dropped: a watch-only wallet must not carry signing keys.
+fn watch_only_keys(keys: &str) -> Result<SinglesigKeys, JsValue> {
+    let keys: SinglesigKeys = serde_json::from_str(keys)
+        .map_err(|e| JsValue::from_str(&format!("cannot parse the wallet keys: {e}")))?;
+    if keys.mnemonic.is_some() {
+        return Err(JsValue::from_str(
+            "watch-only keys must not contain a mnemonic",
+        ));
+    }
+    Ok(keys)
+}
+
+fn multisig_keys(keys: &str) -> Result<MultisigKeys, JsValue> {
+    serde_json::from_str(keys)
+        .map_err(|e| JsValue::from_str(&format!("cannot parse the multisig keys: {e}")))
+}
+
+fn failure(context: &str, e: Error) -> JsValue {
+    JsValue::from_str(&format!("{context}: {e}"))
+}
+
+/// One EVM endpoint, as the host passes it.
+#[derive(Deserialize)]
+struct EvmConfigArg {
+    #[serde(alias = "rpc_url")]
+    rpc_url: String,
+    /// Minimum blocks after the latest one a mint may commit to; only used by `mintBegin`.
+    #[serde(default, alias = "min_mint_lock_blocks")]
+    min_mint_lock_blocks: u64,
+    #[serde(alias = "max_mint_lock_blocks")]
+    max_mint_lock_blocks: u64,
+}
+
+impl From<EvmConfigArg> for EvmReceiveConfig {
+    fn from(arg: EvmConfigArg) -> Self {
+        Self {
+            rpc_url: arg.rpc_url,
+            min_mint_lock_blocks: arg.min_mint_lock_blocks,
+            max_mint_lock_blocks: arg.max_mint_lock_blocks,
+        }
+    }
+}
+
+/// The `evm` argument: one endpoint for every chain, or one per chain ID.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EvmArg {
+    Single(EvmConfigArg),
+    ByChain(HashMap<String, EvmConfigArg>),
+}
+
+/// Parse the optional EVM configuration of a receive.
+///
+/// A value that is not an object (or a chain-ID map of objects) throws a sanitized error; no
+/// endpoint is ever echoed back.
+fn parse_evm(evm: Option<JsValue>) -> Result<Option<EvmReceiveOptions>, JsValue> {
+    let Some(evm) = evm else {
+        return Ok(None);
+    };
+    if evm.is_undefined() || evm.is_null() {
+        return Ok(None);
+    }
+    let json = js_sys::JSON::stringify(&evm)
+        .map_err(|_| JsValue::from_str("cannot read the EVM configuration"))?
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("cannot read the EVM configuration"))?;
+    let arg: EvmArg = serde_json::from_str(&json)
+        .map_err(|e| JsValue::from_str(&format!("cannot parse the EVM configuration: {e}")))?;
+    match arg {
+        EvmArg::Single(config) => Ok(Some(EvmReceiveOptions::single(config.into()))),
+        EvmArg::ByChain(by_chain) => {
+            let mut chains = HashMap::with_capacity(by_chain.len());
+            for (chain_id, config) in by_chain {
+                let chain_id: u64 = chain_id.parse().map_err(|_| {
+                    JsValue::from_str(&format!(
+                        "invalid EVM chain ID '{chain_id}': use an unsigned decimal number"
+                    ))
+                })?;
+                chains.insert(chain_id, config.into());
+            }
+            Ok(Some(EvmReceiveOptions::by_chain(chains)))
+        }
+    }
+}
+
+/// The error of a call that starts while another call still holds the wallet.
+const WALLET_BUSY: &str = "the wallet is busy with another operation";
+
+fn wallet_busy() -> JsValue {
+    JsValue::from_str(WALLET_BUSY)
+}
+
+/// Take exclusive access to a wallet slot for the duration of one operation.
+///
+/// JavaScript can start a second call while an async one is suspended at an await, so a plain
+/// `borrow_mut` would panic there: the non-panicking `try_borrow_mut` returns the busy error
+/// instead.
+fn try_borrow_wallet<T>(slot: &RefCell<Option<T>>) -> Result<RefMut<'_, T>, JsValue> {
+    let slot = slot.try_borrow_mut().map_err(|_| wallet_busy())?;
+    RefMut::filter_map(slot, Option::as_mut).map_err(|_| wallet_busy())
+}
+
+/// Parse an RGB assignment from the core serde shape: `{"Fungible":1000}`, `"NonFungible"`,
+/// `{"InflationRight":1000}` or `"Any"`.
+fn parse_assignment(assignment: &str) -> Result<Assignment, JsValue> {
+    serde_json::from_str(assignment).map_err(|e| {
+        JsValue::from_str(&format!(
+            "cannot parse the assignment: {e}; use the core shape, e.g. {{\"Fungible\":1000}} or \"Any\""
+        ))
+    })
+}
+
+/// Parse the `sendBegin` recipient map from JSON, in the core serde shape: asset ID to a list of
+/// [`Recipient`] objects (`recipient_id`, `assignment`, `transport_endpoints`, `public_key`,
+/// `encryption`, `expiration_timestamp`, optional `witness_data`).
+fn parse_recipients(recipients: &str) -> Result<HashMap<String, Vec<Recipient>>, JsValue> {
+    let map: HashMap<String, Vec<Recipient>> = serde_json::from_str(recipients).map_err(|e| {
+        JsValue::from_str(&format!(
+            "cannot parse the send recipients: {e}; use a map from asset ID to the core recipient list"
+        ))
+    })?;
+    if map.is_empty() || map.values().any(|recipients| recipients.is_empty()) {
+        return Err(JsValue::from_str(
+            "the send recipients must map each asset ID to at least one recipient",
+        ));
+    }
+    Ok(map)
+}
+
+/// Parse the `mintBegin` recipient from JSON, in the core [`Recipient`] serde shape.
+fn parse_recipient(recipient: &str) -> Result<Recipient, JsValue> {
+    serde_json::from_str(recipient).map_err(|e| {
+        JsValue::from_str(&format!(
+            "cannot parse the mint recipient: {e}; use the core recipient object"
+        ))
+    })
+}
+
+/// Parse an optional encryption preference: `required`, `unsupported` or `optional`.
+fn parse_encryption(encryption: Option<String>) -> Result<Option<Encryption>, JsValue> {
+    let Some(encryption) = encryption else {
+        return Ok(None);
+    };
+    let encryption = match encryption.to_ascii_lowercase().as_str() {
+        "required" => Encryption::Required,
+        "unsupported" => Encryption::Unsupported,
+        "optional" => Encryption::Optional,
+        _ => {
+            return Err(JsValue::from_str(
+                "unsupported encryption: use required, unsupported or optional",
+            ));
+        }
+    };
+    Ok(Some(encryption))
+}
+
+/// Serialize an `rgb-lib` object for the host.
+///
+/// The JSON uses the `rgb-lib` serde field names (`snake_case`); the bindings do not rename them.
+fn json_result<T: Serialize>(context: &str, value: &T) -> Result<String, JsValue> {
+    serde_json::to_string(value).map_err(|e| JsValue::from_str(&format!("{context}: {e}")))
+}
+
+/// Generate a fresh Taproot key set for `network` and return it as JSON.
+///
+/// The JSON is the `rgb-lib` [`Keys`] shape (`snake_case`): mnemonic, master xpub, account xpubs for
+/// the vanilla and colored sides, master fingerprint and witness version. The phrase is secret and
+/// the host must store it itself; no error returned here echoes it.
+#[wasm_bindgen(js_name = generateKeys)]
+pub fn generate_keys(network: String) -> Result<String, JsValue> {
+    let network = parse_network(&network)?;
+    let keys = core_generate_keys(network, WitnessVersion::Taproot);
+    json_result("cannot serialize the wallet keys", &keys)
+}
+
+/// Recreate the Taproot key set of `mnemonic` for `network` and return it as JSON.
+///
+/// The JSON is the `rgb-lib` [`Keys`] shape; an invalid phrase is an error with a fixed sanitized
+/// message.
+#[wasm_bindgen(js_name = restoreKeys)]
+pub fn restore_keys(network: String, mnemonic: String) -> Result<String, JsValue> {
+    let network = parse_network(&network)?;
+    let keys = taproot_keys(network, &mnemonic)?;
+    json_result("cannot serialize the wallet keys", &keys)
+}
+
+/// Validate a transfer consignment using the witness data bundled in it, before its witness
+/// transaction is broadcast.
+///
+/// `consignment_bytes` is a `Uint8Array` of the raw strict-encoded consignment (not armored, not
+/// base64), `txid` the witness transaction ID and `network` the Bitcoin network to check it
+/// against. Returns JSON: `{"valid", "warnings"?, "error"?, "details"?}` where `error` is one of
+/// `invalid`, `resolver`, `external_anchors` or `unexpected`. Invalid consignment bytes and an
+/// invalid TXID throw. A valid result does not prove the witness transaction has been broadcast.
+#[wasm_bindgen(js_name = validateConsignmentOffchain)]
+pub fn validate_consignment_offchain(
+    consignment_bytes: Vec<u8>,
+    txid: String,
+    network: String,
+) -> Result<String, JsValue> {
+    let network = parse_network(&network)?;
+    let result = core_validate_consignment_offchain(&consignment_bytes, &txid, network)
+        .map_err(|e| failure("cannot validate the consignment", e))?;
+    json_result("cannot serialize the consignment validation", &result)
+}
+
+/// Return the public metadata of an encrypted backup as JSON.
+///
+/// It reads the archive only: no password is needed and no secret is returned. The JSON carries
+/// the backup `version` and the `scrypt_params` its key was derived with.
+#[wasm_bindgen(js_name = backupInfo)]
+pub fn backup_info(backup_bytes: Vec<u8>) -> Result<String, JsValue> {
+    let info = core_backup_info_bytes(&backup_bytes)
+        .map_err(|e| failure("cannot read the backup info", e))?;
+    json_result("cannot serialize the backup info", &info)
+}
+
+/// Check that the proxy at `url` speaks the supported protocol version.
+///
+/// Async and read-only: validates an RGB transport endpoint (`rpc://host` or `rpcs://host`) with
+/// the shared parser, performs the proxy's `server.info` request over browser `fetch` and resolves
+/// to `true` when the reported protocol version matches. An invalid URL, an unreachable proxy or an
+/// unsupported protocol version throws a sanitized error; no write is ever sent.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = checkProxyUrl)]
+pub async fn check_proxy_url(url: String) -> Result<bool, JsValue> {
+    core_check_proxy_url_async(&url)
+        .await
+        .map_err(|e| failure("cannot check the proxy URL", e))
+}
+
+/// An RGB invoice parsed from a string.
+#[wasm_bindgen]
+pub struct WasmInvoice {
+    invoice: CoreInvoice,
+}
+
+#[wasm_bindgen]
+impl WasmInvoice {
+    /// Parse an RGB invoice for `network`.
+    ///
+    /// The network is checked against the one encoded in the invoice: a mismatch is an error, never
+    /// a silently re-interpreted invoice. Invalid input throws a sanitized error.
+    pub fn parse(invoice: String, network: String) -> Result<WasmInvoice, JsValue> {
+        let network = parse_network(&network)?;
+        let invoice =
+            CoreInvoice::new(invoice).map_err(|e| failure("cannot parse the invoice", e))?;
+        let invoice_network = invoice.invoice_data().network;
+        if invoice_network != network {
+            return Err(JsValue::from_str(&format!(
+                "the invoice is for {invoice_network:?}, not for the given network {network:?}"
+            )));
+        }
+        Ok(Self { invoice })
+    }
+
+    /// Return the parsed invoice data as JSON, in the core `InvoiceData` shape.
+    #[wasm_bindgen(js_name = invoiceData)]
+    pub fn invoice_data(&self) -> Result<String, JsValue> {
+        json_result(
+            "cannot serialize the invoice data",
+            &self.invoice.invoice_data(),
+        )
+    }
+
+    /// Return the invoice string the data was parsed from.
+    #[wasm_bindgen(js_name = invoiceString)]
+    pub fn invoice_string(&self) -> String {
+        self.invoice.invoice_string()
+    }
+}
+
+/// A `rgb-lib` singlesig wallet over the in-memory backend.
+#[wasm_bindgen]
+pub struct RgbLibWallet {
+    /// Held for the whole of one call, so a second overlapping call gets the busy error.
+    wallet: Rc<RefCell<Option<Wallet>>>,
+    name: String,
+    /// This instance's id in the snapshot record; a flush writes it next to the bytes.
+    writer: String,
+    /// Sequence this instance last saw or wrote; a guarded flush needs it to match the store.
+    sequence: Cell<u64>,
+    /// Set once this instance deleted its own snapshot: a later flush must not resurrect it.
+    detached: Cell<bool>,
+}
+
+impl RgbLibWallet {
+    /// Take the wallet for one operation; a call made while another holds it gets the busy error.
+    fn borrow_wallet(&self) -> Result<RefMut<'_, Wallet>, JsValue> {
+        try_borrow_wallet(&self.wallet)
+    }
+}
+
+/// A fresh writer id at sequence 0: a wallet with no stored record yet.
+fn fresh_writer() -> (String, Cell<u64>) {
+    (new_writer_id(), Cell::new(0))
+}
+
+#[wasm_bindgen]
+impl RgbLibWallet {
+    /// Create a wallet from a mnemonic and a network, deriving the keys with
+    /// [`WitnessVersion::Taproot`].
+    pub fn create(
+        name: String,
+        mnemonic: String,
+        network: String,
+    ) -> Result<RgbLibWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let wallet = Wallet::new_in_memory(wallet_data(network), derived_keys(network, &mnemonic)?)
+            .map_err(|e| failure("cannot create the wallet", e))?;
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet: Rc::new(RefCell::new(Some(wallet))),
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Rebuild a wallet from the bytes of [`RgbLibWallet::snapshot`].
+    ///
+    /// The snapshot carries the wallet settings, which are validated against the supplied
+    /// mnemonic and network; a mismatch is an error, never a fresh wallet. Restoring is
+    /// synchronous, so the stored sequence cannot be read here: this instance starts a fresh
+    /// writer at sequence `0`. Use [`RgbLibWallet::load`] to attach to an existing IndexedDB
+    /// record, or the first flush is rejected when that record is already newer.
+    #[wasm_bindgen]
+    pub fn restore(
+        name: String,
+        snapshot: Vec<u8>,
+        mnemonic: String,
+        network: String,
+    ) -> Result<RgbLibWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let wallet = Wallet::from_snapshot(
+            &snapshot,
+            wallet_data(network),
+            derived_keys(network, &mnemonic)?,
+        )
+        .map_err(|e| failure("cannot restore the wallet", e))?;
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet: Rc::new(RefCell::new(Some(wallet))),
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Create a watch-only wallet from public keys JSON.
+    ///
+    /// `keys` is the `rgb-lib` [`SinglesigKeys`] JSON shape: `account_xpub_vanilla`,
+    /// `account_xpub_colored`, `vanilla_keychain`, `master_fingerprint` and `witness_version`.
+    /// `mnemonic` must be absent or `null`, so the wallet derives addresses and signs nothing; the
+    /// binding refuses keys that carry a phrase instead of silently dropping it. Build the JSON
+    /// from [`generateKeys`] or [`restoreKeys`] and keep only the public fields.
+    #[wasm_bindgen(js_name = createWatchOnly)]
+    pub fn create_watch_only(
+        name: String,
+        keys: String,
+        network: String,
+    ) -> Result<RgbLibWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = watch_only_keys(&keys)?;
+        let wallet = Wallet::new_in_memory(wallet_data(network), keys)
+            .map_err(|e| failure("cannot create the watch-only wallet", e))?;
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet: Rc::new(RefCell::new(Some(wallet))),
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Rebuild a watch-only wallet from the bytes of [`RgbLibWallet::snapshot`] and its public keys.
+    #[wasm_bindgen(js_name = restoreWatchOnly)]
+    pub fn restore_watch_only(
+        name: String,
+        snapshot: Vec<u8>,
+        keys: String,
+        network: String,
+    ) -> Result<RgbLibWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = watch_only_keys(&keys)?;
+        let wallet = Wallet::from_snapshot(&snapshot, wallet_data(network), keys)
+            .map_err(|e| failure("cannot restore the watch-only wallet", e))?;
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet: Rc::new(RefCell::new(Some(wallet))),
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Load the snapshot stored under `name` from IndexedDB and rebuild the wallet.
+    ///
+    /// When no snapshot exists yet, a fresh wallet is created instead, so this is the single entry
+    /// point a host needs on startup. Await it before using the wallet. The stored writer id and
+    /// sequence are adopted, so this instance's next flush is guarded against a newer one; a stale
+    /// wallet must call `load` again instead of retrying the clashing flush.
+    #[wasm_bindgen]
+    pub async fn load(
+        name: String,
+        mnemonic: String,
+        network: String,
+    ) -> Result<RgbLibWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = derived_keys(network, &mnemonic)?;
+        let wallet_data = wallet_data(network);
+        match load_snapshot_record(&name)
+            .await
+            .map_err(|e| failure("cannot read the wallet snapshot", e))?
+        {
+            Some(record) => Wallet::from_snapshot(&record.bytes, wallet_data, keys)
+                .map(|wallet| Self {
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
+                    name,
+                    writer: record.writer,
+                    sequence: Cell::new(record.sequence),
+                    detached: Cell::new(false),
+                })
+                .map_err(|e| failure("cannot restore the wallet", e)),
+            // a corrupt snapshot is an error above, never a fresh wallet: no fallback here
+            None => {
+                let wallet = Wallet::new_in_memory(wallet_data, keys)
+                    .map_err(|e| failure("cannot create the wallet", e))?;
+                let (writer, sequence) = fresh_writer();
+                Ok(Self {
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
+                    name,
+                    writer,
+                    sequence,
+                    detached: Cell::new(false),
+                })
+            }
+        }
+    }
+
+    /// The wallet name, i.e. the key of its durable snapshot.
+    ///
+    /// Unlike the other reads this only touches the instance, but it still takes the guard so a
+    /// long operation cannot be observed half-way through.
+    pub fn name(&self) -> Result<String, JsValue> {
+        let _wallet = self.borrow_wallet()?;
+        Ok(self.name.clone())
+    }
+
+    /// The wallet identity: the master fingerprint of its keys.
+    pub fn id(&self) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        Ok(wallet.get_keys().master_fingerprint)
+    }
+
+    /// Return the BTC balances (in sats) as JSON, from local data only.
+    ///
+    /// No chain sync is performed, so this reflects the last known state carried by the wallet.
+    #[wasm_bindgen(js_name = getBtcBalance)]
+    pub fn get_btc_balance(&self) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let balance = wallet
+            .get_btc_balance(None, true)
+            .map_err(|e| failure("cannot get the BTC balance", e))?;
+        drop(wallet);
+        json_result("cannot serialize the BTC balance", &balance)
+    }
+
+    /// Sync the BDK wallet against an Esplora endpoint, read-only.
+    ///
+    /// Runs a full scan of both wallet keychains and applies the result to the shared wallet. The
+    /// change is in the in-memory database when this resolves; call `flush()` to make it durable.
+    /// `stop_gap` is the unused script count per keychain (default 20). No RGB state is touched
+    /// here: use [`RgbLibWallet::sync_online`] to also receive pending RGB transfers.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn sync(&self, indexer_url: String, stop_gap: Option<u32>) -> Result<(), JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        wallet
+            .sync_async(&indexer_url, stop_gap.map(|gap| gap as usize))
+            .await
+            .map_err(|e| failure("cannot sync the wallet", e))
+    }
+
+    /// Receive one RGB transfer from a proxy and ACK it, then leave persistence to `flush()`.
+    ///
+    /// `proxy_url` is the recipient proxy holding the consignment, `indexer_url` the Esplora
+    /// endpoint used for the chain answers the validation needs and for broadcasting a released
+    /// signed TX, and `transfer_id` the proxy transfer ID. `evm` is an optional
+    /// `{ rpcUrl, maxMintLockBlocks }` object or a map from decimal chain ID to that object, and is
+    /// required to receive a BFA mint: a mint without it throws `No EVM RPC URL configured for
+    /// chain ID ...` and never includes the endpoint URL in an error. The transfer must belong to
+    /// a pending incoming invoice of this wallet: a repeated call on an already handled transfer
+    /// is a no-op and a transfer not addressed to this wallet throws. The whole receive, including
+    /// the ACK, happens in one wallet transaction; a failure rolls it back. This call flushes the
+    /// new state before releasing the proxy data, so a failed flush leaves the release pending for
+    /// the next call instead of deleting the only copy of the consignment.
+    ///
+    /// Returns JSON: the handled `batch_transfer_idx`, or `null` when the transfer was already
+    /// handled before this call.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = receiveTransfer)]
+    pub async fn receive_transfer(
+        &self,
+        proxy_url: String,
+        indexer_url: String,
+        transfer_id: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let idx = wallet
+            .receive_transfer_async(&proxy_url, &indexer_url, &transfer_id, evm)
+            .await
+            .map_err(|e| failure("cannot receive the transfer", e))?;
+        // the release marker is in the snapshot only once this resolves: post after it
+        self.flush_wallet(&wallet).await?;
+        wallet.release_pending_retrievals(&indexer_url).await;
+        drop(wallet);
+        json_result("cannot serialize the receive result", &idx)
+    }
+
+    /// Sync the BDK wallet and receive every pending RGB transfer from a proxy.
+    ///
+    /// Runs the read-only BDK full scan, then lists the transfers of each pending incoming invoice
+    /// on `proxy_url`, receiving and ACKing each one through the same shared driver as
+    /// [`RgbLibWallet::receive_transfer`]. `evm` has the same shape as in
+    /// [`RgbLibWallet::receive_transfer`] and is required to receive a BFA mint. Only `Pending` transfers addressed to this wallet are
+    /// considered and an already handled one is skipped, so a repeated call is idempotent. This
+    /// call flushes the new state before releasing the proxy data of the handled transfers; a
+    /// failed flush returns its error and leaves every release pending for the next call.
+    ///
+    /// Returns JSON: the array of `batch_transfer_idx` handled by this call, in processing order.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = syncOnline)]
+    pub async fn sync_online(
+        &self,
+        proxy_url: String,
+        indexer_url: String,
+        evm: Option<JsValue>,
+        stop_gap: Option<u32>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let handled = wallet
+            .sync_online_async(
+                &proxy_url,
+                &indexer_url,
+                evm,
+                stop_gap.map(|gap| gap as usize),
+            )
+            .await
+            .map_err(|e| failure("cannot sync the wallet online", e))?;
+        // same order as receiveTransfer, for every release the handled transfers left behind
+        self.flush_wallet(&wallet).await?;
+        wallet.release_pending_retrievals(&indexer_url).await;
+        drop(wallet);
+        json_result("cannot serialize the online sync result", &handled)
+    }
+
+    /// Fee estimate for confirmation within `blocks`, in sat/vB, from an Esplora endpoint.
+    ///
+    /// `blocks` must be in `1..=1008`. An endpoint without fee history throws the sanitized
+    /// `Cannot estimate fees` error.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = getFeeEstimation)]
+    pub async fn get_fee_estimation(
+        &self,
+        indexer_url: String,
+        blocks: u16,
+    ) -> Result<f64, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .fee_estimation_async(&indexer_url, blocks)
+            .await
+            .map_err(|e| failure("cannot estimate the fee", e))
+    }
+
+    /// Height of the best-chain tip reported by an Esplora endpoint.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = getTipHeight)]
+    pub async fn get_tip_height(&self, indexer_url: String) -> Result<u32, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .tip_height_async(&indexer_url)
+            .await
+            .map_err(|e| failure("cannot get the tip height", e))
+    }
+
+    /// Return the RGB asset balance as JSON, from local data only.
+    #[wasm_bindgen(js_name = getAssetBalance)]
+    pub fn get_asset_balance(&self, asset_id: String) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        let balance = wallet
+            .get_asset_balance(asset_id)
+            .map_err(|e| failure("cannot get the asset balance", e))?;
+        drop(wallet);
+        json_result("cannot serialize the asset balance", &balance)
+    }
+
+    /// Return the RGB asset metadata as JSON.
+    #[wasm_bindgen(js_name = getAssetMetadata)]
+    pub fn get_asset_metadata(&self, asset_id: String) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        let metadata = wallet
+            .get_asset_metadata(asset_id)
+            .map_err(|e| failure("cannot get the asset metadata", e))?;
+        drop(wallet);
+        json_result("cannot serialize the asset metadata", &metadata)
+    }
+
+    /// List the known RGB assets as JSON, grouped by schema.
+    #[wasm_bindgen(js_name = listAssets)]
+    pub fn list_assets(&self) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        let assets = wallet
+            .list_assets(vec![])
+            .map_err(|e| failure("cannot list the assets", e))?;
+        drop(wallet);
+        json_result("cannot serialize the asset list", &assets)
+    }
+
+    /// List the known RGB transfers as JSON, optionally filtered by `asset_id`.
+    #[wasm_bindgen(js_name = listTransfers)]
+    pub fn list_transfers(&self, asset_id: Option<String>) -> Result<String, JsValue> {
+        let filter = match asset_id {
+            Some(asset_id) => AssetFilter::Id(asset_id),
+            None => AssetFilter::AnyOrNone,
+        };
+        let transfers = {
+            let wallet = self.borrow_wallet()?;
+            wallet
+                .list_transfers(filter, TransferScope::All)
+                .map_err(|e| failure("cannot list the transfers", e))?
+        };
+        json_result("cannot serialize the transfer list", &transfers)
+    }
+
+    /// List the known unspents as JSON, from local data only.
+    ///
+    /// `settled_only` excludes allocations on pending RGB operations.
+    #[wasm_bindgen(js_name = listUnspents)]
+    pub fn list_unspents(&self, settled_only: bool) -> Result<String, JsValue> {
+        let unspents = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .list_unspents(None, settled_only, true)
+                .map_err(|e| failure("cannot list the unspents", e))?
+        };
+        json_result("cannot serialize the unspent list", &unspents)
+    }
+
+    /// List the known Bitcoin transactions as JSON, newest first, from local data only.
+    #[wasm_bindgen(js_name = listTransactions)]
+    pub fn list_transactions(&self) -> Result<String, JsValue> {
+        let transactions = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .list_transactions(None, true)
+                .map_err(|e| failure("cannot list the transactions", e))?
+        };
+        json_result("cannot serialize the transaction list", &transactions)
+    }
+
+    /// Return the data that defines the wallet as JSON.
+    #[wasm_bindgen(js_name = getWalletData)]
+    pub fn get_wallet_data(&self) -> Result<String, JsValue> {
+        let wallet_data = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_wallet_data()
+        };
+        json_result("cannot serialize the wallet data", &wallet_data)
+    }
+
+    /// Return the mint received on `recipient_id` as JSON, or `null` when the wallet checked none.
+    ///
+    /// It is what the sender has to lock on the external chain for the mint to complete, read from
+    /// the wallet files, so it survives a snapshot restore. A recipient ID of a transfer that was
+    /// not received, failed or is not a mint gives `null`.
+    #[wasm_bindgen(js_name = getReceivedMint)]
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<JsValue, JsValue> {
+        let received_mint = {
+            let wallet = self.borrow_wallet()?;
+            wallet
+                .get_received_mint(recipient_id)
+                .map_err(|e| failure("cannot get the received mint", e))?
+        };
+        match received_mint {
+            Some(received_mint) => {
+                json_result("cannot serialize the received mint", &received_mint).map(JsValue::from)
+            }
+            None => Ok(JsValue::NULL),
+        }
+    }
+
+    /// Return a new receive address from the vanilla wallet.
+    #[wasm_bindgen(js_name = getAddress)]
+    pub fn get_address(&self) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        wallet
+            .get_address()
+            .map_err(|e| failure("cannot derive a receive address", e))
+    }
+
+    /// Create an out-of-band blind receive request and return its `ReceiveData` as JSON.
+    ///
+    /// `assignment` is the core serde shape (`{"Fungible":1000}`, `"NonFungible"`,
+    /// `{"InflationRight":1000}` or `"Any"`). `encryption` is `required`, `unsupported` or
+    /// `optional`. Transport endpoints are always empty: the invoice carries no proxy endpoint and
+    /// the consignment is exchanged out-of-band, so no proxy reservation is made. A blind receive
+    /// allocates on an existing colored UTXO; a wallet without one throws the core error.
+    #[wasm_bindgen(js_name = blindReceive)]
+    pub fn blind_receive(
+        &self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .blind_receive(
+                    None,
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    vec![],
+                    min_confirmations,
+                    encryption,
+                )
+                .map_err(|e| failure("cannot create the blind receive", e))?
+        };
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
+    /// Create an out-of-band witness receive request and return its `ReceiveData` as JSON.
+    ///
+    /// Arguments and out-of-band semantics are the same as [`RgbLibWallet::blind_receive`], but the
+    /// recipient is a new script and no colored UTXO is needed.
+    #[wasm_bindgen(js_name = witnessReceive)]
+    pub fn witness_receive(
+        &self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .witness_receive(
+                    None,
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    vec![],
+                    min_confirmations,
+                    encryption,
+                )
+                .map_err(|e| failure("cannot create the witness receive", e))?
+        };
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
+    /// Create a blind receive invoice with transport endpoints and reserve it on its proxies.
+    ///
+    /// Same arguments and JSON `ReceiveData` as [`RgbLibWallet::blind_receive`], plus
+    /// `transportEndpoints` (at most 3 `rpc://`/`rpcs://` URLs, no duplicates): the invoice is
+    /// reserved on every reachable proxy over `fetch`, and the receive stores the endpoints and,
+    /// for a blind recipient, the retention deadline the proxies advertise, exactly like the
+    /// native flow. An empty list selects the out-of-band exchange instead. Proxy-level
+    /// authentication keys cannot be configured in the browser, so a proxy requiring them refuses
+    /// the reservation with its explicit error.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = blindReceiveProxy)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blind_receive_proxy(
+        &self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .blind_receive_proxy_async(
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    transport_endpoints,
+                    min_confirmations,
+                    encryption,
+                )
+                .await
+                .map_err(|e| failure("cannot create the blind receive", e))?
+        };
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
+    /// Create a witness receive invoice with transport endpoints and reserve it on its proxies.
+    ///
+    /// Same as [`RgbLibWallet::blind_receive_proxy`], but the recipient is a new script and no
+    /// colored UTXO is needed.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = witnessReceiveProxy)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn witness_receive_proxy(
+        &self,
+        asset_id: Option<String>,
+        assignment: String,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<String>,
+    ) -> Result<String, JsValue> {
+        let assignment = parse_assignment(&assignment)?;
+        let encryption = parse_encryption(encryption)?;
+        let receive_data = {
+            let mut wallet = self.borrow_wallet()?;
+            wallet
+                .witness_receive_proxy_async(
+                    asset_id,
+                    assignment,
+                    expiration_timestamp,
+                    transport_endpoints,
+                    min_confirmations,
+                    encryption,
+                )
+                .await
+                .map_err(|e| failure("cannot create the witness receive", e))?
+        };
+        json_result("cannot serialize the receive data", &receive_data)
+    }
+
+    /// Issue a NIA asset and return its asset ID.
+    ///
+    /// Like every RGB issuance, it allocates on an existing colored UTXO, so the wallet must
+    /// already hold one: a fresh browser wallet has to be funded and synced before this succeeds.
+    /// `amounts` is a `BigUint64Array` on the JS side.
+    #[wasm_bindgen(js_name = issueNia)]
+    pub fn issue_nia(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+    ) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .issue_asset_nia(ticker, name, precision, amounts)
+            .map(|asset| asset.asset_id)
+            .map_err(|e| failure("cannot issue the asset", e))
+    }
+
+    /// Issue a UDA asset and return its asset ID.
+    ///
+    /// Media attachments need a filesystem and are not passed by the bindings.
+    #[wasm_bindgen(js_name = issueUda)]
+    pub fn issue_uda(
+        &self,
+        ticker: String,
+        name: String,
+        details: Option<String>,
+        precision: u8,
+    ) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .issue_asset_uda(ticker, name, details, precision, None, vec![])
+            .map(|asset| asset.asset_id)
+            .map_err(|e| failure("cannot issue the asset", e))
+    }
+
+    /// Issue a CFA asset and return its asset ID.
+    ///
+    /// Media attachments need a filesystem and are not passed by the bindings.
+    /// `amounts` is a `BigUint64Array` on the JS side.
+    #[wasm_bindgen(js_name = issueCfa)]
+    pub fn issue_cfa(
+        &self,
+        name: String,
+        details: Option<String>,
+        precision: u8,
+        amounts: Vec<u64>,
+    ) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .issue_asset_cfa(name, details, precision, amounts, None)
+            .map(|asset| asset.asset_id)
+            .map_err(|e| failure("cannot issue the asset", e))
+    }
+
+    /// Issue an IFA asset and return its asset ID.
+    ///
+    /// `amounts` and `inflation_amounts` are `BigUint64Array` on the JS side; the latter can be
+    /// empty. The optional `reject_list_url` is embedded in the contract.
+    #[wasm_bindgen(js_name = issueIfa)]
+    pub fn issue_ifa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+        inflation_amounts: Vec<u64>,
+        reject_list_url: Option<String>,
+    ) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .issue_asset_ifa(
+                ticker,
+                name,
+                precision,
+                amounts,
+                inflation_amounts,
+                reject_list_url,
+                // a browser issue carries no link right nor contract checks to skip
+                false,
+                None,
+                false,
+            )
+            .map(|asset| asset.asset_id)
+            .map_err(|e| failure("cannot issue the asset", e))
+    }
+
+    /// Issue a BFA asset and return its asset ID.
+    ///
+    /// BFA assets are bridged from an EVM chain, so they are supported on every network but
+    /// mainnet: a mainnet wallet refuses this with the core `Schema Bfa is not supported`, and the
+    /// binding never opts into reckless schemas. `mintRights` mint rights are issued, each on its
+    /// own colored UTXO, so the wallet must already hold them. `chainId` is a `bigint` in JS.
+    /// `contractAddress` is the `0x`-prefixed bridge contract address, committed in the asset
+    /// genesis; `rejectListAddress` optionally commits to a reject list on the same chain. Contract
+    /// checks against the EVM chain are not performed here: `skipContractChecks` only skips the
+    /// checks the wallet can make on its own data for `linkedFromContract`.
+    #[wasm_bindgen(js_name = issueBfa)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .issue_asset_bfa(
+                ticker,
+                name,
+                precision,
+                mint_rights,
+                chain_id,
+                contract_address,
+                reject_list_address,
+                link_right,
+                linked_from_contract,
+                skip_contract_checks,
+            )
+            .map(|asset| asset.asset_id)
+            .map_err(|e| failure("cannot issue the asset", e))
+    }
+
+    /// Sign a PSBT with the wallet keys and return the signed PSBT.
+    ///
+    /// The wallet must have private keys; a watch-only wallet returns an error.
+    #[wasm_bindgen(js_name = signPsbt)]
+    pub fn sign_psbt(&self, psbt: String) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .sign_psbt(psbt, None)
+            .map_err(|e| failure("cannot sign the PSBT", e))
+    }
+
+    /// Finalize a signed PSBT and return the finalized PSBT.
+    #[wasm_bindgen(js_name = finalizePsbt)]
+    pub fn finalize_psbt(&self, psbt: String) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .finalize_psbt(psbt, None)
+            .map_err(|e| failure("cannot finalize the PSBT", e))
+    }
+
+    /// Prepare the PSBT to burn `amount` of an RGB asset, returning it with its details as JSON.
+    ///
+    /// `evm` has the shape [`RgbLibWallet::receive_transfer`] takes and is needed only for a BFA
+    /// asset, whose reject list lives on an EVM chain. `dryRun` skips persisting the operation.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = burnBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn burn_begin(
+        &self,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .burn_begin_async(
+                asset_id,
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+                evm,
+                dry_run,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the burn", e))?;
+        drop(wallet);
+        json_result("cannot serialize the burn begin result", &res)
+    }
+
+    /// Burn the signed `signedPsbt`, broadcasting it over `indexerUrl`, and return the result JSON.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = burnEnd)]
+    pub async fn burn_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+    ) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .burn_end_async(&indexer_url, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the burn", e))?;
+        drop(wallet);
+        json_result("cannot serialize the burn result", &res)
+    }
+
+    /// Prepare the PSBT to link an RGB asset to `linkedToContract`, returning it with its details.
+    ///
+    /// `evm` and `dryRun` are as in [`RgbLibWallet::burn_begin`]; `skipContractChecks` skips the
+    /// checks the wallet can make on its own data.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = linkBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_begin(
+        &self,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        skip_contract_checks: bool,
+        dry_run: bool,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .link_begin_async(
+                asset_id,
+                linked_to_contract,
+                fee_rate,
+                min_confirmations,
+                skip_contract_checks,
+                evm,
+                dry_run,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the link", e))?;
+        drop(wallet);
+        json_result("cannot serialize the link begin result", &res)
+    }
+
+    /// Link the signed `signedPsbt`, broadcasting it over `indexerUrl`, and return the result JSON.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = linkEnd)]
+    pub async fn link_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+    ) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .link_end_async(&indexer_url, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the link", e))?;
+        drop(wallet);
+        json_result("cannot serialize the link result", &res)
+    }
+
+    /// Prepare the PSBT to send RGB assets to the given recipients, returning it with its details
+    /// as JSON.
+    ///
+    /// `recipientsJson` maps each asset ID to its core `Recipient` list, e.g.
+    /// `{"rgb:...": [{"recipient_id": "...", "assignment": {"Fungible": 1000},
+    /// "transport_endpoints": ["rpc://proxy.example"], "public_key": "...", "encryption":
+    /// "unsupported", "expiration_timestamp": 1700000000}]}`. A recipient with no transport
+    /// endpoints uses the out-of-band exchange. `senderTransportEndpoint` is the sender's own
+    /// proxy and is required when any recipient has transport endpoints.
+    ///
+    /// `indexerUrl` is the Esplora endpoint the matching [`RgbLibWallet::send_end`] broadcasts
+    /// over. `evm` has the shape [`RgbLibWallet::receive_transfer`] takes and is needed only for a
+    /// BFA asset, whose reject list lives on an EVM chain.
+    ///
+    /// Proxy-level authentication keys cannot be configured in the browser, so a proxy that
+    /// requires them refuses the send with its explicit authentication error.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = sendBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_begin(
+        &self,
+        recipients_json: String,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: u64,
+        sender_transport_endpoint: Option<String>,
+        indexer_url: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let recipient_map = parse_recipients(&recipients_json)?;
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .send_begin_async(
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+                &indexer_url,
+                evm,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the send", e))?;
+        drop(wallet);
+        json_result("cannot serialize the send begin result", &res)
+    }
+
+    /// Complete the send of the signed `signedPsbt`, broadcasting it over `indexerUrl` when it is
+    /// a donation, and return the result JSON.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = sendEnd)]
+    pub async fn send_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+    ) -> Result<String, JsValue> {
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .send_end_async(&indexer_url, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the send", e))?;
+        drop(wallet);
+        json_result("cannot serialize the send result", &res)
+    }
+
+    /// Prepare the PSBT to mint a BFA asset to `recipientJson`, returning it with its details as
+    /// JSON.
+    ///
+    /// `recipientJson` is a single core `Recipient` object, as in the `sendBegin` recipient list,
+    /// with at least one transport endpoint: a mint recipient is always a proxy one. `beforeBlock`
+    /// is the external chain block the mint commits to, which the host reads with
+    /// [`RgbLibWallet::evm_block_number`] and picks within the configured bounds. `indexerUrl` is
+    /// the Esplora endpoint the matching [`RgbLibWallet::mint_end`] broadcasts over.
+    ///
+    /// `evm` has the shape [`RgbLibWallet::receive_transfer`] takes, with `minMintLockBlocks` too,
+    /// and must name the chain of the asset's bridge contract: a mint of a chain it doesn't name
+    /// fails with the core `NoEvmRpcUrl`. The endpoint is checked to answer with that chain ID
+    /// before any block is read.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = mintBegin)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mint_begin(
+        &self,
+        indexer_url: String,
+        asset_id: String,
+        recipient_json: String,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let recipient = parse_recipient(&recipient_json)?;
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .mint_begin_async(
+                &indexer_url,
+                evm,
+                asset_id,
+                recipient,
+                before_block,
+                fee_rate,
+                min_confirmations,
+                sender_transport_endpoint,
+            )
+            .await
+            .map_err(|e| failure("cannot begin the mint", e))?;
+        drop(wallet);
+        json_result("cannot serialize the mint begin result", &res)
+    }
+
+    /// Complete the mint of the signed `signedPsbt`, broadcasting it over `indexerUrl`, and return
+    /// the result JSON.
+    ///
+    /// A mint whose lock is not final yet is left as is and returns the core
+    /// `Mint lock not found`; one whose lock has expired is failed, releasing its inputs, and
+    /// returns `Mint lock expired`. `evm` is as in [`RgbLibWallet::mint_begin`] and must name the
+    /// same chain.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = mintEnd)]
+    pub async fn mint_end(
+        &self,
+        indexer_url: String,
+        signed_psbt: String,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?;
+        let mut wallet = self.borrow_wallet()?;
+        let res = wallet
+            .mint_end_async(&indexer_url, evm, &signed_psbt)
+            .await
+            .map_err(|e| failure("cannot end the mint", e))?;
+        drop(wallet);
+        json_result("cannot serialize the mint result", &res)
+    }
+
+    /// Return the latest block of the EVM chain `chainId` as a string, after checking `evm`
+    /// answers with that chain ID.
+    ///
+    /// `evm` is as in [`RgbLibWallet::mint_begin`]. The result is a decimal string because a
+    /// JavaScript `number` cannot hold every block height exactly.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = evmBlockNumber)]
+    pub async fn evm_block_number(
+        &self,
+        chain_id: u64,
+        evm: Option<JsValue>,
+    ) -> Result<String, JsValue> {
+        let evm = parse_evm(evm)?
+            .ok_or_else(|| JsValue::from_str("the EVM configuration is required"))?;
+        let wallet = self.borrow_wallet()?;
+        let block = wallet
+            .evm_block_number_async(&evm, chain_id)
+            .await
+            .map_err(|e| failure("cannot read the EVM block number", e))?;
+        Ok(block.to_string())
+    }
+
+    /// Delete eligible failed transfers and return whether any was deleted.
+    ///
+    /// With `batch_transfer_idx` it operates on that batch transfer only; without it, all failed
+    /// transfers are eligible. `no_asset_only` skips transfers with an associated asset ID.
+    #[wasm_bindgen(js_name = deleteTransfers)]
+    pub fn delete_transfers(
+        &self,
+        batch_transfer_idx: Option<i32>,
+        no_asset_only: bool,
+    ) -> Result<bool, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .delete_transfers(batch_transfer_idx, no_asset_only)
+            .map_err(|e| failure("cannot delete the transfers", e))
+    }
+
+    /// Serialize the whole wallet state into bytes for the host to store.
+    pub fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .snapshot()
+            .map_err(|e| failure("cannot serialize the wallet", e))?
+            .ok_or_else(|| JsValue::from_str("the wallet runs without a snapshot-capable backend"))
+    }
+
+    /// Create an encrypted backup of the wallet and return its bytes.
+    ///
+    /// The archive and encryption format is the native one; the browser wallet carries its
+    /// snapshot envelope instead of a wallet directory. The password derives the key and is never
+    /// stored or logged.
+    pub fn backup(&self, password: String) -> Result<Vec<u8>, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .backup_bytes(&password)
+            .map_err(|e| failure("cannot create the backup", e))
+    }
+
+    /// Restore this wallet from the bytes of [`RgbLibWallet::backup`].
+    ///
+    /// The backup must belong to the wallet keys already held here: the shared restore path
+    /// validates them and rebuilds the database, BDK state and files from the backup snapshot. A
+    /// wrong password, a different wallet or a corrupt archive is an error, never a fresh wallet.
+    /// The new wallet replaces the old one under the operation guard, so an overlapping call can
+    /// never observe a half-swapped instance; the snapshot sequence and writer stay unchanged, so
+    /// the next `flush` is still guarded against a newer stored record.
+    #[wasm_bindgen(js_name = restoreBackup)]
+    pub fn restore_backup(&self, backup_bytes: Vec<u8>, password: String) -> Result<(), JsValue> {
+        // the key derivation is slow: do it before taking the guard
+        let restored = core_restore_backup_bytes(&backup_bytes, &password)
+            .map_err(|e| failure("cannot restore the backup", e))?;
+        let snapshot = restored
+            .wallet_snapshot()
+            .map_err(|e| failure("cannot restore the backup", e))?;
+        let mut slot = self.wallet.try_borrow_mut().map_err(|_| wallet_busy())?;
+        let current = slot.as_ref().ok_or_else(wallet_busy)?;
+        let wallet =
+            Wallet::from_snapshot(&snapshot, current.get_wallet_data(), current.get_keys())
+                .map_err(|e| failure("cannot restore the backup", e))?;
+        *slot = Some(wallet);
+        Ok(())
+    }
+
+    /// Store the wallet state in IndexedDB and resolve once the transaction commits.
+    ///
+    /// The write is guarded: it carries this instance's writer id and sequence, and IndexedDB
+    /// rejects it when the stored sequence is newer. The error names the stored sequence and its
+    /// writer; call `load` again to adopt the newer state. A successful flush adopts the returned
+    /// sequence for the next call. After `deleteSnapshot` this instance is detached and every flush
+    /// fails instead of recreating the deleted record.
+    pub async fn flush(&self) -> Result<(), JsValue> {
+        // held across the write: an overlapping flush or any other call gets the busy error
+        let wallet = self.borrow_wallet()?;
+        self.flush_wallet(&wallet).await
+    }
+
+    /// Flush while the caller already holds the operation guard, so a receive and its snapshot
+    /// write cannot be interleaved with another call.
+    async fn flush_wallet(&self, wallet: &Wallet) -> Result<(), JsValue> {
+        if self.detached.get() {
+            return Err(JsValue::from_str(
+                "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",
+            ));
+        }
+        let bytes = wallet
+            .snapshot()
+            .map_err(|e| failure("cannot serialize the wallet", e))?
+            .ok_or_else(|| {
+                JsValue::from_str("the wallet runs without a snapshot-capable backend")
+            })?;
+        let sequence = save_snapshot_record(&self.name, &bytes, &self.writer, self.sequence.get())
+            .await
+            .map_err(|e| failure("cannot persist the wallet", e))?;
+        self.sequence.set(sequence);
+        Ok(())
+    }
+
+    /// Delete the snapshot stored under `name` from IndexedDB and detach this instance.
+    ///
+    /// `name` must be this wallet's name: any other key is refused, so the call can never remove
+    /// another wallet's record. A missing record is not an error, so a repeated call succeeds. The
+    /// in-memory wallet stays usable, but this instance is detached: every later `flush` fails
+    /// instead of recreating the deleted snapshot with a stale sequence. Recreate the record
+    /// deliberately with `load` on a new instance, which starts at sequence `0`, or drop the
+    /// instance.
+    #[wasm_bindgen(js_name = deleteSnapshot)]
+    pub async fn delete_snapshot(&self, name: String) -> Result<(), JsValue> {
+        // held across the delete, so a flush cannot recreate the record while it is being removed
+        let _wallet = self.borrow_wallet()?;
+        if name != self.name {
+            return Err(JsValue::from_str(&format!(
+                "cannot delete the snapshot '{name}': this wallet stores its snapshot under '{}'",
+                self.name
+            )));
+        }
+        core_delete_snapshot(&self.name)
+            .await
+            .map_err(|e| failure("cannot delete the wallet snapshot", e))?;
+        self.detached.set(true);
+        Ok(())
+    }
+}
+
+/// An `rgb-lib` multisig wallet over the in-memory backend.
+///
+/// Only the hub-free subset exists on wasm: the wallet derives addresses from its descriptors and
+/// persists them with a snapshot. Hub-coordinated operations (`getAddress` by shared index,
+/// `goOnline`, voting, sends) need the native-only `_online` feature and are not exposed.
+#[wasm_bindgen]
+pub struct RgbLibMultisigWallet {
+    /// Held for the whole of one call, so a second overlapping call gets the busy error.
+    wallet: Rc<RefCell<Option<MultisigWallet>>>,
+    name: String,
+    /// This instance's id in the snapshot record; a flush writes it next to the bytes.
+    writer: String,
+    /// Sequence this instance last saw or wrote; a guarded flush needs it to match the store.
+    sequence: Cell<u64>,
+    /// Set once this instance deleted its own snapshot: a later flush must not resurrect it.
+    detached: Cell<bool>,
+}
+
+impl RgbLibMultisigWallet {
+    /// Take the wallet for one operation; a call made while another holds it gets the busy error.
+    fn borrow_wallet(&self) -> Result<RefMut<'_, MultisigWallet>, JsValue> {
+        try_borrow_wallet(&self.wallet)
+    }
+}
+
+#[wasm_bindgen]
+impl RgbLibMultisigWallet {
+    /// Create a multisig wallet from a [`MultisigKeys`] JSON string.
+    ///
+    /// The JSON is the `rgb-lib` shape `{"cosigners": [{"account_xpub_vanilla",
+    /// "account_xpub_colored", "vanilla_keychain", "master_fingerprint"}], "threshold_colored",
+    /// "threshold_vanilla"}`; build each cosigner from the public fields of [`generateKeys`] or
+    /// [`restoreKeys`]. No mnemonic is stored.
+    pub fn create(
+        name: String,
+        keys: String,
+        network: String,
+    ) -> Result<RgbLibMultisigWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = multisig_keys(&keys)?;
+        let wallet = MultisigWallet::new(wallet_data(network), keys)
+            .map_err(|e| failure("cannot create the multisig wallet", e))?;
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet: Rc::new(RefCell::new(Some(wallet))),
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Rebuild a multisig wallet from the bytes of [`RgbLibMultisigWallet::snapshot`] and its keys.
+    #[wasm_bindgen]
+    pub fn restore(
+        name: String,
+        snapshot: Vec<u8>,
+        keys: String,
+        network: String,
+    ) -> Result<RgbLibMultisigWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = multisig_keys(&keys)?;
+        let wallet = MultisigWallet::from_snapshot(&snapshot, wallet_data(network), keys)
+            .map_err(|e| failure("cannot restore the multisig wallet", e))?;
+        let (writer, sequence) = fresh_writer();
+        Ok(Self {
+            wallet: Rc::new(RefCell::new(Some(wallet))),
+            name,
+            writer,
+            sequence,
+            detached: Cell::new(false),
+        })
+    }
+
+    /// Load the snapshot stored under `name` from IndexedDB and rebuild the multisig wallet.
+    ///
+    /// When no snapshot exists yet, a fresh wallet is created. The stored writer id and sequence
+    /// are adopted, so this instance's next flush is guarded like the singlesig one.
+    #[wasm_bindgen]
+    pub async fn load(
+        name: String,
+        keys: String,
+        network: String,
+    ) -> Result<RgbLibMultisigWallet, JsValue> {
+        let network = parse_network(&network)?;
+        let keys = multisig_keys(&keys)?;
+        let wallet_data = wallet_data(network);
+        match load_snapshot_record(&name)
+            .await
+            .map_err(|e| failure("cannot read the wallet snapshot", e))?
+        {
+            Some(record) => MultisigWallet::from_snapshot(&record.bytes, wallet_data, keys)
+                .map(|wallet| Self {
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
+                    name,
+                    writer: record.writer,
+                    sequence: Cell::new(record.sequence),
+                    detached: Cell::new(false),
+                })
+                .map_err(|e| failure("cannot restore the multisig wallet", e)),
+            None => {
+                let wallet = MultisigWallet::new(wallet_data, keys)
+                    .map_err(|e| failure("cannot create the multisig wallet", e))?;
+                let (writer, sequence) = fresh_writer();
+                Ok(Self {
+                    wallet: Rc::new(RefCell::new(Some(wallet))),
+                    name,
+                    writer,
+                    sequence,
+                    detached: Cell::new(false),
+                })
+            }
+        }
+    }
+
+    /// The wallet name, i.e. the key of its durable snapshot.
+    ///
+    /// Takes the guard like every other call, so an overlapping operation is reported instead of
+    /// being observed half-way through.
+    pub fn name(&self) -> Result<String, JsValue> {
+        let _wallet = self.borrow_wallet()?;
+        Ok(self.name.clone())
+    }
+
+    /// The wallet identity, derived from the descriptors: a multisig group has no single master
+    /// fingerprint.
+    pub fn id(&self) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        Ok(wallet.get_wallet_id())
+    }
+
+    /// Return the data that defines the wallet as JSON.
+    #[wasm_bindgen(js_name = getWalletData)]
+    pub fn get_wallet_data(&self) -> Result<String, JsValue> {
+        let wallet_data = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_wallet_data()
+        };
+        json_result("cannot serialize the wallet data", &wallet_data)
+    }
+
+    /// Return the cosigners and thresholds of the wallet as JSON.
+    #[wasm_bindgen(js_name = getKeys)]
+    pub fn get_keys(&self) -> Result<String, JsValue> {
+        let keys = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_keys()
+        };
+        json_result("cannot serialize the multisig keys", &keys)
+    }
+
+    /// Return the colored and vanilla descriptors of the wallet as JSON.
+    #[wasm_bindgen(js_name = getDescriptors)]
+    pub fn get_descriptors(&self) -> Result<String, JsValue> {
+        let descriptors = {
+            let wallet = self.borrow_wallet()?;
+            wallet.get_descriptors()
+        };
+        json_result("cannot serialize the descriptors", &descriptors)
+    }
+
+    /// Return the vanilla receive address at `index`, derived from the wallet descriptors.
+    ///
+    /// Unlike the native, hub-coordinated `getAddress`, this neither reveals nor persists the
+    /// index: every cosigner derives the same address for the same `index`.
+    #[wasm_bindgen(js_name = getAddress)]
+    pub fn get_address(&self, index: u32) -> Result<String, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        Ok(wallet.peek_address(index))
+    }
+
+    /// Serialize the whole wallet state into bytes for the host to store.
+    pub fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
+        let wallet = self.borrow_wallet()?;
+        wallet
+            .snapshot()
+            .map_err(|e| failure("cannot serialize the wallet", e))?
+            .ok_or_else(|| JsValue::from_str("the wallet runs without a snapshot-capable backend"))
+    }
+
+    /// Store the wallet state in IndexedDB and resolve once the transaction commits.
+    ///
+    /// The write is guarded like the singlesig one: a stale sequence is rejected and the error
+    /// names the stored sequence and its writer. Call `load` again to adopt the newer state. After
+    /// `deleteSnapshot` this instance is detached and every flush fails.
+    pub async fn flush(&self) -> Result<(), JsValue> {
+        // held across the write: an overlapping flush or any other call gets the busy error
+        let wallet = self.borrow_wallet()?;
+        if self.detached.get() {
+            return Err(JsValue::from_str(
+                "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet",
+            ));
+        }
+        let bytes = wallet
+            .snapshot()
+            .map_err(|e| failure("cannot serialize the wallet", e))?
+            .ok_or_else(|| {
+                JsValue::from_str("the wallet runs without a snapshot-capable backend")
+            })?;
+        let sequence = save_snapshot_record(&self.name, &bytes, &self.writer, self.sequence.get())
+            .await
+            .map_err(|e| failure("cannot persist the wallet", e))?;
+        self.sequence.set(sequence);
+        Ok(())
+    }
+
+    /// Delete the snapshot stored under `name` from IndexedDB and detach this instance.
+    ///
+    /// `name` must be this wallet's name: any other key is refused. A missing record is not an
+    /// error. The in-memory wallet stays usable, but every later `flush` fails instead of
+    /// recreating the deleted snapshot; `load` on a new instance recreates the record at sequence
+    /// `0` deliberately.
+    #[wasm_bindgen(js_name = deleteSnapshot)]
+    pub async fn delete_snapshot(&self, name: String) -> Result<(), JsValue> {
+        // held across the delete, so a flush cannot recreate the record while it is being removed
+        let _wallet = self.borrow_wallet()?;
+        if name != self.name {
+            return Err(JsValue::from_str(&format!(
+                "cannot delete the snapshot '{name}': this wallet stores its snapshot under '{}'",
+                self.name
+            )));
+        }
+        core_delete_snapshot(&self.name)
+            .await
+            .map_err(|e| failure("cannot delete the wallet snapshot", e))?;
+        self.detached.set(true);
+        Ok(())
+    }
+}
+
+/// Browser coverage for the bindings, run by the `wasm_browser_lifecycle` CI job.
+///
+/// The tests create real wallets over the in-memory backend, so the durable paths go through a
+/// real IndexedDB. The required CI job has no indexer and no proxy: network coverage uses a
+/// refused local URL and pins the sanitized error, while a real receive stays in the opt-in
+/// `regtest_proxy_receive_smoke` of the root crate.
+///
+/// The re-entrancy tests cover the operation guard: a JavaScript host can start a second call
+/// while an async method is suspended at an await, so the overlap must be the busy error and
+/// never a panic in `borrow_mut` or an aliased wallet. An async method cannot be suspended on
+/// purpose without a service, so the borrow an in-flight operation holds is simulated directly
+/// and the public methods are observed around it.
+#[cfg(test)]
+mod tests {
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use super::*;
+    use rgb_lib::wallet::Cosigner;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A fixed BIP-39 phrase: every wallet below is built offline, nothing touches the chain.
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// A local port with no listener, so a browser request fails with a connection error.
+    const REFUSED_URL: &str = "http://127.0.0.1:65534";
+
+    fn singlesig(name: &str) -> RgbLibWallet {
+        RgbLibWallet::create(
+            name.to_string(),
+            MNEMONIC.to_string(),
+            "regtest".to_string(),
+        )
+        .expect("the wallet is created offline")
+    }
+
+    fn multisig_keys() -> MultisigKeys {
+        let cosigner = || {
+            let keys = core_generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+            Cosigner {
+                account_xpub_vanilla: keys.account_xpub_vanilla,
+                account_xpub_colored: keys.account_xpub_colored,
+                vanilla_keychain: None,
+                master_fingerprint: keys.master_fingerprint,
+            }
+        };
+        MultisigKeys::new(vec![cosigner(), cosigner()], 2, 2)
+    }
+
+    fn multisig_keys_json() -> String {
+        serde_json::to_string(&multisig_keys()).expect("the multisig keys serialize")
+    }
+
+    fn multisig() -> RgbLibMultisigWallet {
+        RgbLibMultisigWallet::create(
+            "busy-multisig".to_string(),
+            multisig_keys_json(),
+            "regtest".to_string(),
+        )
+        .expect("the multisig wallet is created offline")
+    }
+
+    fn message(err: JsValue) -> String {
+        err.as_string().expect("the bindings throw a string")
+    }
+
+    /// Whether `haystack` carries `needle`; used to assert no secret leaks into a snapshot or an
+    /// error, without repeating the secret in a failure message.
+    fn carries(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Create, flush and drop a wallet, then `load` it back: the sequence guard accepts both
+    /// writes and the restored wallet hands out the address derived after the last flush.
+    #[wasm_bindgen_test]
+    async fn durable_wallet_round_trip_over_indexed_db() {
+        const NAME: &str = "binding-durable-e2e";
+        core_delete_snapshot(NAME).await.unwrap();
+
+        let wallet = singlesig(NAME);
+        let first_address = wallet.get_address().unwrap();
+        let id = wallet.id().unwrap();
+        let snapshot = wallet.snapshot().unwrap();
+        assert!(!snapshot.is_empty());
+        assert!(
+            !carries(&snapshot, MNEMONIC.as_bytes()),
+            "the snapshot carries the mnemonic"
+        );
+        // the first write starts at sequence 0; the second proves the instance adopts its own
+        // committed sequence instead of being rejected as stale
+        wallet.flush().await.unwrap();
+        wallet.flush().await.unwrap();
+        let next_address = wallet.get_address().unwrap();
+        assert_ne!(next_address, first_address);
+        drop(wallet);
+
+        let loaded = RgbLibWallet::load(
+            NAME.to_string(),
+            MNEMONIC.to_string(),
+            "regtest".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.id().unwrap(), id);
+        assert_eq!(
+            loaded.get_address().unwrap(),
+            next_address,
+            "the loaded wallet did not resume at the stored address index"
+        );
+
+        loaded.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+    }
+
+    /// Deleting the record detaches the instance: its flush is refused, and a new `load` under
+    /// the same name starts from a fresh wallet instead of resurrecting the deleted snapshot.
+    #[wasm_bindgen_test]
+    async fn deleting_the_snapshot_detaches_and_restarts_fresh() {
+        const NAME: &str = "binding-delete-e2e";
+        core_delete_snapshot(NAME).await.unwrap();
+
+        let wallet = singlesig(NAME);
+        let first_address = wallet.get_address().unwrap();
+        wallet.flush().await.unwrap();
+
+        wallet.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+
+        let err = message(wallet.flush().await.unwrap_err());
+        assert_eq!(
+            err,
+            "the wallet snapshot was deleted: this instance is detached, call load again to start a new wallet"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+
+        // no record exists, so load creates a fresh wallet at sequence 0 and the first address
+        let fresh = RgbLibWallet::load(
+            NAME.to_string(),
+            MNEMONIC.to_string(),
+            "regtest".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh.get_address().unwrap(), first_address);
+        fresh.flush().await.unwrap();
+        fresh.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+    }
+
+    /// A refused indexer is a sanitized error, never a panic, and the wallet stays usable.
+    #[wasm_bindgen_test]
+    async fn refused_indexer_is_a_sanitized_error_and_keeps_the_wallet_usable() {
+        let wallet = singlesig("binding-sync-e2e");
+        let err = message(
+            wallet
+                .sync(REFUSED_URL.to_string(), Some(2))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            err.starts_with("cannot sync the wallet: Indexer error:"),
+            "unexpected sync error: {err}"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+        assert_eq!(wallet.name().unwrap(), "binding-sync-e2e");
+        assert!(wallet.get_address().unwrap().starts_with("bcrt1"));
+    }
+
+    /// With no pending transfer, both online methods reject with their documented prefix and a
+    /// sanitized transport error; no proxy or indexer service exists in the required job.
+    #[wasm_bindgen_test]
+    async fn receive_and_online_sync_without_a_transfer_fail_cleanly() {
+        let wallet = singlesig("binding-online-e2e");
+        // a transfer ID no pending invoice of this fresh wallet matches
+        let transfer_id = "0".repeat(64);
+        let err = message(
+            wallet
+                .receive_transfer(
+                    REFUSED_URL.to_string(),
+                    REFUSED_URL.to_string(),
+                    transfer_id,
+                    None,
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            err.starts_with("cannot receive the transfer:"),
+            "unexpected receive error: {err}"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+
+        // syncOnline scans first, so the refused indexer is the clean documented failure
+        let err = message(
+            wallet
+                .sync_online(
+                    REFUSED_URL.to_string(),
+                    REFUSED_URL.to_string(),
+                    None,
+                    Some(2),
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            err.starts_with("cannot sync the wallet online:"),
+            "unexpected online sync error: {err}"
+        );
+        assert!(!carries(err.as_bytes(), MNEMONIC.as_bytes()));
+        assert!(wallet.get_address().unwrap().starts_with("bcrt1"));
+    }
+
+    /// The hub-free multisig class carries the same durable round trip: descriptors and id survive
+    /// a flush and load, and the loaded instance adopts the stored sequence.
+    #[wasm_bindgen_test]
+    async fn multisig_durable_round_trip_over_indexed_db() {
+        const NAME: &str = "binding-multisig-e2e";
+        core_delete_snapshot(NAME).await.unwrap();
+        let keys = multisig_keys_json();
+
+        let wallet =
+            RgbLibMultisigWallet::create(NAME.to_string(), keys.clone(), "regtest".to_string())
+                .unwrap();
+        let address = wallet.get_address(7).unwrap();
+        let id = wallet.id().unwrap();
+        let descriptors = wallet.get_descriptors().unwrap();
+        wallet.flush().await.unwrap();
+        drop(wallet);
+
+        let loaded = RgbLibMultisigWallet::load(NAME.to_string(), keys, "regtest".to_string())
+            .await
+            .unwrap();
+        assert_eq!(loaded.id().unwrap(), id);
+        assert_eq!(loaded.get_descriptors().unwrap(), descriptors);
+        assert_eq!(loaded.get_address(7).unwrap(), address);
+        // load adopted the stored sequence, so the next guarded write is accepted
+        loaded.flush().await.unwrap();
+
+        loaded.delete_snapshot(NAME.to_string()).await.unwrap();
+        assert!(load_snapshot_record(NAME).await.unwrap().is_none());
+    }
+
+    /// The second call on a held instance reports the busy error; once the first operation ends
+    /// the same instance serves the next call.
+    #[wasm_bindgen_test]
+    fn overlapping_calls_are_rejected() {
+        let wallet = singlesig("busy-test");
+        // stand in for an async operation suspended at an await
+        let slot = Rc::clone(&wallet.wallet);
+        let held = slot.try_borrow_mut().expect("the fresh wallet is free");
+
+        for err in [
+            wallet.get_btc_balance().unwrap_err(),
+            wallet.snapshot().unwrap_err(),
+            wallet.name().unwrap_err(),
+            wallet.id().unwrap_err(),
+            wallet.get_wallet_data().unwrap_err(),
+            wallet.list_assets().unwrap_err(),
+            wallet.get_address().unwrap_err(),
+        ] {
+            assert_eq!(message(err), WALLET_BUSY);
+        }
+
+        drop(held);
+        // the first operation finished: the same instance is usable and its state advanced
+        assert_eq!(wallet.name().unwrap(), "busy-test");
+        assert_eq!(wallet.id().unwrap().len(), 8);
+        assert!(!wallet.get_btc_balance().unwrap().is_empty());
+        assert!(wallet.get_address().unwrap().starts_with("bcrt1"));
+    }
+
+    /// The multisig class carries the same guard.
+    #[wasm_bindgen_test]
+    fn overlapping_multisig_calls_are_rejected() {
+        let wallet = multisig();
+        let slot = Rc::clone(&wallet.wallet);
+        let held = slot.try_borrow_mut().expect("the fresh wallet is free");
+
+        for err in [
+            wallet.name().unwrap_err(),
+            wallet.id().unwrap_err(),
+            wallet.get_address(0).unwrap_err(),
+        ] {
+            assert_eq!(message(err), WALLET_BUSY);
+        }
+
+        drop(held);
+        assert_eq!(wallet.name().unwrap(), "busy-multisig");
+        assert!(wallet.get_address(0).unwrap().starts_with("bcrt1"));
+        assert!(!wallet.snapshot().unwrap().is_empty());
+    }
+}

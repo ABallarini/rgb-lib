@@ -61,7 +61,7 @@ fn keep_stored_bdk_tx(column: bdk_tx::Column) -> SimpleExpr {
     .into()
 }
 
-impl DbTxn {
+impl SqliteTxn {
     /// Get the aggregate BDK [`ChangeSet`] from the database.
     pub(crate) fn get_bdk_changeset(&self) -> Result<ChangeSet, Error> {
         block_on(load_changeset(self.inner()))

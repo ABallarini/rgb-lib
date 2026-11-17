@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 fn check_wallet(
     party: &impl OfflineSigParty<W = Wallet>,
     network: BitcoinNetwork,
@@ -86,6 +89,405 @@ fn success() {
         .unwrap()
     );
     check_wallet(&party, bitcoin_network, vanilla_keychain);
+}
+
+#[test]
+#[parallel]
+fn memory_database_success() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_data = data_dir.wallet_data();
+
+    let wallet = Wallet::new_with_database(
+        wallet_data,
+        SinglesigKeys::from_keys(&keys, None),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+
+    // construction ran against the injected backend, not SQLite
+    assert!(wallet.database().memory_backend().is_some());
+    assert_eq!(
+        wallet.get_wallet_data().bitcoin_network,
+        BitcoinNetwork::Regtest
+    );
+    assert_eq!(
+        wallet.get_keys().master_fingerprint,
+        keys.master_fingerprint
+    );
+
+    // reads go through the wallet tables and the RGB store of the same backend
+    let assets = wallet.list_assets(vec![]).unwrap();
+    assert!(assets.nia.unwrap_or_default().is_empty());
+    assert!(assets.uda.unwrap_or_default().is_empty());
+    assert!(assets.cfa.unwrap_or_default().is_empty());
+    assert!(assets.ifa.unwrap_or_default().is_empty());
+}
+
+#[test]
+#[parallel]
+fn new_in_memory_success() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+
+    let wallet = Wallet::new_in_memory(
+        data_dir.wallet_data(),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+
+    // the host-facing constructor always selects the snapshot-capable memory backend
+    assert!(wallet.database().memory_backend().is_some());
+    assert!(wallet.snapshot().unwrap().is_some());
+    assert_eq!(
+        wallet.get_keys().master_fingerprint,
+        keys.master_fingerprint
+    );
+}
+
+/// Seed the one unspent colored TXO the offline issuer allocates asset amounts to.
+fn seed_colored_txo(wallet: &Wallet) {
+    use crate::database::entities::txo::ActiveModel as DbTxoActMod;
+    use sea_orm::ActiveValue;
+
+    wallet
+        .database()
+        .memory_backend()
+        .unwrap()
+        .db
+        .set_txo(DbTxoActMod {
+            idx: ActiveValue::NotSet,
+            txid: ActiveValue::Set(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vout: ActiveValue::Set(0),
+            btc_amount: ActiveValue::Set("1000".to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(true),
+            pending_witness: ActiveValue::Set(false),
+        })
+        .unwrap();
+}
+
+fn memory_counts(wallet: &Wallet) -> (usize, usize, usize, usize) {
+    wallet
+        .database()
+        .memory_backend()
+        .unwrap()
+        .counters()
+        .counts()
+}
+
+#[test]
+#[parallel]
+fn memory_database_operations_hit_injected_backend() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let mut wallet = Wallet::new_with_database(
+        data_dir.wallet_data(),
+        SinglesigKeys::from_keys(&keys, None),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+
+    // count only what the wallet operations below do, not construction
+    let before = memory_counts(&wallet);
+
+    let wallet_data = wallet.get_wallet_data();
+    assert_eq!(wallet_data.bitcoin_network, BitcoinNetwork::Regtest);
+    let address = wallet.get_address().unwrap();
+    assert!(address.starts_with("bcrt1"));
+    seed_colored_txo(&wallet);
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .unwrap();
+    let assets = wallet.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+
+    let (begin, writes, reads, bdk) = memory_counts(&wallet);
+    assert!(begin > before.0, "no transaction hit the injected backend");
+    assert!(writes > before.1, "no asset write hit the injected backend");
+    assert!(reads > before.2, "no asset read hit the injected backend");
+    assert!(bdk > before.3, "no BDK update hit the injected backend");
+}
+
+#[test]
+#[parallel]
+fn memory_database_restored_operations_hit_injected_backend() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet_data = data_dir.wallet_data();
+
+    let wallet = Wallet::new_with_database(
+        wallet_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    seed_colored_txo(&wallet);
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+
+    let mut restored = Wallet::from_snapshot(&snapshot, wallet_data, wallet_keys).unwrap();
+    let before = memory_counts(&restored);
+
+    let restored_data = restored.get_wallet_data();
+    assert_eq!(restored_data.bitcoin_network, BitcoinNetwork::Regtest);
+    let address = restored.get_address().unwrap();
+    assert!(address.starts_with("bcrt1"));
+    let assets = restored.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+
+    let (begin, writes, reads, bdk) = memory_counts(&restored);
+    assert!(begin > before.0, "no transaction hit the restored backend");
+    assert!(reads > before.2, "no asset read hit the restored backend");
+    assert!(bdk > before.3, "no BDK update hit the restored backend");
+    // nothing in a read path writes assets
+    assert_eq!(writes, before.1);
+    // the restored wallet can still be snapshotted
+    assert!(restored.snapshot().unwrap().is_some());
+}
+
+#[test]
+#[parallel]
+fn native_constructor_selects_sqlite() {
+    let data_dir = PrivateDataDir::new();
+    let wallet = data_dir.wallet(true, None);
+    assert!(wallet.database().memory_backend().is_none());
+    assert_eq!(
+        wallet.get_wallet_data().bitcoin_network,
+        BitcoinNetwork::Regtest
+    );
+}
+
+#[test]
+#[parallel]
+fn snapshot_and_restore_memory_success() {
+    use crate::database::entities::txo::ActiveModel as DbTxoActMod;
+    use sea_orm::ActiveValue;
+
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet_data = data_dir.wallet_data();
+
+    let wallet = Wallet::new_with_database(
+        wallet_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+
+    // the offline issuer needs one unspent colored TXO to allocate the asset amounts to
+    wallet
+        .database()
+        .memory_backend()
+        .unwrap()
+        .db
+        .set_txo(DbTxoActMod {
+            idx: ActiveValue::NotSet,
+            txid: ActiveValue::Set(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vout: ActiveValue::Set(0),
+            btc_amount: ActiveValue::Set("1000".to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(true),
+            pending_witness: ActiveValue::Set(false),
+        })
+        .unwrap();
+
+    let asset = wallet
+        .issue_asset_nia("TICKER".to_string(), "NAME".to_string(), 0, vec![100])
+        .unwrap();
+    let fingerprint = wallet.get_keys().master_fingerprint.clone();
+
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    assert!(!snapshot.is_empty());
+    // the snapshot is the wallet envelope, and the backend keeps the manifest for later flushes
+    assert!(snapshot.starts_with(b"RGBWL"));
+    assert!(
+        wallet
+            .database()
+            .memory_backend()
+            .unwrap()
+            .wallet_manifest()
+            .is_some()
+    );
+    // the DB snapshot carries the persisted wallet state, never the mnemonic
+    let mnemonic = keys.mnemonic.clone();
+    assert!(
+        !snapshot
+            .windows(mnemonic.len())
+            .any(|window| window == mnemonic.as_bytes())
+    );
+    drop(wallet);
+
+    // a restore with settings the snapshot was not created with is rejected
+    let mut wallet_data_bad = wallet_data.clone();
+    wallet_data_bad.max_allocations_per_utxo += 1;
+    assert!(matches!(
+        Wallet::from_snapshot(&snapshot, wallet_data_bad, wallet_keys.clone()),
+        Err(Error::WalletSettingMismatch { .. })
+    ));
+
+    // the manifest written by the first construction is in the same wallet dir
+    let restored = Wallet::from_snapshot(&snapshot, wallet_data.clone(), wallet_keys).unwrap();
+    assert_eq!(restored.get_keys().master_fingerprint, fingerprint);
+    assert_eq!(
+        restored.get_wallet_data().bitcoin_network,
+        wallet_data.bitcoin_network
+    );
+    let assets = restored.list_assets(vec![]).unwrap();
+    assert!(
+        assets
+            .nia
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.asset_id == asset.asset_id)
+    );
+}
+
+#[test]
+#[parallel]
+fn snapshot_restore_keeps_the_schema_set_it_was_written_with() {
+    let data_dir = PrivateDataDir::new();
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    // the four schemas a wallet created before BFA support listed
+    let mut old_data = data_dir.wallet_data();
+    old_data.supported_schemas = vec![
+        AssetSchema::Nia,
+        AssetSchema::Uda,
+        AssetSchema::Cfa,
+        AssetSchema::Ifa,
+    ];
+    let wallet = Wallet::new_with_database(
+        old_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+
+    // a caller whose wallet now also supports BFA restores it: the schemas travel in the manifest
+    // and the snapshot's own set wins over the one the caller lists
+    let mut new_data = old_data.clone();
+    new_data.supported_schemas = AssetSchema::VALUES.to_vec();
+    let restored = Wallet::from_snapshot(&snapshot, new_data, wallet_keys.clone())
+        .expect("a snapshot written before BFA support restores");
+    assert_eq!(
+        restored.get_wallet_data().supported_schemas,
+        old_data.supported_schemas
+    );
+    // the restored wallet writes the same set again, so it keeps restoring
+    let snapshot = restored.snapshot().unwrap().unwrap();
+    drop(restored);
+    let restored = Wallet::from_snapshot(&snapshot, data_dir.wallet_data(), wallet_keys)
+        .expect("the restored snapshot restores again");
+    assert_eq!(
+        restored.get_wallet_data().supported_schemas,
+        old_data.supported_schemas
+    );
+}
+
+#[test]
+#[parallel]
+fn bfa_snapshot_restores_and_mainnet_keeps_the_opt_in() {
+    let data_dir = PrivateDataDir::new();
+
+    // regtest: a wallet supporting BFA snapshots and restores with it
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let wallet = Wallet::new_with_database(
+        data_dir.wallet_data(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+    let restored = Wallet::from_snapshot(&snapshot, data_dir.wallet_data(), wallet_keys)
+        .expect("a BFA snapshot restores off mainnet");
+    assert!(
+        restored
+            .get_wallet_data()
+            .supported_schemas
+            .contains(&AssetSchema::Bfa)
+    );
+
+    // mainnet: BFA is only operated with an explicit opt-in, so the snapshot of a wallet created
+    // with one does not restore for a caller that doesn't opt in
+    let keys = generate_keys(BitcoinNetwork::Mainnet, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let mut mainnet_data = data_dir.wallet_data();
+    mainnet_data.bitcoin_network = BitcoinNetwork::Mainnet;
+    // the schemas a mainnet wallet allows, plus the bridged one the caller opts into
+    mainnet_data.supported_schemas = vec![
+        AssetSchema::Nia,
+        AssetSchema::Uda,
+        AssetSchema::Cfa,
+        AssetSchema::Bfa,
+    ];
+    mainnet_data.allow_reckless_schemas = true;
+    let wallet = Wallet::new_with_database(
+        mainnet_data.clone(),
+        wallet_keys.clone(),
+        Some(RgbLibDatabase::new_memory()),
+    )
+    .unwrap();
+    let snapshot = wallet.snapshot().unwrap().unwrap();
+    drop(wallet);
+
+    let mut no_opt_in = mainnet_data.clone();
+    no_opt_in.allow_reckless_schemas = false;
+    // without the opt-in the mainnet check refuses the schema, so the snapshot of a wallet that
+    // operated it does not restore silently
+    let err = Wallet::from_snapshot(&snapshot, no_opt_in, wallet_keys.clone())
+        .err()
+        .expect("a mainnet wallet without the opt-in must not restore BFA");
+    assert!(
+        matches!(
+            err,
+            Error::CannotUseSchemaOnMainnet {
+                asset_schema: AssetSchema::Bfa
+            }
+        ),
+        "{err:?}"
+    );
+    let restored = Wallet::from_snapshot(&snapshot, mainnet_data, wallet_keys)
+        .expect("the opted-in snapshot restores");
+    assert!(
+        restored
+            .get_wallet_data()
+            .supported_schemas
+            .contains(&AssetSchema::Bfa)
+    );
+}
+
+#[test]
+#[parallel]
+fn sqlite_snapshot_is_none() {
+    let data_dir = PrivateDataDir::new();
+    let wallet = data_dir.wallet(true, None);
+    assert!(wallet.snapshot().unwrap().is_none());
 }
 
 #[cfg(feature = "electrum")]
@@ -196,6 +598,8 @@ fn mainnet_success_esplora() {
     assert_eq!(party.get_wallet_data().bitcoin_network, bitcoin_network);
 }
 
+// uses unix file permissions and a writability check that only exists natively
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 #[parallel]
 fn fail() {
@@ -262,21 +666,25 @@ fn fail() {
     assert!(matches!(result, Err(Error::FingerprintMismatch)));
 
     // non-writable wallet dir
-    let non_writable_path = "non_writable";
-    let _ = fs::remove_dir(non_writable_path);
-    fs::create_dir(non_writable_path).unwrap();
-    // set the permissions to read and execute only (no write permissions)
-    let permissions = fs::Permissions::from_mode(0o555);
-    fs::set_permissions(non_writable_path, permissions).unwrap();
-    // try to setup logger, expecting it to receive a permission denied error
-    let result = std::panic::catch_unwind(|| setup_logger(non_writable_path, Some("log")));
-    assert!(result.is_ok());
-    let res = result.unwrap();
-    assert!(res.is_err());
-    let err = res.err().unwrap();
-    assert!(matches!(err, Error::IO { details: m } if m.starts_with("Permission denied")));
-    // remove non writable directory
-    fs::remove_dir(non_writable_path).unwrap();
+    // permission bits are only enforced on unix; windows has no equivalent here
+    #[cfg(unix)]
+    {
+        let non_writable_path = "non_writable";
+        let _ = fs::remove_dir(non_writable_path);
+        fs::create_dir(non_writable_path).unwrap();
+        // set the permissions to read and execute only (no write permissions)
+        let permissions = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(non_writable_path, permissions).unwrap();
+        // try to setup logger, expecting it to receive a permission denied error
+        let result = std::panic::catch_unwind(|| setup_logger(non_writable_path, Some("log")));
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert!(matches!(err, Error::IO { details: m } if m.starts_with("Permission denied")));
+        // remove non writable directory
+        fs::remove_dir(non_writable_path).unwrap();
+    }
 }
 
 #[cfg(feature = "electrum")]
@@ -763,6 +1171,7 @@ fn legacy_bdk_store_is_imported() {
     let database = setup_db(dir.path()).unwrap();
     let bdk_wallet = setup_bdk(
         &database,
+        &*default_files(dir.path()),
         dir.path(),
         descriptors.colored.clone(),
         descriptors.vanilla.clone(),

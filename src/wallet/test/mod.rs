@@ -26,8 +26,6 @@ use biscuit_auth::{KeyPair, builder::date, macros::*};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 #[cfg(feature = "electrum")]
-use regex::RegexSet;
-#[cfg(feature = "electrum")]
 use rgbstd::stl::{EmbeddedMedia as RgbEmbeddedMedia, ProofOfReserves as RgbProofOfReserves};
 #[cfg(feature = "_online")]
 use rgbstd::{Assign, RevealedValue, TypedAssigns};
@@ -420,7 +418,7 @@ pub fn mock_token_data(token_data: TokenData) -> TokenData {
 }
 
 #[cfg(feature = "_online")]
-pub fn mock_input_unspents<W: WalletOnline + ?Sized>(
+pub fn mock_input_unspents<W: WalletPrepare + ?Sized>(
     wallet: &W,
     unspents: &[LocalUnspent],
 ) -> Vec<LocalUnspent> {
@@ -667,6 +665,9 @@ mod delete_transfers;
 mod drain_to;
 #[cfg(feature = "electrum")]
 mod fail_transfers;
+// native only: these drive a real wallet directory
+#[cfg(not(target_arch = "wasm32"))]
+mod files;
 #[cfg(feature = "electrum")]
 mod finalize_psbt;
 mod get_address;
@@ -714,6 +715,9 @@ mod migrate;
 mod mint;
 #[cfg(feature = "electrum")]
 mod multisig;
+// snapshot/restore needs no hub, so it runs under the plain `wallet` feature too
+#[path = "multisig/snapshot.rs"]
+mod multisig_snapshot;
 mod new;
 #[cfg(feature = "electrum")]
 mod refresh;

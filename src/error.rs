@@ -224,7 +224,10 @@ pub enum Error {
     InsufficientAllocationSlots,
 
     /// There are not enough assignments of the requested asset to fulfill the request
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     #[error("Insufficient total assignments for asset: {asset_id}")]
     InsufficientAssignments {
         /// Asset ID
@@ -988,9 +991,19 @@ pub enum Error {
     WrongPassword,
 }
 
-#[cfg(feature = "_validation")]
+#[cfg(any(
+    feature = "_validation",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
+    #[error("Indexer internal error: {details}")]
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", feature = "esplora_async")),
+        allow(dead_code)
+    )]
+    Internal { details: String },
+
     #[cfg(feature = "bitcoind_validation")]
     #[error("Bitcoind error: {0}")]
     Bitcoind(#[from] BitcoindRpcError),
@@ -999,7 +1012,9 @@ pub(crate) enum IndexerError {
     #[error("Electrum error: {0}")]
     Electrum(#[from] ElectrumError),
 
-    #[cfg(feature = "esplora_validation")]
+    // the blocking and the browser async transports share the client error type, so both map
+    // through the same variant and the same `Error::Indexer` details
+    #[cfg(any(feature = "esplora_async", feature = "esplora_validation"))]
     #[error("Esplora error: {0}")]
     Esplora(#[from] EsploraError),
 }
@@ -1037,6 +1052,11 @@ pub(crate) enum InternalError {
 
     #[error("Consensus encode error: {0}")]
     ConsensusEncode(#[from] bitcoin::io::Error),
+
+    /// A database constraint violation, shaped like the SQLite backend's [`Error::Database`].
+    #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
+    #[error("Database error: {0}")]
+    Database(String),
 
     #[error("From slice error: {0}")]
     FromSlice(#[from] amplify::FromSliceError),
@@ -1114,7 +1134,10 @@ impl From<bdk_wallet::bitcoin::psbt::PsbtParseError> for Error {
     }
 }
 
-#[cfg(feature = "_validation")]
+#[cfg(any(
+    feature = "_validation",
+    all(target_arch = "wasm32", feature = "esplora_async")
+))]
 impl From<IndexerError> for Error {
     fn from(e: IndexerError) -> Self {
         Error::Indexer {
@@ -1242,8 +1265,12 @@ impl From<std::io::Error> for Error {
 #[cfg(feature = "wallet")]
 impl From<InternalError> for Error {
     fn from(e: InternalError) -> Self {
-        Error::Internal {
-            details: e.to_string(),
+        match e {
+            #[cfg(any(test, target_arch = "wasm32", not(feature = "sqlite")))]
+            InternalError::Database(details) => Error::Database { details },
+            e => Error::Internal {
+                details: e.to_string(),
+            },
         }
     }
 }
@@ -1329,11 +1356,15 @@ mod tests {
             let err = Error::from(err);
             assert_matches!(err, Error::Indexer { details } if !details.is_empty());
         }
-        #[cfg(feature = "esplora")]
+        #[cfg(any(
+            feature = "esplora",
+            all(target_arch = "wasm32", feature = "esplora_async")
+        ))]
         {
             let err = IndexerError::Esplora(EsploraError::InvalidResponse);
             let err = Error::from(err);
-            assert_matches!(err, Error::Indexer { details } if !details.is_empty());
+            // both Esplora transports (blocking native and async browser) go through this shape
+            assert_matches!(err, Error::Indexer { details } if details == "Esplora error: InvalidResponse");
         }
     }
 

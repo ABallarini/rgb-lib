@@ -1,0 +1,46 @@
+[package]
+name = "rgb-lib-wasm"
+version = "0.1.0"
+authors = [
+    "Zoe Faltibà <zoefaltiba@gmail.com>",
+    "Nicola Busanello <nicola.busanello@gmail.com>",
+]
+edition = "2024"
+rust-version = "1.94.0"
+repository = "https://github.com/RGB-Tools/rgb-lib"
+homepage = "https://github.com/RGB-Tools/rgb-lib"
+license = "MIT"
+description = "wasm-bindgen bindings for the rgb-lib wallet"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "rgb_lib_wasm"
+
+[dependencies]
+# The shared wallet, over the in-memory backend: `wallet` without `sqlite` keeps the SQLite
+# driver, Tokio and the migration crate out of the wasm graph.
+rgb-lib = { version = "0.3.0-beta.7", path = "../../", default-features = false, features = [
+    "wallet",
+    "esplora_async",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# JSON bridge for structured optional arguments (`evm`), already in the wasm graph.
+js-sys = "0.3"
+
+# JSON return values for the structured `rgb-lib` objects; already in the root wallet graph.
+serde = "1"
+serde_json = "1"
+
+# Browser re-entrancy tests for the operation guard, run by the `wasm_browser_lifecycle` job.
+# Pinned to the release that pairs with wasm-bindgen 0.2.129: the CI job installs the matching
+# `wasm-bindgen-test-runner`, the same version the root Cargo.lock resolves.
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.80"
+
+# Separate crate, like `c-ffi` and `uniffi`: its own lockfile and no membership in the rgb-lib
+# workspace, so the root lockfile and default build stay untouched.
+[workspace]
+
+[profile.release]
+overflow-checks = true

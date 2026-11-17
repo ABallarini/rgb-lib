@@ -4,17 +4,27 @@
 
 use super::*;
 
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+use crate::api::jsonrpc::ServerInfoResponse;
+
+#[cfg(not(target_arch = "wasm32"))]
 const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour repr:24]:[minute]:[second].[subsecond digits:3]+00"
 );
 
-#[cfg(feature = "rgb_fs_store_migration")]
+// The legacy RGB store directory. It stays defined without the migration feature so that a build
+// that finds one can report it instead of silently skipping the import.
 pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 
 /// Where the legacy filesystem RGB store is moved to be deleted, once migrated into the DB, so
 /// that retiring it is atomic. Only ever on disk between that rename and the delete: a crash in
 /// between leaves this dir, which the next wallet open sweeps up and every backup skips.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) const RGB_RUNTIME_DELETING_DIR: &str = "rgb.deleting";
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) const LOG_FILE: &str = "log";
 
 /// Size cap for a strict-encoded fascia file, matching what rgb-ops uses for its own containers.
@@ -29,35 +39,19 @@ pub(crate) const KEYCHAIN_BTC: u8 = 0;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) const INDEXER_STOP_GAP: usize = 20;
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) const INDEXER_TIMEOUT: u64 = 10;
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) const INDEXER_RETRIES: u8 = 3;
 #[cfg(feature = "electrum")]
 pub(crate) const INDEXER_BATCH_SIZE: usize = 5;
 #[cfg(feature = "esplora")]
 pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 
-#[cfg(feature = "_online")]
-const PROXY_PROTOCOL_VERSION: &str = "1.0";
-
-// sea-orm with runtime-tokio-rustls needs a tokio runtime for connection pool management
-static TOKIO_RUNTIME: LazyLock<tokio::runtime::Runtime> =
-    LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to create the runtime"));
-
-/// Block on a future, spawning a new thread if already inside a Tokio runtime.
-pub fn block_on<F>(future: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // avoid blocking the Tokio runtime thread; spawn a new thread
-        std::thread::scope(|s| {
-            s.spawn(|| TOKIO_RUNTIME.block_on(future))
-                .join()
-                .expect("rgb-lib block_on thread panicked")
-        })
-    } else {
-        TOKIO_RUNTIME.block_on(future)
-    }
-}
+// The blocking runtime boundary lives in its own module; re-exported here because `utils::block_on`
+// is part of the public API.
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub use crate::runtime::block_on;
 
 /// Make a newly created file's directory entry durable.
 ///
@@ -75,17 +69,21 @@ pub(crate) fn sync_dir<P: AsRef<Path>>(_dir: P) -> Result<(), io::Error> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(
+    not(target_os = "windows"),
+    feature = "sqlite",
+    not(target_arch = "wasm32")
+))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().display().to_string()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
     const VERBATIM_PREFIX: &str = r#"\\?\"#;
     let p = p.as_ref().display().to_string();
-    if p.starts_with(VERBATIM_PREFIX) {
-        p[VERBATIM_PREFIX.len()..].to_string()
+    if let Some(stripped) = p.strip_prefix(VERBATIM_PREFIX) {
+        stripped.to_string()
     } else {
         p
     }
@@ -444,9 +442,12 @@ pub(crate) fn calculate_descriptor_from_xpub(
 /// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
 /// expiration it keeps the data awaiting retrieval. A proxy not advertising it is considered to
 /// grant none.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "_online"))]
     if let Some(grace) = mock_retention_grace() {
         return grace;
     }
@@ -458,7 +459,10 @@ pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
 
 /// The max number of media per transfer advertised by a proxy (`max_media`), `None` if it doesn't
 /// advertise a valid one.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
     info.max_media.as_ref().and_then(|max| max.parse().ok())
 }
@@ -467,21 +471,7 @@ pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
 #[cfg(feature = "_online")]
 pub(crate) fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> {
     let proxy_client = ProxyClient::new(proxy_url)?;
-    let server_info = proxy_client.get_info()?;
-    if let Some(info) = server_info.result {
-        if info.protocol_version == *PROXY_PROTOCOL_VERSION {
-            return Ok(info);
-        } else {
-            return Err(Error::InvalidProxyProtocol {
-                version: info.protocol_version,
-            });
-        }
-    }
-    let details = match server_info.error {
-        Some(err) => err.message,
-        None => s!("proxy response has neither result nor error"),
-    };
-    Err(Error::Proxy { details })
+    crate::api::jsonrpc::check_server_info(proxy_client.get_info()?)
 }
 
 #[cfg(feature = "_online")]
@@ -595,6 +585,9 @@ pub(crate) fn hash_bytes_hex(data: &[u8]) -> String {
 /// single filesystem, a reader (or a crash) never observes a partially-written
 /// file. The fsync (plus a best-effort directory fsync) makes the result
 /// durable across a power loss.
+///
+/// Native-only: a wasm wallet writes through its file adapter, never a path.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn atomic_write_with<F>(path: &Path, write: F) -> Result<(), Error>
 where
     F: FnOnce(&Path) -> Result<(), Error>,
@@ -625,6 +618,7 @@ where
 ///
 /// Exposed so a loader can recover a temp file left behind by a crash between the write and the
 /// rename.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn atomic_tmp_path(path: &Path) -> Result<PathBuf, Error> {
     let parent = path.parent().ok_or_else(|| Error::Internal {
         details: format!("cannot atomically write {path:?}: no parent directory"),
@@ -639,6 +633,7 @@ pub(crate) fn atomic_tmp_path(path: &Path) -> Result<PathBuf, Error> {
 }
 
 /// Atomically write `bytes` to `path`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     atomic_write_with(path, |tmp| Ok(fs::write(tmp, bytes)?))
 }
@@ -648,6 +643,34 @@ pub(crate) fn read_fascia(path: &Path) -> Result<Fascia, Error> {
     Fascia::strict_deserialize_from_file::<FASCIA_MAX_LEN>(path).map_err(|e| Error::Internal {
         details: format!("cannot read fascia {}: {e}", path.display()),
     })
+}
+
+/// Decode a fascia from its strict-encoded bytes, which is what [`read_fascia`] reads.
+///
+/// `source` names the file in the error, like [`read_fascia`] does with its path.
+pub(crate) fn fascia_from_bytes(bytes: Vec<u8>, source: &str) -> Result<Fascia, Error> {
+    let data =
+        Confined::<Vec<u8>, 0, FASCIA_MAX_LEN>::try_from(bytes).map_err(|e| Error::Internal {
+            details: format!("cannot read fascia {source}: {e}"),
+        })?;
+    Fascia::from_strict_serialized::<FASCIA_MAX_LEN>(data).map_err(|e| Error::Internal {
+        details: format!("cannot read fascia {source}: {e}"),
+    })
+}
+
+/// Encode a fascia to its strict-encoded bytes, as written by [`write_fascia`].
+#[cfg(any(
+    feature = "_online",
+    feature = "rgb_fs_store_migration",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) fn fascia_to_bytes(fascia: &Fascia) -> Result<Vec<u8>, Error> {
+    Ok(fascia
+        .to_strict_serialized::<FASCIA_MAX_LEN>()
+        .map_err(|e| Error::Internal {
+            details: format!("cannot serialize fascia: {e}"),
+        })?
+        .release())
 }
 
 /// Remove the RGB data (operations, consumers and commitment data) from the given PSBT, once they
@@ -691,6 +714,7 @@ pub(crate) fn check_psbt_parsable(psbt: &Psbt) -> Result<(), Error> {
 
 /// Write a fascia file atomically, so a crash mid-write cannot leave a torn one behind.
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
+#[allow(dead_code)] // native tests and the legacy migration use it independently of the indexer
 pub(crate) fn write_fascia(path: &Path, fascia: &Fascia) -> Result<(), Error> {
     let bytes = fascia
         .to_strict_serialized::<FASCIA_MAX_LEN>()
@@ -714,6 +738,21 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, Error> {
     Ok(sha256::Hash::from_engine(engine).to_string())
 }
 
+/// The digest [`hash_file`] produces, over bytes already in memory.
+///
+/// Note this is the `bitcoin` hash display order, not the plain hex of [`hash_bytes_hex`]: the
+/// values are exchanged with counterparties, so the two must not be confused.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) fn hash_file_bytes(bytes: &[u8]) -> String {
+    let mut engine = sha256::HashEngine::default();
+    engine.input(bytes);
+    sha256::Hash::from_engine(engine).to_string()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn log_timestamp(io: &mut dyn io::Write) -> io::Result<()> {
     let now: time::OffsetDateTime = now();
     write!(
@@ -724,10 +763,24 @@ fn log_timestamp(io: &mut dyn io::Write) -> io::Result<()> {
     )
 }
 
+/// Keeps the logger's drain alive. On wasm there is no file drain to flush, so the no-op guard
+/// keeps the same shape without spawning the async logger's thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type LoggerGuard = slog_async::AsyncGuard;
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Default)]
+pub(crate) struct LoggerGuard;
+
+// Pinned at compile time as well: the wasm build fails here if the async logger's worker handle
+// ever comes back into the guard.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(std::mem::size_of::<LoggerGuard>() == 0);
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn setup_logger<P: AsRef<Path>>(
     log_path: P,
     log_name: Option<&str>,
-) -> Result<(Logger, AsyncGuard), Error> {
+) -> Result<(Logger, LoggerGuard), Error> {
     let log_file = log_name.unwrap_or(LOG_FILE);
     let log_filepath = log_path.as_ref().join(log_file);
     let file = fs::OpenOptions::new()
@@ -743,6 +796,16 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     let logger = Logger::root(drain.fuse(), o!());
 
     Ok((logger, async_guard))
+}
+
+/// wasm: there is no filesystem to write a log file to, so callers get a discard logger.
+#[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn setup_logger<P: AsRef<Path>>(
+    _log_path: P,
+    _log_name: Option<&str>,
+) -> Result<(Logger, LoggerGuard), Error> {
+    Ok((Logger::root(slog::Discard, o!()), LoggerGuard))
 }
 
 pub(crate) fn now() -> OffsetDateTime {
@@ -796,6 +859,16 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
+    /// The witnesses anchoring `bundle_id`, as the browser prefetch needs them before opening the
+    /// database transaction that consumes the consignment.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora_async"))]
+    pub(crate) fn bundle_witnesses(&self, bundle_id: BundleId) -> Result<BTreeSet<RgbTxid>, Error> {
+        Ok(rgbstd::persistence::RgbStore::bundle_witnesses(
+            self.stock.as_store(),
+            bundle_id,
+        )?)
+    }
+
     pub(crate) fn consume_fascia(
         &mut self,
         fascia: Fascia,
@@ -833,7 +906,10 @@ impl<'txn> RgbStock<'txn> {
 
     /// The assignments on the given outpoints of every contract assigning state there, in a
     /// single store query
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn assignments_by_contract(
         &self,
         outpoints: impl IntoIterator<Item = impl Into<OutPoint>>,
@@ -890,7 +966,10 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn contract_schema(&self, contract_id: ContractId) -> Result<Schema, Error> {
         self.stock
             .as_store()
@@ -966,7 +1045,10 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn transfer_from_fascia_with_dag(
         &self,
         contract_id: ContractId,
@@ -990,7 +1072,10 @@ impl<'txn> RgbStock<'txn> {
             .map_err(Error::from)
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn transition_builder_raw(
         &self,
         contract_id: ContractId,
@@ -1059,6 +1144,7 @@ mod tests {
         val: Option<u64>,
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_block_on_inside_tokio_runtime() {
         // calling block_on from within an active Tokio runtime takes the thread-spawn path
@@ -1393,5 +1479,30 @@ mod tests {
             get_indexer_and_resolver(&IndexerConfig::Electrum { url }, BitcoinNetwork::Regtest);
         // Indexer is not Debug, so the Ok variant cannot be printed by assert_matches
         assert!(matches!(result, Err(Error::InvalidIndexer { .. })));
+    }
+
+    /// Pins the native logger: same drain, level and format as before, and the guard keeps the
+    /// async worker alive until it is dropped, which flushes what was queued.
+    #[test]
+    fn logger_writes_the_native_file_and_flushes_on_guard_drop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (logger, guard) = setup_logger(dir.path(), Some("wallet_log")).expect("setup logger");
+        info!(logger, "wallet opened");
+        // the wallet holds the guard for its lifetime; dropping it joins the async worker
+        drop(guard);
+        let written =
+            fs::read_to_string(dir.path().join("wallet_log")).expect("the log file was written");
+        assert!(written.contains("wallet opened"), "{written}");
+        // the format still carries the UTC timestamp and the source location
+        assert!(written.contains("+00"), "{written}");
+        assert!(written.contains("src/utils.rs"), "{written}");
+
+        // the default file name is still `log`
+        let (logger, guard) = setup_logger(dir.path(), None).expect("setup default logger");
+        info!(logger, "default log file");
+        drop(guard);
+        let written = fs::read_to_string(dir.path().join(LOG_FILE))
+            .expect("the default log file was written");
+        assert!(written.contains("default log file"), "{written}");
     }
 }

@@ -4,19 +4,85 @@
 
 pub(crate) mod backup;
 pub(crate) mod core;
+// Wallet-relative storage seam: every wallet owns one adapter and routes its file operations
+// through it.
+pub(crate) mod files;
 #[cfg(feature = "_online")]
 pub(crate) mod indexer;
+// browser Esplora capability: wasm32 only, next to (not inside) the native online indexer paths
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) mod indexer_async;
 pub(crate) mod multisig;
 pub(crate) mod objects;
 pub(crate) mod offline;
 #[cfg(feature = "_online")]
 pub(crate) mod online;
+#[cfg(target_arch = "wasm32")]
+pub mod persistence;
+// the steps preparing an outgoing operation: shared by the native online wallet and the browser
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) mod prepare;
+// wallet-free checks shared by the native and browser receive drivers
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) mod receive_checks;
+// FOLLOW-UP(wasm-receive): the shared receive driver runs natively and, over the browser
+// transport in `receive_wasm`, on wasm32.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) mod receive;
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) mod receive_wasm;
+// browser burn and link: the shared authoring over the async transport, no `Online` object
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
+pub(crate) mod mint_wasm;
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
+pub(crate) mod send_wasm;
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
+pub(crate) mod transfer_wasm;
+#[cfg(all(feature = "esplora_async", target_arch = "wasm32"))]
+pub(crate) mod wasm_online;
+// async chain-resolution boundary: the browser fetches before the DB transaction opens, native
+// builds keep the blocking resolver
+#[cfg(feature = "wallet")]
+pub(crate) mod resolver_async;
 pub mod rust_only;
 pub(crate) mod singlesig;
 
 #[cfg(test)]
 pub(crate) mod test;
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) mod test_wasm;
+// Opt-in browser smoke test for the async transport/resolver against a controlled regtest
+// Esplora. Compiled only with `esplora_async`; returns early when no regtest URL is baked in.
+#[cfg(all(test, target_arch = "wasm32", feature = "esplora_async"))]
+pub(crate) mod test_wasm_online;
+// Opt-in browser test for the BFA EVM claim prefetch and reject list transport against the local
+// mock JSON-RPC node in `scripts/mock_evm_rpc.mjs`. Returns early when no mock URL is baked in.
+#[cfg(all(test, target_arch = "wasm32", feature = "esplora_async"))]
+pub(crate) mod test_wasm_bfa;
 
+#[cfg(feature = "wallet")]
+pub use crate::api::evm_claims::{EvmReceiveConfig, EvmReceiveOptions};
 pub use crate::database::enums::TypeOfTransition;
 #[cfg(feature = "_validation")]
 pub use crate::no_wallet::{BitcoindAuth, IndexerConfig, IndexerProtocol};
@@ -28,7 +94,9 @@ pub use crate::no_wallet::{
     RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo,
     TransitionGlobal, TransitionMetadata,
 };
-pub use backup::restore_backup;
+pub use backup::{
+    BackupInfo, RestoredBackup, backup_info_bytes, restore_backup, restore_backup_bytes,
+};
 pub use multisig::{Cosigner, MultisigKeys, MultisigWallet};
 #[cfg(feature = "_online")]
 pub use multisig::{
@@ -50,30 +118,95 @@ pub use objects::{
     LinkDetails, MintBeginResult, MintDetails, OnlineOptions, OperationResult, RefreshFilter,
     RefreshResult, RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
 };
+// the mint results are shared by the native online wallet and the browser operations
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
+pub use objects::{MintBeginResult, MintDetails};
+// the burn and link results are shared by the native online wallet and the browser operations
+#[cfg(all(
+    feature = "esplora_async",
+    target_arch = "wasm32",
+    not(feature = "_online")
+))]
+pub use objects::{
+    BurnBeginResult, BurnDetails, LinkBeginResult, LinkDetails, OperationResult, SendBeginResult,
+    SendDetails,
+};
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
 pub use online::{RgbWalletOpsOnline, check_indexer_url};
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use prepare::{MintChainConfig, MintTransport, SendTransport, WalletPrepare};
+#[cfg(feature = "_online")]
+pub(crate) use prepare::{
+    check_operation_expiration, clock_skew_margin, invoice_expiration_margin,
+};
 pub use singlesig::{SinglesigKeys, Wallet};
 
 pub(crate) use backup::WalletBackup;
+#[cfg(test)]
+pub(crate) use core::setup_db;
 pub(crate) use core::{
     ASSETS_DIR, MEDIA_DIR, NUM_KNOWN_SCHEMAS, WalletCore, WalletInternals, WalletManifest,
-    setup_bdk, setup_db, setup_new_wallet, setup_rgb,
+    setup_bdk, setup_db_with_backend, setup_new_wallet, setup_rgb,
 };
 #[cfg(feature = "_online")]
 pub use core::{SyncKeychain, SyncOptions, SyncStrategy};
+pub(crate) use files::{WalletFiles, WalletPath, WasmFilesState, default_files};
 #[cfg(feature = "bitcoind")]
 pub(crate) use indexer::BitcoindClient;
 #[cfg(feature = "_online")]
 pub(crate) use indexer::Indexer;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::PendingMintLocks;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::PendingRetrieval;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ProxyReceiveData;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ReceiveMatcher;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ReceiveMode;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::ReceivedConsignmentMeta;
+// types shared with the browser preparation of an outgoing operation
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use objects::SentMint;
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, ChangeDestination, ChangeSlots,
-    CleanAckOutcome, ConsignmentPayment, ExtraAllocations, FailTransfersOutcome, LocalRecipient,
-    LocalRecipientData, LocalWitnessData, MainTransition, OnlineData, PaymentSeal,
-    PendingMintLocks, PrepareRgbPsbtResult, PrepareTransferPsbtResult, ProxyReceiveData,
-    ReceiveMatcher, ReceiveMode, ReceivedConsignmentMeta, RefreshResultTrait, SelectedInputs,
-    SentMint, TakenSlots, TryFailBatchTransferOutcome,
+    ExtraAllocations, LocalRecipient, LocalRecipientData, LocalWitnessData, MainTransition,
+    PrepareRgbPsbtResult, PrepareTransferPsbtResult, SelectedInputs,
 };
 pub(crate) use objects::{
     AssetTransferColoringInfo, InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails,
@@ -81,20 +214,53 @@ pub(crate) use objects::{
     TransferData, TransferEndData,
 };
 #[cfg(feature = "_online")]
+pub(crate) use objects::{
+    CleanAckOutcome, FailTransfersOutcome, OnlineData, RefreshResultTrait,
+    TryFailBatchTransferOutcome,
+};
+// receive types shared with the browser driver
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "_online")),
+    allow(unused_imports)
+)] // used by the browser receive loop once wired
+pub(crate) use objects::{ConsignmentPayment, PaymentSeal, TakenSlots};
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use offline::TRANSFER_DATA_FILE;
 #[cfg(feature = "rgb_fs_store_migration")]
 pub(crate) use offline::TRANSFERS_DIR;
 pub(crate) use offline::WalletOffline;
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) use offline::max_utxo_asset_allocations;
 #[cfg(feature = "_online")]
+pub(crate) use online::NativeMint;
+#[cfg(feature = "_online")]
 pub(crate) use online::WalletOnline;
+// the receive driver is shared by the native and browser paths
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) use receive::ReceiveWallet;
+#[cfg(feature = "_online")]
+pub(crate) use receive::{NativeReceiveTransport, ReceiveDriver, drive_native};
 
 use super::*;
 
 pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
 pub(crate) const FASCIA_FILE: &str = "fascia";
 pub(crate) const UNSIGNED_PSBT_FILE: &str = "unsigned.psbt";
+/// Signed TX of an outgoing transfer, saved to broadcast it once the transfer is accepted
+pub(crate) const SIGNED_TX_FILE: &str = "signed.tx";
 
 /// Maximum time in the future, in seconds, an expiration can be set to, both for an invoice and
 /// for an outgoing operation: about 10 years. A later one is refused with
@@ -114,21 +280,30 @@ pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 /// The docs of `send_begin` and `send_init` state, in minutes, the operation expiration
 /// requirements following from it (this margin, [`INVOICE_EXPIRATION_MARGIN_SECS`] and their sum):
 /// update them along with it.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 
 /// Minimum time, in seconds, between the expiration of an outgoing operation and the earliest
 /// invoice expiration among its recipients, so the TX can only be released while the recipients
 /// are still waiting for it, leaving time to detect the ACKs and broadcast the TX and accounting
 /// for clock skew (see `v1.0-changes-spec.md` 6.1).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
 /// Minimum retention grace, in seconds, a recipient requires from the sender proxy
 /// (`retention_grace_secs`) to ACK a transfer: it's the time a released signed TX can still be
 /// retrieved after the operation expiration, so a recipient offline for longer might miss it. A
 /// transfer whose sender proxy grants less is NACKed (see `v1.0-changes-spec.md` 6.4).
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const MIN_SENDER_RETENTION_GRACE_SECS: u32 = 86400;
 
 /// Time, in seconds, a recipient waits after the broadcast deadline (the operation expiration plus
@@ -140,7 +315,10 @@ pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
 
 /// Maximum proof of work difficulty (leading zero bits) the wallet accepts to compute when posting
 /// a consignment; a proxy requiring more cannot be used to create transfers.
-#[cfg(feature = "_online")]
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
 pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";

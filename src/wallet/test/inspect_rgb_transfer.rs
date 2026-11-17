@@ -58,7 +58,7 @@ fn fail() {
     transition.insert(s!("nonce"), nonce.wrapping_add(1).into());
     let tampered_fascia: Fascia = serde_json::from_value(fascia_json).unwrap();
     let tampered_file = tempfile::NamedTempFile::with_prefix("inspect_rgb_transfer::").unwrap();
-    write_fascia(tampered_file.path(), &tampered_fascia).unwrap();
+    crate::utils::write_fascia(tampered_file.path(), &tampered_fascia).unwrap();
     let result = party.wallet.inspect_rgb_transfer(
         res.psbt,
         tampered_file.path().to_string_lossy().to_string(),

@@ -11,6 +11,8 @@ pub(crate) mod validation;
 
 use super::*;
 
+#[cfg(feature = "wallet")]
+pub use inspection::validate_consignment_offchain;
 pub use inspection::{
     BundleFilter, ConsignmentInspection, RgbGenesisInfo, RgbInputInfo, RgbInspection, RgbMediaInfo,
     RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo, TransitionGlobal, TransitionMetadata,

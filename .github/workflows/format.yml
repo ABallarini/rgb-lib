@@ -2,9 +2,9 @@ name: Format code
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
 
 env:
   CARGO_TERM_COLOR: always

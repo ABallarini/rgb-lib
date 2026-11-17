@@ -19,6 +19,37 @@ pub(crate) const MAX_ATTACHMENTS: usize = 20;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
+/// Serialize an issued contract to the bytes rgb-ops `ValidContract::save_file` writes.
+///
+/// rgb-ops exposes only a path-based `save_file` for a validated consignment, which cannot run in
+/// the browser. The layout is the contract's own file encoding with the validated-consignment
+/// magic and the JSON validation status appended; the native issuance test pins this output to
+/// `save_file`, byte for byte.
+#[allow(dead_code)] // wasm issuance and some feature/test combinations
+pub(crate) fn contract_file_bytes(valid_contract: &ValidContract) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    valid_contract
+        .clone()
+        .into_consignment()
+        .save(&mut bytes)
+        .map_err(|e| Error::Internal {
+            details: format!("cannot serialize issued contract: {e}"),
+        })?;
+    // a contract file starts with `RGB\0CON`; the validated form writes `RGB\0VCO`
+    bytes
+        .get_mut(4..7)
+        .ok_or_else(|| Error::Internal {
+            details: s!("serialized issued contract is missing its magic"),
+        })?
+        .copy_from_slice(b"VCO");
+    serde_json::to_writer(&mut bytes, valid_contract.validation_status()).map_err(|e| {
+        Error::Internal {
+            details: format!("cannot serialize issued contract status: {e}"),
+        }
+    })?;
+    Ok(bytes)
+}
+
 pub(crate) const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
 
 /// The maximum length of a confined collection, given an accessor returning it from a bundle.
@@ -58,6 +89,67 @@ pub(crate) fn contract_link(
         })
 }
 
+/// A proxy's answer to an invoice reservation, before the shared decision.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) enum InvoiceReservation {
+    /// The invoice is reserved; the proxy keeps its data for this many seconds past its expiration.
+    Reserved { retention_grace: u32 },
+    /// The proxy is draining and refused the reservation.
+    Draining,
+    /// The proxy was unreachable or does not speak the supported protocol.
+    Unreachable,
+}
+
+/// Turn the per-endpoint reservation outcomes into the result of a receive invoice.
+///
+/// At least one proxy must have reserved the invoice; a draining proxy alone is reported as such,
+/// and a definite proxy-side rejection is returned as it is. Shared by the native blocking
+/// reservation and the browser one, so the retention deadline and the error choice cannot drift.
+#[cfg(any(
+    feature = "_online",
+    all(feature = "esplora_async", target_arch = "wasm32")
+))]
+pub(crate) fn apply_invoice_reservations(
+    receive_data: &mut ReceiveDataInternal,
+    outcomes: impl IntoIterator<Item = Result<InvoiceReservation, Error>>,
+) -> Result<(), Error> {
+    let mut reserved = false;
+    let mut draining = false;
+    for outcome in outcomes {
+        match outcome? {
+            InvoiceReservation::Reserved { retention_grace } => {
+                reserved = true;
+                // only a blind receive keeps its allocation reserved until the deadline
+                if matches!(
+                    receive_data.recipient_type_full,
+                    RecipientTypeFull::Blind { .. }
+                ) {
+                    let deadline = receive_data
+                        .expiration_timestamp
+                        .saturating_add(i64::from(retention_grace));
+                    receive_data.retention_deadline = Some(std::cmp::max(
+                        receive_data.retention_deadline.unwrap_or(deadline),
+                        deadline,
+                    ));
+                }
+            }
+            InvoiceReservation::Draining => draining = true,
+            InvoiceReservation::Unreachable => {}
+        }
+    }
+    if !reserved {
+        return Err(if draining {
+            Error::ProxyDraining
+        } else {
+            Error::NoValidTransportEndpoint
+        });
+    }
+    Ok(())
+}
+
 pub trait WalletOffline: WalletBackup {
     fn bitcoin_network(&self) -> BitcoinNetwork {
         self.wallet_data().bitcoin_network
@@ -86,6 +178,51 @@ pub trait WalletOffline: WalletBackup {
     fn get_asset_transfer_dir<P: AsRef<Path>>(&self, transfer_dir: P, asset_id: &str) -> PathBuf {
         let asset_id_no_prefix = asset_id.replace(ASSET_ID_PREFIX, "");
         transfer_dir.as_ref().join(&asset_id_no_prefix)
+    }
+
+    /// Key of the `transfers` directory.
+    fn transfers_key(&self) -> Result<WalletPath, Error> {
+        WalletPath::from_segments(&[TRANSFERS_DIR])
+    }
+
+    /// Key of a transfer directory, named after its TXID (or after the receive IDs hash while the
+    /// transfer is still being prepared).
+    fn transfer_key(&self, transfer_id: &str) -> Result<WalletPath, Error> {
+        self.transfers_key()?.join(transfer_id)
+    }
+
+    /// Key of the `media_files` directory.
+    fn media_key(&self, digest: &str) -> Result<WalletPath, Error> {
+        WalletPath::from_segments(&[MEDIA_DIR])?.join(digest)
+    }
+
+    /// Remove media blobs saved earlier in the same receive, after one of them could not be saved.
+    fn cleanup_media_files(&self, keys: &[WalletPath]) -> Result<(), Error> {
+        for key in keys {
+            self.files().remove(key)?;
+        }
+        Ok(())
+    }
+
+    /// Read a fascia through the wallet adapter.
+    fn read_fascia_at(&self, key: &WalletPath) -> Result<Fascia, Error> {
+        crate::utils::fascia_from_bytes(self.files().read(key)?, key.as_str())
+    }
+
+    /// Write a fascia through the wallet adapter, atomically.
+    #[cfg(any(
+        feature = "_online",
+        feature = "rgb_fs_store_migration",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
+    fn write_fascia_at(&self, key: &WalletPath, fascia: &Fascia) -> Result<(), Error> {
+        let bytes = crate::utils::fascia_to_bytes(fascia).map_err(|e| Error::Internal {
+            details: match e {
+                Error::Internal { details } => format!("{details}: {key}"),
+                e => e.to_string(),
+            },
+        })?;
+        self.files().atomic_write(key, &bytes)
     }
 
     fn max_allocations_per_utxo(&self) -> u32 {
@@ -489,10 +626,10 @@ pub trait WalletOffline: WalletBackup {
         let src = original_file_path.as_ref().to_string_lossy().to_string();
         let dst = media.clone().file_path;
         if src != dst {
-            atomic_write_with(Path::new(&dst), |tmp| {
-                fs::copy(&src, tmp)?;
-                Ok(())
-            })?;
+            // the source is a file supplied by the host, the destination is a wallet blob
+            let bytes = fs::read(&src)?;
+            self.files()
+                .atomic_write(&self.wallet_key(Path::new(&dst))?, &bytes)?;
         }
         Ok(())
     }
@@ -568,6 +705,15 @@ pub trait WalletOffline: WalletBackup {
         let valid_contract = builder.issue_contract().expect("issuance should succeed");
         let asset_id = valid_contract.contract_id().to_string();
         let contract_path = self.get_issue_consignment_path(&asset_id);
+        #[cfg(target_arch = "wasm32")]
+        {
+            // rgb-ops only writes a validated consignment to a path, so the browser rebuilds the
+            // exact bytes and stores them through its blob adapter under the native key
+            let bytes = contract_file_bytes(&valid_contract)?;
+            self.files()
+                .atomic_write(&self.wallet_key(&contract_path)?, &bytes)?;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         atomic_write_with(&contract_path, |tmp| Ok(valid_contract.save_file(tmp)?))?;
         Ok((asset_id, contract_path, valid_contract))
     }
@@ -1305,11 +1451,17 @@ pub trait WalletOffline: WalletBackup {
         Ok(endpoints)
     }
 
+    /// Everything a receive invoice needs before it is reserved on any proxy: the validation of
+    /// the endpoints and the expiration, the blind UTXO or witness script, the invoice and the
+    /// per-operation key.
+    ///
+    /// No network access and no database write. The native reservation runs right after this in
+    /// [`Self::create_receive_data`], inside the same transaction; the browser one runs after its
+    /// read transaction is closed, as it cannot hold a transaction across a `fetch`.
     #[allow(clippy::too_many_arguments)]
-    fn create_receive_data(
+    fn prepare_receive_data(
         &mut self,
         txn: &DbTxn,
-        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] online: Option<Online>,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: i64,
@@ -1321,16 +1473,6 @@ pub trait WalletOffline: WalletBackup {
 
         // no need to be online if an out-of-band exchange is requested
         let out_of_band = transport_endpoints.is_empty();
-        #[cfg(not(feature = "_online"))]
-        if !out_of_band {
-            return Err(Error::Offline);
-        }
-        #[cfg(feature = "_online")]
-        if let Some(online) = online {
-            self.check_online(online)?;
-        } else if !out_of_band {
-            return Err(Error::OnlineNeeded);
-        }
 
         let (beneficiary, recipient_type_full, blind_seal, script_pubkey) = match recipient_type {
             RecipientType::Blind => {
@@ -1456,70 +1598,6 @@ pub trait WalletOffline: WalletBackup {
         let invoice = invoice_builder.finish();
         let invoice_string = invoice.to_string();
 
-        // for a blind receive reserved on proxies, the invoice expiration plus the longest retention
-        // grace among them, until which a transfer to the invoice can still be downloaded
-        #[allow(unused_mut)]
-        let mut retention_deadline = None;
-
-        // reserve the invoice on the proxy/proxies; skipped for the out-of-band exchange
-        #[cfg(feature = "_online")]
-        if !out_of_band {
-            let recipient_pk = hex::encode(recipient_vk.to_bytes());
-            let invoice_id = invoice_id(&recipient_id, &recipient_pk);
-            let reservation_expiration = expiration_timestamp.to_string();
-            let mut reserved = false;
-            // whether a proxy refused the reservation as it is draining
-            let mut draining = false;
-            for endpoint in &endpoints {
-                // skip endpoints that are unreachable or run an unsupported protocol version
-                let Ok(info) = check_proxy(endpoint) else {
-                    continue;
-                };
-                let proxy_client = ProxyClient::new(endpoint)?;
-                // only needed by proxies with proxy-level authentication enabled
-                let signature = self.online_data().as_ref().and_then(|online_data| {
-                    online_data.proxy_auth_signature(
-                        endpoint,
-                        &prepare_invoice_auth_message(
-                            &invoice_id,
-                            &reservation_expiration,
-                            &recipient_pk,
-                        ),
-                    )
-                });
-                match proxy_client.prepare_invoice(
-                    &invoice_id,
-                    &reservation_expiration,
-                    &recipient_pk,
-                    signature,
-                ) {
-                    Ok(res) if res.error.is_none() => {
-                        reserved = true;
-                        if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
-                            let deadline = expiration_timestamp
-                                .saturating_add(i64::from(proxy_retention_grace(&info)));
-                            retention_deadline =
-                                Some(max(retention_deadline.unwrap_or(deadline), deadline));
-                        }
-                    }
-                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
-                        // a draining proxy, the invoice can be reserved on the other ones
-                        Error::ProxyDraining => draining = true,
-                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
-                        e => return Err(e),
-                    },
-                    Err(_) => continue,
-                }
-            }
-            if !reserved {
-                return Err(if draining {
-                    Error::ProxyDraining
-                } else {
-                    Error::NoValidTransportEndpoint
-                });
-            }
-        }
-
         Ok(ReceiveDataInternal {
             asset_id,
             detected_assignment,
@@ -1534,8 +1612,109 @@ pub trait WalletOffline: WalletBackup {
             operation_secret_key: recipient_sk.to_bytes().to_vec(),
             recipient_pubkey: recipient_vk.to_bytes().to_vec(),
             encryption,
-            retention_deadline,
+            // set once the invoice is reserved on its proxies
+            retention_deadline: None,
         })
+    }
+
+    /// Create a receive invoice, reserving it on its proxies when it has transport endpoints.
+    ///
+    /// The `online` object is required when transport endpoints are provided, since the recipient
+    /// ID is reserved on their proxies, and can be `None` for the out-of-band exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn create_receive_data(
+        &mut self,
+        txn: &DbTxn,
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))] online: Option<Online>,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: i64,
+        transport_endpoints: Vec<String>,
+        recipient_type: RecipientType,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveDataInternal, Error> {
+        // no need to be online if an out-of-band exchange is requested
+        let out_of_band = transport_endpoints.is_empty();
+        #[cfg(not(feature = "_online"))]
+        if !out_of_band {
+            return Err(Error::Offline);
+        }
+        #[cfg(feature = "_online")]
+        if let Some(online) = online {
+            self.check_online(online)?;
+        } else if !out_of_band {
+            return Err(Error::OnlineNeeded);
+        }
+
+        #[allow(unused_mut)]
+        let mut receive_data = self.prepare_receive_data(
+            txn,
+            asset_id,
+            assignment,
+            expiration_timestamp,
+            transport_endpoints,
+            recipient_type,
+            encryption,
+        )?;
+        // reserve the invoice on the proxy/proxies; skipped for the out-of-band exchange
+        #[cfg(feature = "_online")]
+        if !out_of_band {
+            self.reserve_receive_data(&mut receive_data)?;
+        }
+        Ok(receive_data)
+    }
+
+    /// Reserve the invoice of `receive_data` on its proxy endpoints with the native blocking
+    /// client.
+    ///
+    /// The per-endpoint outcomes are turned into the final reservation by
+    /// [`apply_invoice_reservations`], the same decision the browser transport uses.
+    #[cfg(feature = "_online")]
+    fn reserve_receive_data(&self, receive_data: &mut ReceiveDataInternal) -> Result<(), Error> {
+        let recipient_pk = hex::encode(&receive_data.recipient_pubkey);
+        let invoice_id = invoice_id(&receive_data.recipient_id, &recipient_pk);
+        let reservation_expiration = receive_data.expiration_timestamp.to_string();
+        let mut outcomes: Vec<Result<InvoiceReservation, Error>> =
+            Vec::with_capacity(receive_data.endpoints.len());
+        for endpoint in &receive_data.endpoints {
+            // skip endpoints that are unreachable or run an unsupported protocol version
+            let Ok(info) = check_proxy(endpoint) else {
+                outcomes.push(Ok(InvoiceReservation::Unreachable));
+                continue;
+            };
+            let proxy_client = ProxyClient::new(endpoint)?;
+            // only needed by proxies with proxy-level authentication enabled
+            let signature = self.online_data().as_ref().and_then(|online_data| {
+                online_data.proxy_auth_signature(
+                    endpoint,
+                    &prepare_invoice_auth_message(
+                        &invoice_id,
+                        &reservation_expiration,
+                        &recipient_pk,
+                    ),
+                )
+            });
+            outcomes.push(
+                match proxy_client.prepare_invoice(
+                    &invoice_id,
+                    &reservation_expiration,
+                    &recipient_pk,
+                    signature,
+                ) {
+                    Ok(res) if res.error.is_none() => Ok(InvoiceReservation::Reserved {
+                        retention_grace: proxy_retention_grace(&info),
+                    }),
+                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
+                        // a draining proxy, the invoice can be reserved on the other ones
+                        Error::ProxyDraining => Ok(InvoiceReservation::Draining),
+                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
+                        e => Err(e),
+                    },
+                    Err(_) => Ok(InvoiceReservation::Unreachable),
+                },
+            );
+        }
+        apply_invoice_reservations(receive_data, outcomes)
     }
 
     fn store_receive_transfer(
@@ -2487,14 +2666,22 @@ pub trait WalletOffline: WalletBackup {
             .join(MINT_RCV_FILE)
     }
 
+    /// Whether the details of the mint received on `recipient_id` were saved, once the wallet
+    /// checked it (see [`Self::read_received_mint`]).
+    fn has_received_mint(&self, recipient_id: &str) -> bool {
+        self.wallet_key(&self.get_received_mint_path(recipient_id))
+            .and_then(|key| self.files().exists(&key))
+            .unwrap_or(false)
+    }
+
     /// The details of the mint received on `recipient_id`, saved once the wallet has checked it.
     fn read_received_mint(&self, recipient_id: &str) -> Result<Option<ReceivedMint>, Error> {
-        let path = self.get_received_mint_path(recipient_id);
-        if !path.exists() {
+        let key = self.wallet_key(&self.get_received_mint_path(recipient_id))?;
+        if !self.files().exists(&key)? {
             return Ok(None);
         }
         let received_mint =
-            serde_json::from_str(&fs::read_to_string(path)?).map_err(InternalError::from)?;
+            serde_json::from_slice(&self.files().read(&key)?).map_err(InternalError::from)?;
         Ok(Some(received_mint))
     }
 
@@ -2644,7 +2831,13 @@ pub trait WalletOffline: WalletBackup {
                 .txid
                 .as_ref()
                 .map(|txid| self.get_transfer_dir(txid).join(UNSIGNED_PSBT_FILE))
-                .filter(|p| p.exists())
+                .filter(|p| {
+                    // a wallet that cannot tell whether the file exists reports it as missing,
+                    // which is what `Path::exists` does
+                    self.wallet_key(p)
+                        .and_then(|k| self.files().exists(&k))
+                        .unwrap_or(false)
+                })
                 .map(|p| p.to_string_lossy().to_string()),
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness | TransferKind::Issuance => {
                 None
@@ -3096,16 +3289,20 @@ pub trait WalletOffline: WalletBackup {
 
     fn get_transfer_end_data_by_txid(&self, txid: String) -> Result<TransferEndData, Error> {
         let transfer_dir = self.get_transfer_dir(&txid);
-        if !transfer_dir.exists() {
+        let transfer_key = self.transfer_key(&txid)?;
+        if !self.files().exists(&transfer_key)? {
             return Err(Error::UnknownTransfer { txid });
         }
 
-        let info_file = transfer_dir.join(TRANSFER_DATA_FILE);
-        let serialized_info = fs::read_to_string(info_file)?;
+        let info_key = transfer_key.join(TRANSFER_DATA_FILE)?;
+        let serialized_info =
+            String::from_utf8(self.files().read(&info_key)?).map_err(|e| Error::Internal {
+                details: format!("cannot read transfer data {info_key}: {e}"),
+            })?;
         let info_contents: InfoBatchTransfer =
             serde_json::from_str(&serialized_info).map_err(InternalError::from)?;
 
-        let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
+        let fascia = self.read_fascia_at(&transfer_key.join(FASCIA_FILE)?)?;
 
         Ok((txid, transfer_dir, info_contents, fascia))
     }
@@ -3134,9 +3331,18 @@ pub trait WalletOffline: WalletBackup {
             )?;
             stock.store_spv_proofs(spv_proofs)?;
             let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
-            fs::create_dir_all(&asset_transfer_dir)?;
+            let asset_transfer_key = self.wallet_key(&asset_transfer_dir)?;
+            self.files().create_dir_all(&asset_transfer_key)?;
             let consignment_path = self.get_send_consignment_path_impl(asset_transfer_dir);
-            atomic_write_with(&consignment_path, |tmp| Ok(consignment.save_file(tmp)?))?;
+            let mut bytes = Vec::new();
+            consignment.save(&mut bytes).map_err(|e| Error::Internal {
+                details: format!(
+                    "cannot serialize consignment {}: {e}",
+                    consignment_path.display()
+                ),
+            })?;
+            self.files()
+                .atomic_write(&self.wallet_key(&consignment_path)?, &bytes)?;
         }
         Ok(())
     }
@@ -3411,5 +3617,87 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
         txn.commit()?;
         info!(self.logger(), "RGB transfer inspection completed");
         Ok(inspection)
+    }
+}
+
+#[cfg(all(test, feature = "_online"))]
+mod tests {
+    use super::*;
+
+    fn receive_data(recipient_type_full: RecipientTypeFull) -> ReceiveDataInternal {
+        ReceiveDataInternal {
+            asset_id: None,
+            detected_assignment: Assignment::Any,
+            invoice_string: String::new(),
+            recipient_id: String::new(),
+            endpoints: vec![],
+            created_at: 0,
+            expiration_timestamp: 1_000,
+            recipient_type_full,
+            blind_seal: None,
+            script_pubkey: None,
+            operation_secret_key: vec![],
+            recipient_pubkey: vec![],
+            encryption: Encryption::Required,
+            retention_deadline: None,
+        }
+    }
+
+    fn blind() -> RecipientTypeFull {
+        RecipientTypeFull::Blind {
+            unblinded_utxo: Outpoint {
+                txid: "00".repeat(32),
+                vout: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_blind_receive_keeps_the_longest_proxy_retention_grace() {
+        let mut data = receive_data(blind());
+        apply_invoice_reservations(
+            &mut data,
+            [
+                Ok(InvoiceReservation::Reserved {
+                    retention_grace: 10,
+                }),
+                Ok(InvoiceReservation::Unreachable),
+                Ok(InvoiceReservation::Reserved {
+                    retention_grace: 30,
+                }),
+            ],
+        )
+        .expect("a reserved invoice");
+        assert_eq!(data.retention_deadline, Some(1_030));
+    }
+
+    #[test]
+    fn a_witness_receive_has_no_retention_deadline() {
+        let mut data = receive_data(RecipientTypeFull::Witness { vout: None });
+        apply_invoice_reservations(
+            &mut data,
+            [Ok(InvoiceReservation::Reserved {
+                retention_grace: 30,
+            })],
+        )
+        .expect("a reserved invoice");
+        assert_eq!(data.retention_deadline, None);
+    }
+
+    #[test]
+    fn an_unreserved_invoice_reports_a_draining_or_invalid_proxy() {
+        let mut data = receive_data(blind());
+        let draining = apply_invoice_reservations(
+            &mut data,
+            [
+                Ok(InvoiceReservation::Unreachable),
+                Ok(InvoiceReservation::Draining),
+            ],
+        );
+        assert!(matches!(draining, Err(Error::ProxyDraining)));
+
+        let unreachable =
+            apply_invoice_reservations(&mut data, [Ok(InvoiceReservation::Unreachable)]);
+        assert!(matches!(unreachable, Err(Error::NoValidTransportEndpoint)));
     }
 }

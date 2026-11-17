@@ -2,9 +2,9 @@ name: Run tests
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "next", "feat/**" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +42,8 @@ jobs:
     needs: test_and_coverage
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -51,16 +53,17 @@ jobs:
         with:
           name: coverage-report
       - name: Upload coverage report
+        if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v7
         timeout-minutes: 5
         with:
           fail_ci_if_error: true
           files: coverage.lcov
           flags: rust
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
 
   test_features:
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: ubuntu-latest
 
     steps:
@@ -96,9 +99,12 @@ jobs:
       - name: Test with indexer validation features
         run: |
           cargo test --profile reldebug --no-default-features --features bitcoind_validation,electrum_validation,esplora_validation
-      - name: Test with wallet feature
+      - name: Check the native wallet-only build
         run: |
-          cargo test --profile reldebug --no-default-features --features wallet
+          cargo check --lib --no-default-features --features wallet
+      - name: Test with wallet and sqlite features
+        run: |
+          cargo test --profile reldebug --no-default-features --features wallet,sqlite
 
   test_doc:
     timeout-minutes: 30

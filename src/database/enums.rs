@@ -1,5 +1,7 @@
 use super::*;
 
+use rgbstd::validation::SchemaRules;
+
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_UDA: &str =
@@ -196,7 +198,10 @@ impl AssetSchema {
     }
 
     /// Whether the schema supports burning.
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(target_arch = "wasm32", feature = "esplora_async")
+    ))]
     pub(crate) fn supports_burn(&self) -> bool {
         match self {
             Self::Bfa | Self::Ifa => true,
@@ -229,7 +234,7 @@ impl From<AssetSchema> for SchemaId {
 }
 
 #[cfg(feature = "wallet")]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
 pub enum ColoringType {
     #[sea_orm(num_value = 1)]
@@ -280,7 +285,7 @@ impl TryFrom<Value> for RecipientTypeFull {
 }
 
 #[cfg(feature = "wallet")]
-impl rgb_lib_migration::ValueType for RecipientTypeFull {
+impl sea_query::ValueType for RecipientTypeFull {
     fn type_name() -> String {
         "json".to_string()
     }
@@ -530,7 +535,10 @@ impl Assignment {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn add_to_assignments(&self, assignments: &mut AssignmentsCollection) {
         match self {
             Self::Fungible(amt) => {
@@ -578,7 +586,10 @@ impl Assignment {
         }
     }
 
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn inflation_amount(&self) -> u64 {
         if let Self::InflationRight(amt) = self {
             *amt
@@ -610,7 +621,7 @@ impl TryFrom<Value> for Assignment {
 }
 
 #[cfg(feature = "wallet")]
-impl rgb_lib_migration::ValueType for Assignment {
+impl sea_query::ValueType for Assignment {
     fn type_name() -> String {
         "json".to_string()
     }
@@ -721,7 +732,10 @@ pub enum TypeOfTransition {
 }
 
 impl TypeOfTransition {
-    #[cfg(feature = "_online")]
+    #[cfg(any(
+        feature = "_online",
+        all(feature = "esplora_async", target_arch = "wasm32")
+    ))]
     pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Inflate => "inflate",
@@ -827,15 +841,15 @@ mod tests {
 
         // value type
         assert_eq!(
-            <RecipientTypeFull as rgb_lib_migration::ValueType>::type_name(),
+            <RecipientTypeFull as sea_query::ValueType>::type_name(),
             "json"
         );
         assert_eq!(
-            <RecipientTypeFull as rgb_lib_migration::ValueType>::column_type(),
+            <RecipientTypeFull as sea_query::ValueType>::column_type(),
             ColumnType::Json
         );
         assert_eq!(
-            <RecipientTypeFull as rgb_lib_migration::ValueType>::array_type(),
+            <RecipientTypeFull as sea_query::ValueType>::array_type(),
             ArrayType::Json
         );
 
@@ -848,19 +862,18 @@ mod tests {
         };
         let json_val = serde_json::to_value(&blind).unwrap();
         let value = Value::Json(Some(Box::new(json_val)));
-        let recovered =
-            <RecipientTypeFull as rgb_lib_migration::ValueType>::try_from(value).unwrap();
+        let recovered = <RecipientTypeFull as sea_query::ValueType>::try_from(value).unwrap();
         assert_eq!(blind, recovered);
 
         // value type try from: not JSON
         let value = Value::Int(Some(42));
-        let err = <RecipientTypeFull as rgb_lib_migration::ValueType>::try_from(value);
+        let err = <RecipientTypeFull as sea_query::ValueType>::try_from(value);
         assert!(err.is_err());
 
         // value type try from: invalid JSON
         let bad_json = serde_json::json!({"bad": "data"});
         let value = Value::Json(Some(Box::new(bad_json)));
-        let err = <RecipientTypeFull as rgb_lib_migration::ValueType>::try_from(value);
+        let err = <RecipientTypeFull as sea_query::ValueType>::try_from(value);
         assert!(err.is_err());
 
         // nullable
@@ -899,16 +912,13 @@ mod tests {
         assert!(matches!(err, sea_orm::DbErr::Custom(_)));
 
         // value type
+        assert_eq!(<Assignment as sea_query::ValueType>::type_name(), "json");
         assert_eq!(
-            <Assignment as rgb_lib_migration::ValueType>::type_name(),
-            "json"
-        );
-        assert_eq!(
-            <Assignment as rgb_lib_migration::ValueType>::column_type(),
+            <Assignment as sea_query::ValueType>::column_type(),
             ColumnType::Json
         );
         assert_eq!(
-            <Assignment as rgb_lib_migration::ValueType>::array_type(),
+            <Assignment as sea_query::ValueType>::array_type(),
             ArrayType::Json
         );
 
@@ -916,18 +926,18 @@ mod tests {
         let assignment = Assignment::Fungible(42);
         let json_val = serde_json::to_value(&assignment).unwrap();
         let value = Value::Json(Some(Box::new(json_val)));
-        let recovered = <Assignment as rgb_lib_migration::ValueType>::try_from(value).unwrap();
+        let recovered = <Assignment as sea_query::ValueType>::try_from(value).unwrap();
         assert_eq!(assignment, recovered);
 
         // value type try from: not JSON
         let value = Value::Int(Some(42));
-        let err = <Assignment as rgb_lib_migration::ValueType>::try_from(value);
+        let err = <Assignment as sea_query::ValueType>::try_from(value);
         assert!(err.is_err());
 
         // value type try from: invalid JSON
         let bad_json = serde_json::json!({"InvalidVariant": 123});
         let value = Value::Json(Some(Box::new(bad_json)));
-        let err = <Assignment as rgb_lib_migration::ValueType>::try_from(value);
+        let err = <Assignment as sea_query::ValueType>::try_from(value);
         assert!(err.is_err());
 
         // nullable
