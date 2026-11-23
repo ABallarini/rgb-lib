@@ -692,6 +692,8 @@ mod inspect_consignment;
 #[cfg(feature = "electrum")]
 mod inspect_fascia;
 #[cfg(feature = "electrum")]
+mod insufficient_fee;
+#[cfg(feature = "electrum")]
 mod issue_asset_bfa;
 #[cfg(feature = "electrum")]
 mod issue_asset_cfa;

@@ -5077,7 +5077,9 @@ pub trait WalletOnline: WalletOffline {
                     let mut free_utxos = self.get_available_allocations(
                         input_unspents,
                         used_txos.as_slice(),
-                        Some(0),
+                        // colored UTXOs with spare allocation slots can pay the fee too: the
+                        // allocations they carry move to the RGB change
+                        None,
                     )?;
                     // sort UTXOs by BTC amount
                     if !free_utxos.is_empty() {
@@ -5097,7 +5099,9 @@ pub trait WalletOnline: WalletOffline {
                                 .expect("DB should contain a valid BTC amount")
                         });
                     }
-                    if let Some(a) = free_utxos.pop() {
+                    // take the smallest first, to keep the bigger UTXOs spendable
+                    if !free_utxos.is_empty() {
+                        let a = free_utxos.remove(0);
                         all_inputs.insert(a.utxo.into());
                         continue;
                     }

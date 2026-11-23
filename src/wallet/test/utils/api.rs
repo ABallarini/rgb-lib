@@ -1962,6 +1962,24 @@ impl SinglesigParty {
     }
 
     #[cfg(feature = "electrum")]
+    pub(crate) fn send_begin_result_with_fee_rate(
+        &mut self,
+        recipient_map: &HashMap<String, Vec<Recipient>>,
+        fee_rate: u64,
+    ) -> Result<SendBeginResult, Error> {
+        self.wallet.send_begin(
+            self.online,
+            recipient_map.clone(),
+            false,
+            fee_rate,
+            MIN_CONFIRMATIONS,
+            default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
+            false,
+        )
+    }
+
+    #[cfg(feature = "electrum")]
     pub(crate) fn send_btc(&mut self, address: &str, amount: u64) -> String {
         self.send_btc_result(address, amount).unwrap()
     }
