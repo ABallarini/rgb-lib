@@ -1,3 +1,4 @@
+use crate::DbBackend;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -154,11 +155,15 @@ impl MigrationTrait for Migration {
         // counterparty, can no longer be completed, as the protocol keeps no backward
         // compatibility and their transfer data files don't parse anymore: fail them. They have
         // no TXOs reserved, as before the update only wallet transactions reserved them
+        let now = match manager.get_database_backend() {
+            DbBackend::Postgres => "CAST(EXTRACT(EPOCH FROM now()) AS BIGINT)",
+            _ => "CAST(strftime('%s', 'now') AS INTEGER)",
+        };
         manager
             .get_connection()
             .execute_unprepared(&format!(
                 "UPDATE batch_transfer \
-                 SET status = {STATUS_FAILED}, updated_at = CAST(strftime('%s', 'now') AS INTEGER) \
+                 SET status = {STATUS_FAILED}, updated_at = {now} \
                  WHERE NOT incoming \
                  AND status IN ({STATUS_INITIATED}, {STATUS_WAITING_COUNTERPARTY})"
             ))

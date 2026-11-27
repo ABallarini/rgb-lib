@@ -213,6 +213,8 @@ esplora_validation = [
     "rgb-ops/esplora_blocking",
 ]
 camel_case = []
+# store wallet state in PostgreSQL instead of SQLite
+postgres = ["wallet", "sea-orm/sqlx-postgres"]
 
 [profile.release]
 # make overflow bugs fail loudly instead of producing wrong amounts

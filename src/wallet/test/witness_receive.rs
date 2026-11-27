@@ -37,7 +37,10 @@ fn success() {
     );
     let transfer = party.get_test_transfer_recipient(&receive_data.recipient_id);
     let (_, batch_transfer) = party.get_test_transfer_related(&transfer);
-    assert_eq!(batch_transfer.min_confirmations, MIN_CONFIRMATIONS);
+    assert_eq!(
+        batch_transfer.min_confirmations,
+        i16::from(MIN_CONFIRMATIONS)
+    );
 
     // asset ID + expiration + 0 min confirmations
     let asset = party.issue_asset_cfa(None, None);
@@ -61,7 +64,10 @@ fn success() {
     assert_eq!(receive_data.expiration_timestamp, expiration_timestamp);
     let transfer = party.get_test_transfer_recipient(&receive_data.recipient_id);
     let (_, batch_transfer) = party.get_test_transfer_related(&transfer);
-    assert_eq!(batch_transfer.min_confirmations, min_confirmations);
+    assert_eq!(
+        batch_transfer.min_confirmations,
+        i16::from(min_confirmations)
+    );
     let invoice = Invoice::new(receive_data.invoice.clone()).unwrap();
     let invoice_data = invoice.invoice_data();
     assert_eq!(invoice_data.asset_schema, Some(AssetSchema::Cfa));

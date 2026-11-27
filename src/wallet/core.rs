@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[cfg(feature = "postgres")]
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
 // BDK file store of wallets created before the changeset moved into the rgb-lib DB
 #[cfg(feature = "bdk_file_store_migration")]
 pub(crate) const BDK_DB_NAME: &str = "bdk_db";
@@ -41,6 +44,7 @@ struct WalletManifestVersion {
 pub(crate) struct WalletManifest {
     pub(crate) version: u8,
     pub(crate) bitcoin_network: BitcoinNetwork,
+    #[serde(default)]
     pub(crate) database_type: DatabaseType,
     pub(crate) max_allocations_per_utxo: u32,
     pub(crate) supported_schemas: Vec<AssetSchema>,
@@ -304,7 +308,18 @@ pub(crate) fn db_exists(wallet_dir: &Path) -> bool {
     wallet_dir.join(RGB_LIB_DB_NAME).exists()
 }
 
-pub(crate) fn setup_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, Error> {
+pub(crate) fn setup_db<P: AsRef<Path>>(
+    wallet_dir: P,
+    database_type: &DatabaseType,
+) -> Result<RgbLibDatabase, Error> {
+    match database_type {
+        DatabaseType::Sqlite => setup_sqlite_db(wallet_dir),
+        #[cfg(feature = "postgres")]
+        DatabaseType::Postgres(config) => setup_postgres_db(config),
+    }
+}
+
+fn setup_sqlite_db<P: AsRef<Path>>(wallet_dir: P) -> Result<RgbLibDatabase, Error> {
     let db_path = wallet_dir.as_ref().join(RGB_LIB_DB_NAME);
     let display_db_path = adjust_canonicalization(db_path);
     let connection_string = format!("sqlite:{display_db_path}?mode=rwc");
@@ -394,6 +409,62 @@ fn rename_files(dir: &Path, new_path: impl Fn(&Path) -> Option<PathBuf>) -> Resu
         sync_dir(dir)?;
     }
     Ok(())
+}
+
+/// Set up the wallet database in its own Postgres schema. The single pooled connection holds a
+/// session advisory lock, so a wallet has one writer: BDK and RGB updates cannot interleave.
+#[cfg(feature = "postgres")]
+fn setup_postgres_db(config: &PostgresConfig) -> Result<RgbLibDatabase, Error> {
+    let schema = &config.schema;
+    if config.url.trim().is_empty() {
+        return Err(Error::InvalidPostgresConfig {
+            details: "empty connection url".to_string(),
+        });
+    }
+    if schema.is_empty()
+        || schema.len() > 63
+        || !schema
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(Error::InvalidPostgresConfig {
+            details: format!("invalid schema name: {schema}"),
+        });
+    }
+    let mut opt = ConnectOptions::new(config.url.clone());
+    opt.sqlx_logging(false)
+        .set_schema_search_path(schema.clone())
+        .map_sqlx_postgres_pool_opts(|opts| {
+            // one connection holds the session lock, and never times out
+            opts.max_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None)
+        });
+    let connection = block_on(Database::connect(opt))?;
+    if !try_advisory_lock(&connection, schema)? {
+        return Err(Error::WalletInUse {
+            schema: schema.clone(),
+        });
+    }
+    block_on(connection.execute_unprepared(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"")))?;
+    block_on(Migrator::up(&connection, None))?;
+    Ok(RgbLibDatabase::new(connection))
+}
+
+/// Take the schema's session advisory lock; it is released when the connection closes.
+#[cfg(feature = "postgres")]
+fn try_advisory_lock(connection: &DatabaseConnection, schema: &str) -> Result<bool, Error> {
+    let digest = Sha256::digest(schema.as_bytes());
+    let key = i64::from_be_bytes(digest[..8].try_into().expect("8 bytes"));
+    let row = block_on(connection.query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_try_advisory_lock($1) AS locked",
+        [key.into()],
+    )))?;
+    let row = row.ok_or_else(|| Error::Database {
+        details: "advisory lock query returned no row".to_string(),
+    })?;
+    Ok(row.try_get("", "locked")?)
 }
 
 /// Import the BDK data of a wallet created before the changeset moved into the rgb-lib DB.

@@ -15,12 +15,12 @@ impl EntityName for Entity {
 pub struct Model {
     pub idx: i32,
     pub contract_id: Vec<u8>,
-    pub type_id: u16,
+    pub type_id: i32,
     pub opid: Vec<u8>,
-    pub out_index: u16,
+    pub out_index: i32,
     pub nonce: String,
     pub bundle_id: Option<Vec<u8>>,
-    pub transition_type: Option<u16>,
+    pub transition_type: Option<i32>,
     pub value_blob: Vec<u8>,
 }
 

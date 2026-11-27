@@ -2129,11 +2129,11 @@ pub trait WalletOnline: WalletOffline {
         Ok(reject_list)
     }
 
-    fn safe_height(&self, min_confirmations: u8) -> Result<u32, Error> {
+    fn safe_height(&self, min_confirmations: i16) -> Result<u32, Error> {
         Ok(self
             .indexer()
             .get_latest_block_height()?
-            .saturating_sub(min_confirmations as u32)
+            .saturating_sub(u32::try_from(min_confirmations).unwrap_or(0))
             + 1)
     }
 
@@ -6694,7 +6694,7 @@ pub trait WalletOnline: WalletOffline {
             status: ActiveValue::Set(status),
             expiration: ActiveValue::Set(info_contents.expiration_timestamp),
             created_at: ActiveValue::Set(info_contents.created_at),
-            min_confirmations: ActiveValue::Set(info_contents.min_confirmations),
+            min_confirmations: ActiveValue::Set(i16::from(info_contents.min_confirmations)),
             incoming: ActiveValue::Set(false),
             operation_secret_key: ActiveValue::Set(info_contents.operation_secret_key.clone()),
             ..Default::default()

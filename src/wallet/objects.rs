@@ -9,10 +9,24 @@ use super::*;
 // ────────────────────────────────────────────────────────────
 
 /// Supported database types.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub enum DatabaseType {
     /// A SQLite database
+    #[default]
     Sqlite,
+    /// A PostgreSQL database, in its own schema
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresConfig),
+}
+
+/// Settings for [`DatabaseType::Postgres`].
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PostgresConfig {
+    /// Connection string, e.g. `postgres://user:password@localhost:5432/rgb`
+    pub url: String,
+    /// Schema for the wallet's tables, created if missing
+    pub schema: String,
 }
 
 /// Data that defines a [`Wallet`].
@@ -24,6 +38,7 @@ pub struct WalletData {
     /// Bitcoin network for the wallet
     pub bitcoin_network: BitcoinNetwork,
     /// Database type for the wallet
+    #[serde(default)]
     pub database_type: DatabaseType,
     /// The max number of RGB allocations allowed per UTXO
     #[serde(deserialize_with = "from_str_or_number_mandatory")]
@@ -576,7 +591,7 @@ impl AssetNIA {
             ticker: asset.ticker.clone().unwrap(),
             name: asset.name.clone(),
             details: asset.details.clone(),
-            precision: asset.precision,
+            precision: asset.precision as u8,
             issued_supply: initial_supply,
             timestamp: asset.timestamp,
             added_at: asset.added_at,
@@ -649,7 +664,7 @@ impl AssetUDA {
             details: asset.details.clone(),
             ticker: asset.ticker.clone().unwrap(),
             name: asset.name.clone(),
-            precision: asset.precision,
+            precision: asset.precision as u8,
             timestamp: asset.timestamp,
             added_at: asset.added_at,
             balance,
@@ -719,7 +734,7 @@ impl AssetCFA {
             asset_id: asset.id.clone(),
             name: asset.name.clone(),
             details: asset.details.clone(),
-            precision: asset.precision,
+            precision: asset.precision as u8,
             issued_supply: initial_supply,
             timestamp: asset.timestamp,
             added_at: asset.added_at,
@@ -805,7 +820,7 @@ impl AssetIFA {
             ticker: asset.ticker.clone().unwrap(),
             name: asset.name.clone(),
             details: asset.details.clone(),
-            precision: asset.precision,
+            precision: asset.precision as u8,
             initial_supply,
             max_supply,
             known_circulating_supply,
@@ -892,7 +907,7 @@ impl AssetBFA {
             ticker: asset.ticker.clone().unwrap(),
             name: asset.name.clone(),
             details: asset.details.clone(),
-            precision: asset.precision,
+            precision: asset.precision as u8,
             known_circulating_supply,
             timestamp: asset.timestamp,
             added_at: asset.added_at,

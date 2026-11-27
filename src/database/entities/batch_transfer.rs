@@ -21,7 +21,7 @@ pub struct Model {
     pub created_at: i64,
     pub updated_at: i64,
     pub expiration: Option<i64>,
-    pub min_confirmations: u8,
+    pub min_confirmations: i16,
     pub incoming: bool,
     pub operation_secret_key: Option<Vec<u8>>,
     pub broadcast_deadline: Option<i64>,

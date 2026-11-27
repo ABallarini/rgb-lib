@@ -15,10 +15,10 @@ impl EntityName for Entity {
 pub struct Model {
     pub idx: i32,
     pub txid: Vec<u8>,
-    pub status: u8,
+    pub status: i16,
     pub height: Option<u32>,
     pub timestamp: Option<i64>,
-    pub layer1: Option<u8>,
+    pub layer1: Option<i16>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]

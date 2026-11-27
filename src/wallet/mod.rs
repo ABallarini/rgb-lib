@@ -39,6 +39,8 @@ pub use multisig::{
     HubInfo, InitOperationResult, MultisigOnlineOptions, MultisigVotingStatus, Operation,
     OperationInfo, RespondToOperation, UserRole,
 };
+#[cfg(feature = "postgres")]
+pub use objects::PostgresConfig;
 pub use objects::{
     Address, AssetBFA, AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets,
     AssignmentsCollection, Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, Media,

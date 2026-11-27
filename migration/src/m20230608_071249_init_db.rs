@@ -1,3 +1,4 @@
+use crate::unsigned_u32;
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -13,7 +14,7 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(Txo::Idx))
                     .col(string(Txo::Txid))
-                    .col(big_unsigned(Txo::Vout))
+                    .col(unsigned_u32(manager.get_database_backend(), Txo::Vout))
                     .col(string(Txo::BtcAmount))
                     .col(boolean(Txo::Spent))
                     .col(boolean(Txo::Exists))
@@ -249,7 +250,7 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(Token::Idx))
                     .col(integer(Token::AssetIdx))
-                    .col(big_unsigned(Token::Index))
+                    .col(unsigned_u32(manager.get_database_backend(), Token::Index))
                     .col(string_null(Token::Ticker))
                     .col(string_null(Token::Name))
                     .col(string_null(Token::Details))

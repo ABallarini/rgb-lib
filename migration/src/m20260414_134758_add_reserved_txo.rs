@@ -1,3 +1,4 @@
+use crate::unsigned_u32;
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -13,7 +14,10 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(ReservedTxo::Idx))
                     .col(string(ReservedTxo::Txid))
-                    .col(big_unsigned(ReservedTxo::Vout))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        ReservedTxo::Vout,
+                    ))
                     .col(integer_null(ReservedTxo::ReservedFor))
                     .foreign_key(
                         ForeignKey::create()
