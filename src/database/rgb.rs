@@ -27,12 +27,12 @@ const QUERY_CHUNK: usize = 400;
 const OUTPOINT_CHUNK: usize = QUERY_CHUNK / 2;
 
 // `witness_ords.status` values, mirroring the `WitnessOrd` strict-encoding tag order
-const ORD_MINED: u8 = 0;
-const ORD_TENTATIVE: u8 = 1;
-const ORD_IGNORED: u8 = 2;
-const ORD_ARCHIVED: u8 = 3;
+const ORD_MINED: i16 = 0;
+const ORD_TENTATIVE: i16 = 1;
+const ORD_IGNORED: i16 = 2;
+const ORD_ARCHIVED: i16 = 3;
 
-type OrdColumns = (u8, Option<u32>, Option<i64>, Option<u8>);
+type OrdColumns = (i16, Option<u32>, Option<i64>, Option<i16>);
 
 fn enc(val: &impl StrictEncode) -> Result<Vec<u8>, Error> {
     encode(val).map_err(|e| Error::Internal {
@@ -78,7 +78,11 @@ fn assignment_to_row(m: &DbAssignment) -> Result<AllocationRow, Error> {
         details: format!("corrupted RGB data: unknown state type {}", m.state_type),
     })?;
     let opid = dec::<OpId>(&m.opid)?;
-    let opout = Opout::new(opid, AssignmentType::with(m.type_id), m.output_no);
+    let opout = Opout::new(
+        opid,
+        AssignmentType::with(m.type_id as u16),
+        m.output_no as u16,
+    );
     let seal = AllocSeal {
         txid: m.seal_txid.as_deref().map(dec::<RgbTxid>).transpose()?,
         vout: Vout::from_u32(m.seal_vout),
@@ -96,10 +100,10 @@ fn assignment_to_row(m: &DbAssignment) -> Result<AllocationRow, Error> {
 fn global_state_to_row(m: &DbGlobalState) -> Result<GlobalStateRow, Error> {
     Ok(GlobalStateRow {
         opid: dec::<OpId>(&m.opid)?,
-        index: m.out_index,
+        index: m.out_index as u16,
         nonce: m.nonce.parse().expect("DB should contain a valid nonce"),
         bundle_id: m.bundle_id.as_deref().map(dec::<BundleId>).transpose()?,
-        transition_type: m.transition_type.map(TransitionType::with),
+        transition_type: m.transition_type.map(|t| TransitionType::with(t as u16)),
         value: dec::<RevealedData>(&m.value_blob)?,
     })
 }
@@ -741,13 +745,15 @@ impl RgbStore for &DbTxn {
         block_on(
             RgbGlobalState::insert(DbGlobalStateActMod {
                 contract_id: ActiveValue::Set(enc(&global_state.contract_id)?),
-                type_id: ActiveValue::Set(global_state.type_id.into_inner()),
+                type_id: ActiveValue::Set(i32::from(global_state.type_id.into_inner())),
                 opid: ActiveValue::Set(enc(&global_state.opid)?),
-                out_index: ActiveValue::Set(global_state.index),
+                out_index: ActiveValue::Set(i32::from(global_state.index)),
                 nonce: ActiveValue::Set(global_state.nonce.to_string()),
                 bundle_id: ActiveValue::Set(global_state.bundle_id.map(|b| enc(&b)).transpose()?),
                 transition_type: ActiveValue::Set(
-                    global_state.transition_type.map(|t| t.into_inner()),
+                    global_state
+                        .transition_type
+                        .map(|t| i32::from(t.into_inner())),
                 ),
                 value_blob: ActiveValue::Set(enc(global_state.value)?),
                 ..Default::default()
@@ -784,7 +790,8 @@ impl RgbStore for &DbTxn {
                     query = query.filter(rgb_assignment::Column::StateType.eq(state_type));
                 }
                 if let Some(type_id) = filter.type_id {
-                    query = query.filter(rgb_assignment::Column::TypeId.eq(type_id.into_inner()));
+                    query = query
+                        .filter(rgb_assignment::Column::TypeId.eq(i32::from(type_id.into_inner())));
                 }
                 let rows = block_on(query.all(self.inner()))?;
                 self.visible_assignments(rows, filter.visibility)?
@@ -797,7 +804,9 @@ impl RgbStore for &DbTxn {
                     filter
                         .kind
                         .is_none_or(|k| m.state_type == alloc_kind_str(k))
-                        && filter.type_id.is_none_or(|t| m.type_id == t.into_inner())
+                        && filter
+                            .type_id
+                            .is_none_or(|t| m.type_id == i32::from(t.into_inner()))
                 })
                 .collect(),
         };
@@ -823,9 +832,9 @@ impl RgbStore for &DbTxn {
             RgbAssignment::insert(DbAssignmentActMod {
                 contract_id: ActiveValue::Set(enc(&allocation.contract_id)?),
                 state_type: ActiveValue::Set(alloc_kind_str(allocation.kind).to_string()),
-                type_id: ActiveValue::Set(allocation.opout.ty.into_inner()),
+                type_id: ActiveValue::Set(i32::from(allocation.opout.ty.into_inner())),
                 opid: ActiveValue::Set(enc(&allocation.opout.op)?),
-                output_no: ActiveValue::Set(allocation.opout.no),
+                output_no: ActiveValue::Set(i32::from(allocation.opout.no)),
                 seal_txid: ActiveValue::Set(allocation.seal.txid.as_ref().map(enc).transpose()?),
                 seal_vout: ActiveValue::Set(allocation.seal.vout.to_u32()),
                 bundle_id: ActiveValue::Set(allocation.bundle_id.map(|b| enc(&b)).transpose()?),
@@ -1139,8 +1148,8 @@ impl RgbStore for &DbTxn {
             let op = dec::<OpId>(&row.opid)?;
             out.insert(Opout::new(
                 op,
-                AssignmentType::with(row.type_id),
-                row.output_no,
+                AssignmentType::with(row.type_id as u16),
+                row.output_no as u16,
             ));
         }
         Ok(out)
@@ -1155,8 +1164,8 @@ impl RgbStore for &DbTxn {
         block_on(
             RgbOpInput::insert(DbOpInputActMod {
                 opid: ActiveValue::Set(enc(&spent_opout.op)?),
-                type_id: ActiveValue::Set(spent_opout.ty.into_inner()),
-                output_no: ActiveValue::Set(spent_opout.no),
+                type_id: ActiveValue::Set(i32::from(spent_opout.ty.into_inner())),
+                output_no: ActiveValue::Set(i32::from(spent_opout.no)),
                 child_opid: ActiveValue::Set(enc(&child_opid)?),
                 child_bundle_id: ActiveValue::Set(enc(&child_bundle_id)?),
                 ..Default::default()

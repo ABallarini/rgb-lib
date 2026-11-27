@@ -1720,7 +1720,7 @@ pub trait WalletOffline: WalletBackup {
             status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
             expiration: ActiveValue::Set(Some(receive_data_internal.expiration_timestamp)),
             created_at: ActiveValue::Set(receive_data_internal.created_at),
-            min_confirmations: ActiveValue::Set(min_confirmations),
+            min_confirmations: ActiveValue::Set(i16::from(min_confirmations)),
             incoming: ActiveValue::Set(true),
             operation_secret_key: ActiveValue::Set(Some(
                 receive_data_internal.operation_secret_key.clone(),
@@ -2057,7 +2057,7 @@ pub trait WalletOffline: WalletBackup {
             known_circulating_supply,
             timestamp: asset.timestamp,
             name: asset.name,
-            precision: asset.precision,
+            precision: asset.precision as u8,
             ticker: asset.ticker,
             details: asset.details,
             token,
@@ -2081,7 +2081,7 @@ pub trait WalletOffline: WalletBackup {
         txn.set_token_media(DbTokenMediaActMod {
             token_idx: ActiveValue::Set(token_idx),
             media_idx: ActiveValue::Set(media_idx),
-            attachment_id: ActiveValue::Set(attachment_id),
+            attachment_id: ActiveValue::Set(attachment_id.map(i16::from)),
             ..Default::default()
         })?;
 
@@ -2107,7 +2107,7 @@ pub trait WalletOffline: WalletBackup {
                 asset_data.known_circulating_supply.map(|s| s.to_string()),
             ),
             name: ActiveValue::Set(asset_data.name.clone()),
-            precision: ActiveValue::Set(asset_data.precision),
+            precision: ActiveValue::Set(i16::from(asset_data.precision)),
             ticker: ActiveValue::Set(asset_data.ticker.clone()),
             timestamp: ActiveValue::Set(asset_data.timestamp),
             bridge_location: ActiveValue::Set(asset_data.bridge_location.clone()),
@@ -2172,7 +2172,7 @@ pub trait WalletOffline: WalletBackup {
                     let db_media = medias.iter().find(|m| m.idx == tm.media_idx).unwrap();
                     let media_tkn = Media::from_db_media(db_media, &media_dir);
                     if let Some(attachment_id) = tm.attachment_id {
-                        attachments.insert(attachment_id, media_tkn);
+                        attachments.insert(attachment_id as u8, media_tkn);
                     } else {
                         media = Some(media_tkn);
                     }

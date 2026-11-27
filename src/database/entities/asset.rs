@@ -24,7 +24,7 @@ pub struct Model {
     pub details: Option<String>,
     pub initial_supply: String,
     pub name: String,
-    pub precision: u8,
+    pub precision: i16,
     pub ticker: Option<String>,
     pub timestamp: i64,
     pub max_supply: Option<String>,

@@ -6572,8 +6572,14 @@ fn min_confirmations_common(
     let (transfer, _, _) = party.get_test_transfer_sender(&txid);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
     let (_, batch_transfer) = party.get_test_transfer_related(&transfer);
-    assert_eq!(rcv_batch_transfer.min_confirmations, min_confirmations);
-    assert_eq!(batch_transfer.min_confirmations, min_confirmations);
+    assert_eq!(
+        rcv_batch_transfer.min_confirmations,
+        i16::from(min_confirmations)
+    );
+    assert_eq!(
+        batch_transfer.min_confirmations,
+        i16::from(min_confirmations)
+    );
     assert_eq!(
         rcv_transfer_data.status,
         TransferStatus::WaitingCounterparty
@@ -6666,8 +6672,14 @@ fn min_confirmations_common(
     let (transfer, _, _) = party.get_test_transfer_sender(&txid);
     let (transfer_data, _) = party.get_test_transfer_data(&transfer);
     let (_, batch_transfer) = party.get_test_transfer_related(&transfer);
-    assert_eq!(rcv_batch_transfer.min_confirmations, min_confirmations);
-    assert_eq!(batch_transfer.min_confirmations, min_confirmations);
+    assert_eq!(
+        rcv_batch_transfer.min_confirmations,
+        i16::from(min_confirmations)
+    );
+    assert_eq!(
+        batch_transfer.min_confirmations,
+        i16::from(min_confirmations)
+    );
     assert_eq!(
         rcv_transfer_data.status,
         TransferStatus::WaitingCounterparty

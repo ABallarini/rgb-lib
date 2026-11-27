@@ -60,3 +60,28 @@ fn success() {
         MAX_ALLOCATIONS_PER_UTXO
     );
 }
+
+#[test]
+fn database_type_defaults_to_sqlite() {
+    let mut json = serde_json::to_value(WalletData {
+        data_dir: "test".to_string(),
+        bitcoin_network: BitcoinNetwork::Regtest,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 1,
+        supported_schemas: vec![AssetSchema::Nia],
+        allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
+    })
+    .unwrap();
+    let map = json.as_object_mut().unwrap();
+    let database_type_key = map
+        .keys()
+        .find(|key| key.as_str() == "database_type" || key.as_str() == "databaseType")
+        .unwrap()
+        .clone();
+    map.remove(&database_type_key);
+
+    let wallet_data: WalletData = serde_json::from_value(json).unwrap();
+    assert!(matches!(wallet_data.database_type, DatabaseType::Sqlite));
+}

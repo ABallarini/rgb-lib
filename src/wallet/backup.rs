@@ -104,6 +104,11 @@ pub trait WalletBackup: WalletCore {
         password: &str,
         scrypt_params: Option<ScryptParams>,
     ) -> Result<(), Error> {
+        #[cfg(feature = "postgres")]
+        if matches!(self.wallet_data().database_type, DatabaseType::Postgres(_)) {
+            // the database is not in the wallet directory
+            return Err(Error::DatabaseBackupNotSupported);
+        }
         // setup
         info!(self.logger(), "starting backup...");
         let backup_file = PathBuf::from(&backup_path);

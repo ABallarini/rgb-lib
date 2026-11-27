@@ -277,7 +277,7 @@ fn save_new_asset_success() {
     assert_eq!(asset_model.id, nia_asset.asset_id);
     assert_eq!(asset_model.initial_supply, AMOUNT.to_string());
     assert_eq!(asset_model.name, NAME);
-    assert_eq!(asset_model.precision, PRECISION);
+    assert_eq!(asset_model.precision, i16::from(PRECISION));
     assert_eq!(asset_model.ticker.unwrap(), TICKER);
     assert_eq!(asset_model.schema, AssetSchema::Nia);
 
@@ -293,7 +293,7 @@ fn save_new_asset_success() {
     assert_eq!(asset_model.id, cfa_asset.asset_id);
     assert_eq!(asset_model.initial_supply, AMOUNT.to_string());
     assert_eq!(asset_model.name, NAME);
-    assert_eq!(asset_model.precision, PRECISION);
+    assert_eq!(asset_model.precision, i16::from(PRECISION));
     assert!(asset_model.ticker.is_none());
     assert_eq!(asset_model.schema, AssetSchema::Cfa);
 
@@ -308,7 +308,7 @@ fn save_new_asset_success() {
     assert_eq!(asset_model.id, uda_asset.asset_id);
     assert_eq!(asset_model.initial_supply, 1.to_string());
     assert_eq!(asset_model.name, NAME);
-    assert_eq!(asset_model.precision, PRECISION);
+    assert_eq!(asset_model.precision, i16::from(PRECISION));
     assert_eq!(asset_model.ticker.unwrap(), TICKER);
     assert_eq!(asset_model.schema, AssetSchema::Uda);
 }

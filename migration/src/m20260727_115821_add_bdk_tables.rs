@@ -1,3 +1,4 @@
+use crate::unsigned_u32;
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -32,7 +33,10 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(BdkWalletLockedOutpoint::Idx))
                     .col(string(BdkWalletLockedOutpoint::Txid))
-                    .col(big_integer(BdkWalletLockedOutpoint::Vout))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        BdkWalletLockedOutpoint::Vout,
+                    ))
                     .to_owned(),
             )
             .await?;
@@ -55,7 +59,10 @@ impl MigrationTrait for Migration {
                     .table(BdkBlock::Table)
                     .if_not_exists()
                     .col(pk_auto(BdkBlock::Idx))
-                    .col(big_integer(BdkBlock::BlockHeight))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        BdkBlock::BlockHeight,
+                    ))
                     .col(string(BdkBlock::BlockHash))
                     .to_owned(),
             )
@@ -105,7 +112,7 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(BdkTxout::Idx))
                     .col(string(BdkTxout::Txid))
-                    .col(big_integer(BdkTxout::Vout))
+                    .col(unsigned_u32(manager.get_database_backend(), BdkTxout::Vout))
                     .col(string(BdkTxout::Value))
                     .col(binary(BdkTxout::Script))
                     .to_owned(),
@@ -131,7 +138,10 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(BdkAnchor::Idx))
                     .col(string(BdkAnchor::Txid))
-                    .col(big_integer(BdkAnchor::BlockHeight))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        BdkAnchor::BlockHeight,
+                    ))
                     .col(string(BdkAnchor::BlockHash))
                     .col(string(BdkAnchor::ConfirmationTime))
                     .foreign_key(
@@ -166,7 +176,10 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(pk_auto(BdkDescriptorLastRevealed::Idx))
                     .col(string(BdkDescriptorLastRevealed::DescriptorId))
-                    .col(big_integer(BdkDescriptorLastRevealed::LastRevealed))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        BdkDescriptorLastRevealed::LastRevealed,
+                    ))
                     .to_owned(),
             )
             .await?;

@@ -128,6 +128,27 @@ pub enum Error {
         details: String,
     },
 
+    /// The PostgreSQL configuration is invalid
+    #[cfg(feature = "postgres")]
+    #[error("Invalid PostgreSQL configuration: {details}")]
+    InvalidPostgresConfig {
+        /// Error details
+        details: String,
+    },
+
+    /// The wallet is open in another process
+    #[cfg(feature = "postgres")]
+    #[error("Wallet already in use (PostgreSQL schema: {schema})")]
+    WalletInUse {
+        /// Schema of the wallet database
+        schema: String,
+    },
+
+    /// The wallet database cannot be included in a backup
+    #[cfg(feature = "postgres")]
+    #[error("Wallet backup is not supported for this database type")]
+    DatabaseBackupNotSupported,
+
     /// Two proxy authentication key entries resolve to the same proxy URL
     #[error("Duplicate proxy authentication key: {details}")]
     DuplicateProxyAuthKey {

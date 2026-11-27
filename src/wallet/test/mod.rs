@@ -756,6 +756,8 @@ mod mint;
 #[cfg(feature = "electrum")]
 mod multisig;
 mod new;
+#[cfg(feature = "postgres")]
+mod postgres;
 #[cfg(feature = "electrum")]
 mod refresh;
 #[cfg(feature = "electrum")]

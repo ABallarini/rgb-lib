@@ -18,6 +18,7 @@
 //! The unique keys and indexes do the rest: one row per schema, contract, bundle, witness,
 //! seal, op and state entry.
 
+use crate::{unsigned_u32, unsigned_u32_null};
 use sea_orm_migration::{prelude::*, schema::*};
 
 #[derive(DeriveMigrationName)]
@@ -144,7 +145,10 @@ impl MigrationTrait for Migration {
                     .col(pk_auto(RgbWitnessOrd::Idx))
                     .col(binary(RgbWitnessOrd::Txid).unique_key())
                     .col(tiny_unsigned(RgbWitnessOrd::Status))
-                    .col(big_integer_null(RgbWitnessOrd::Height))
+                    .col(unsigned_u32_null(
+                        manager.get_database_backend(),
+                        RgbWitnessOrd::Height,
+                    ))
                     .col(big_integer_null(RgbWitnessOrd::Timestamp))
                     .col(tiny_unsigned_null(RgbWitnessOrd::Layer1))
                     // status 0 is `WitnessOrd::Mined`, the only variant carrying a position
@@ -239,7 +243,10 @@ impl MigrationTrait for Migration {
                     .col(binary(RgbAssignment::Opid))
                     .col(integer(RgbAssignment::OutputNo))
                     .col(binary_null(RgbAssignment::SealTxid))
-                    .col(big_integer(RgbAssignment::SealVout))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        RgbAssignment::SealVout,
+                    ))
                     .col(binary_null(RgbAssignment::BundleId))
                     .col(binary(RgbAssignment::ValueBlob))
                     .check(
@@ -419,7 +426,10 @@ impl MigrationTrait for Migration {
                     .col(pk_auto(RgbOutpointOpout::Idx))
                     .col(binary(RgbOutpointOpout::ContractId))
                     .col(binary(RgbOutpointOpout::Txid))
-                    .col(big_integer(RgbOutpointOpout::Vout))
+                    .col(unsigned_u32(
+                        manager.get_database_backend(),
+                        RgbOutpointOpout::Vout,
+                    ))
                     .col(binary(RgbOutpointOpout::Opout))
                     .to_owned(),
             )

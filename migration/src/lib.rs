@@ -1,5 +1,31 @@
 pub use sea_orm_migration::prelude::*;
 
+pub use sea_orm_migration::sea_orm::DbBackend;
+
+/// Column for a `u32` field: Postgres reads it only from `INTEGER`, SQLite keeps `BIGINT`.
+pub fn unsigned_u32<I>(backend: DbBackend, iden: I) -> ColumnDef
+where
+    I: IntoIden,
+{
+    let mut col = ColumnDef::new(iden);
+    if backend == DbBackend::Postgres {
+        col.integer();
+    } else {
+        col.big_unsigned();
+    };
+    col
+}
+
+/// Nullable [`unsigned_u32`].
+pub fn unsigned_u32_null<I>(backend: DbBackend, iden: I) -> ColumnDef
+where
+    I: IntoIden,
+{
+    let mut col = unsigned_u32(backend, iden);
+    col.null();
+    col
+}
+
 mod m20230608_071249_init_db;
 mod m20251017_074408_asset_update;
 mod m20251105_132121_asset_update;

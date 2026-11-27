@@ -15,8 +15,8 @@ impl EntityName for Entity {
 pub struct Model {
     pub idx: i32,
     pub opid: Vec<u8>,
-    pub type_id: u16,
-    pub output_no: u16,
+    pub type_id: i32,
+    pub output_no: i32,
     pub child_opid: Vec<u8>,
     pub child_bundle_id: Vec<u8>,
 }

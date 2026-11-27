@@ -238,7 +238,7 @@ impl Wallet {
         }
 
         // setup rgb-lib DB
-        let database = setup_db(&wallet_dir)?;
+        let database = setup_db(&wallet_dir, &wdata.database_type)?;
 
         // setup the BDK wallet, persisting its data inside the rgb-lib DB
         let bdk_wallet = setup_bdk(

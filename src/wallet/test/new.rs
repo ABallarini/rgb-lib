@@ -786,7 +786,7 @@ fn legacy_bdk_store_is_imported() {
     store.append(&legacy_changeset).unwrap();
     drop(store);
 
-    let database = setup_db(dir.path()).unwrap();
+    let database = setup_db(dir.path(), &DatabaseType::Sqlite).unwrap();
     let bdk_wallet = setup_bdk(
         &database,
         dir.path(),

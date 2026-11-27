@@ -85,7 +85,7 @@ macro_rules! impl_json_column {
 /// The schema of an asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
-#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "i16", db_type = "TinyUnsigned"))]
 pub enum AssetSchema {
     /// NIA schema
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
@@ -301,7 +301,7 @@ impl From<AssetSchema> for SchemaId {
 
 #[cfg(feature = "wallet")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
-#[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
+#[sea_orm(rs_type = "i16", db_type = "TinyUnsigned")]
 pub enum ColoringType {
     #[sea_orm(num_value = 1)]
     Receive = 1,
@@ -335,7 +335,7 @@ impl_json_column!(RecipientTypeFull);
 /// The type of an RGB transport.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
-#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "i16", db_type = "TinyUnsigned"))]
 pub enum TransportType {
     /// HTTP(s) JSON-RPC ([specification](https://github.com/RGB-Tools/rgb-http-json-rpc))
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
@@ -345,7 +345,7 @@ pub enum TransportType {
 #[cfg(feature = "wallet")]
 /// The role of a transport endpoint associated to a transfer.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Deserialize, Serialize)]
-#[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
+#[sea_orm(rs_type = "i16", db_type = "TinyUnsigned")]
 pub enum TransportEndpointKind {
     /// The recipient's proxy (where the consignment and media are exchanged)
     #[sea_orm(num_value = 1)]
@@ -359,7 +359,7 @@ pub enum TransportEndpointKind {
 /// [`rgbinvoice::Encryption`]).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
-#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "i16", db_type = "TinyUnsigned"))]
 pub enum Encryption {
     /// Encryption is mandatory for consignment and media (the recipient refuses cleartext)
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
@@ -407,7 +407,7 @@ impl From<Encryption> for rgbinvoice::Encryption {
     Deserialize,
     Serialize,
 )]
-#[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
+#[sea_orm(rs_type = "i16", db_type = "TinyUnsigned")]
 pub enum TransferStatus {
     /// Transfer has been initiated (PSBT prepared) but not yet finalized
     #[sea_orm(num_value = 5)]
@@ -491,7 +491,7 @@ impl TransferStatus {
 #[cfg(feature = "wallet")]
 /// The type of a pending vanilla wallet transaction.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Deserialize, Serialize)]
-#[sea_orm(rs_type = "u8", db_type = "TinyUnsigned")]
+#[sea_orm(rs_type = "i16", db_type = "TinyUnsigned")]
 pub enum WalletTransactionType {
     /// Transaction used to create UTXOs
     #[sea_orm(num_value = 1)]
@@ -663,7 +663,7 @@ impl Assignment {
 /// Type of RGB transition
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "wallet", derive(EnumIter, DeriveActiveEnum))]
-#[cfg_attr(feature = "wallet", sea_orm(rs_type = "u8", db_type = "TinyUnsigned"))]
+#[cfg_attr(feature = "wallet", sea_orm(rs_type = "i16", db_type = "TinyUnsigned"))]
 pub enum TypeOfTransition {
     /// Inflation transition (issuing new tokens)
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 1))]
